@@ -239,7 +239,8 @@ class FetchMessagesCoverFetcherCodesTest(unittest.TestCase):
 
     @unittest.skipIf(NODE is None, NO_NODE)
     def test_fetch_error_message_gives_every_code_its_own_words(self) -> None:
-        codes = sorted(FETCH_JOB_ERRORS | FETCH_REFUSALS | (fetcher_error_codes() if FETCHER_PACKAGE.is_dir() else set()))
+        scanned = fetcher_error_codes() if FETCHER_PACKAGE.is_dir() else set()
+        codes = sorted(FETCH_JOB_ERRORS | FETCH_REFUSALS | scanned)
         script = (
             "import { pathToFileURL } from 'node:url';"
             "const [path, payload] = process.argv.slice(1);"
