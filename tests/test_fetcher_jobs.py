@@ -1,6 +1,8 @@
 """The fetch job queue (strange_ringtone_fetch.jobs): one worker, a bounded queue, one held result, a TTL."""
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import stat
 import sys
@@ -233,6 +235,26 @@ class RunTest(JobsTestCase):
         wait_for(lambda: (self.jobs.status(second) or {}).get("status") == "done", "the second job")
         self.assertEqual(self.runner.max_running, 1)
         self.assertEqual(self.runner.calls, [VIDEO_ID, OTHER_ID])
+
+    def test_the_worker_logs_only_the_exception_type(self) -> None:
+        # The worker survives an unexpected error with one line on stderr. An
+        # exception message could carry a title or a path, so only the type
+        # is written.
+        calls: list[float | None] = []
+
+        def run_next(timeout: float | None = None) -> bool:
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise RuntimeError(f"Stub Title {VIDEO_ID} in {self.scratch}")
+            time.sleep(0.01)
+            return False
+
+        log = io.StringIO()
+        with mock.patch.object(self.jobs, "run_next", side_effect=run_next), contextlib.redirect_stderr(log):
+            self.jobs.start(sweep_interval=3600)
+            wait_for(lambda: len(calls) > 1, "the worker to go on after the error")
+            self.jobs.stop()
+        self.assertEqual(log.getvalue(), "error while running a fetch job: RuntimeError\n")
 
     def test_stop_cancels_the_running_fetch(self) -> None:
         self.runner.gates[VIDEO_ID] = threading.Event()

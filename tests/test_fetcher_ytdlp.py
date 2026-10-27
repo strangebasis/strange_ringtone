@@ -268,6 +268,9 @@ class MappingTest(unittest.TestCase):
     def test_blocked_phrases(self) -> None:
         for text in (
             "ERROR: [youtube] x: Sign in to confirm you're not a bot",
+            # Each phrase on its own, so no alternative of the pattern
+            # hides behind another one in the same message.
+            "ERROR: [youtube] x: Sign in to confirm your age",
             "ERROR: are you NOT A BOT",
             "ERROR: captcha required",
             "ERROR: PO Token required",
