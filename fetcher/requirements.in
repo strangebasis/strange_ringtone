@@ -1,0 +1,9 @@
+# The fetcher's only third-party code (docs/PLAN.md 6). Recompile the hashed
+# lock with the command in README.md (Development, "Fetcher image"); never
+# hand-edit requirements.txt. fetcher/Dockerfile installs it with
+# --require-hashes --no-deps --only-binary :all:.
+yt-dlp==2026.10.26
+# The YouTube challenge solver scripts that yt-dlp runs in Deno. Must equal
+# the yt-dlp-ejs pin in yt-dlp's own metadata (its "default" extra), which
+# --no-deps would not install for us; tests/image_fetcher checks they match.
+yt-dlp-ejs==0.8.0
