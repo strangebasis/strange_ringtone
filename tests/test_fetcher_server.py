@@ -715,6 +715,55 @@ class RateLimitTest(ServerTestCase):
             self.assertJsonError(self.post_job(OTHER_ID), 429, "rate_limited")
         self.assertEqual(len(self.server.jobs), 1)
 
+    def test_the_second_look_the_enqueue_and_the_count_are_one_step(self) -> None:
+        # Two requests from one client, both past the first look. Whichever
+        # submits first is held inside submit until the other has looked once,
+        # then for a while longer: under the submit lock the other can't take
+        # its second look before this one is counted; without the lock it
+        # does, finds room, and both are accepted.
+        self.start(rate_limit_fetches_per_minute=1)
+        self.gate(VIDEO_ID)
+        changed = threading.Condition()
+        looks = 0
+        submits = 0
+        real_has_room = self.server.limiter.has_room
+        real_submit = self.server.jobs.submit
+
+        def counted_look(key: Any) -> tuple[bool, int]:
+            nonlocal looks
+            answer = real_has_room(key)
+            with changed:
+                looks += 1
+                changed.notify_all()
+            return answer
+
+        def held_submit(video_id: str) -> str:
+            nonlocal submits
+            with changed:
+                submits += 1
+                if submits == 1:
+                    # This request's two looks and the other's first.
+                    self.assertTrue(changed.wait_for(lambda: looks >= 3, DEADLINE))
+                    changed.wait_for(lambda: looks >= 4, 0.5)
+            return real_submit(video_id)
+
+        statuses: list[int] = []
+        lock = threading.Lock()
+
+        def post() -> None:
+            status = self.post_job().status
+            with lock:
+                statuses.append(status)
+
+        with mock.patch.object(self.server.limiter, "has_room", side_effect=counted_look),                 mock.patch.object(self.server.jobs, "submit", side_effect=held_submit):
+            threads = [threading.Thread(target=post) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(DEADLINE)
+        self.assertEqual(sorted(statuses), [202, 429])
+        self.assertEqual(len(self.server.jobs), 1)
+
     def test_forwarded_for_is_ignored_from_untrusted_peers(self) -> None:
         self.start(rate_limit_fetches_per_minute=1)
         self.assertEqual(self.post_job(extra=[("X-Forwarded-For", "198.51.100.1")]).status, 202)
