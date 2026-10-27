@@ -355,6 +355,11 @@ class TemplateTest(unittest.TestCase):
         self.assertEqual(attrs["type"], "text")
         self.assertEqual(attrs["autocomplete"], "off")
         self.assertEqual(attrs["inputmode"], "url")
+        # Words, not an example link: the template may hold no http(s) URL,
+        # and fetch.js refuses a link without its scheme, so a sample such as
+        # "youtu.be/..." would invite exactly what the parser turns down.
+        self.assertTrue(attrs.get("placeholder"))
+        self.assertNotRegex(attrs["placeholder"], r"[./:]")
         self.assertEqual(by_id["yt-fetch"], ("button", {"type": "button", "id": "yt-fetch"}))
         self.assertEqual(by_id["yt-status"][0], "p")
         self.assertEqual(by_id["yt-status"][1].get("role"), "status")
