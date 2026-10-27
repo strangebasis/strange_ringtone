@@ -755,7 +755,10 @@ class RateLimitTest(ServerTestCase):
             with lock:
                 statuses.append(status)
 
-        with mock.patch.object(self.server.limiter, "has_room", side_effect=counted_look),                 mock.patch.object(self.server.jobs, "submit", side_effect=held_submit):
+        with (
+            mock.patch.object(self.server.limiter, "has_room", side_effect=counted_look),
+            mock.patch.object(self.server.jobs, "submit", side_effect=held_submit),
+        ):
             threads = [threading.Thread(target=post) for _ in range(2)]
             for thread in threads:
                 thread.start()
