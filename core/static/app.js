@@ -1,12 +1,14 @@
-// The trimmer: pick a file, select the hook, preview it, render it and hand it
-// to iOS. The page's configuration arrives in escaped data-* attributes,
-// because the CSP allows no inline script, and every dynamic text goes through
-// textContent, so a file name or a server message can never become markup.
+// The trimmer: pick a file or fetch a YouTube video, select the hook, preview
+// it, render it and hand it to iOS. The page's configuration arrives in
+// escaped data-* attributes, because the CSP allows no inline script, and
+// every dynamic text goes through textContent, so a file name, a video title
+// or a server message can never become markup.
 import { decodeFile, MAX_INPUT_SECONDS } from "./audio/decode.js";
 import { gainForTarget, integratedLufs } from "./audio/loudness.js";
 import { displayName, renderQuery, toneNameHeader } from "./audio/request.js";
-import { suggestSelection } from "./audio/suggest.js";
+import { suggestionRule, suggestSelection } from "./audio/suggest.js";
 import { clampSelection, encodeWav } from "./audio/wav.js";
+import { FetchError, fetchAudio, fetchErrorMessage, fetchJob, parseYouTubeLink, pollJob } from "./fetch.js";
 import { Player } from "./player.js";
 import { canShareFile, fetchResult, isCancel, render, resultUrl, shareFile, ShareError } from "./share.js";
 import { moveEdge, Waveform } from "./waveform.js";
@@ -66,6 +68,9 @@ const MAX_FRAMES = config.maxClipSeconds * SAMPLE_RATE;
 const el = {
   maxClipSeconds: byId("max-clip-seconds"),
   youtube: byId("youtube"),
+  ytLink: byId("yt-link"),
+  ytFetch: byId("yt-fetch"),
+  ytStatus: byId("yt-status"),
   file: byId("file"),
   fileStatus: byId("file-status"),
   editor: byId("editor"),
@@ -118,7 +123,11 @@ const state = {
   // file pick does not keep the new file's Hear final greyed out.
   renderToken: null,
   playing: null,
+  // Bumped by every new file pick or fetch: whichever came last wins, and an
+  // older one's result is dropped when it arrives.
   decodeToken: 0,
+  // Stops the polling of a fetch that a newer pick or fetch replaced.
+  fetchController: null,
 };
 
 let audioContext = null;
@@ -507,33 +516,57 @@ function resetForNewFile() {
   updateButtons();
 }
 
-el.file.addEventListener("change", async () => {
-  const file = el.file.files !== null && el.file.files.length > 0 ? el.file.files[0] : null;
-  if (file === null) return;
-  resetForNewFile();
-  // A second pick while the first file still decodes wins; the first result
-  // is dropped when it arrives.
+function fileHint() {
+  return "Any audio file up to " + Math.round(MAX_INPUT_SECONDS / 60)
+    + " minutes long. It is decoded on this device; only the selection is sent.";
+}
+
+// What placed the selection (docs/PLAN.md 7.2), in the status line's words.
+const RULE_WORDS = {
+  timestamp: "The selection starts at the link's timestamp",
+  heatmap: "The selection is on the most replayed stretch",
+  loudness: "The selection starts on the loudest stretch",
+};
+
+// A new pick or fetch replaces whatever was loading: the token makes an
+// older decode's result stale, and the abort stops an older fetch's polling.
+function supersede() {
   state.decodeToken += 1;
-  const token = state.decodeToken;
-  setStatus(el.fileStatus, "Reading the file…");
+  if (state.fetchController !== null) {
+    state.fetchController.abort();
+    state.fetchController = null;
+  }
+  return state.decodeToken;
+}
+
+/**
+ * Decode a picked or fetched file and open the editor on it. Shared by the
+ * file picker and the YouTube fetch, so both get the same checks.
+ * @param {File} file
+ * @param {number} token from supersede(); a newer one drops this result
+ * @param {{status: object, label: string, name: string, heatmap?: unknown, timestamp?: number | null}} source
+ *   where to report, what to call the clip there, the name field's value,
+ *   and the fetcher's hints for the suggestion
+ */
+async function loadAudio(file, token, { status, label, name, heatmap = null, timestamp = null }) {
   let audio;
   try {
     audio = await decodeFile(file, SAMPLE_RATE);
   } catch (error) {
-    if (token === state.decodeToken) setStatus(el.fileStatus, decodeErrorMessage(error), true);
+    if (token === state.decodeToken) setStatus(status, decodeErrorMessage(error), true);
     return;
   }
   if (token !== state.decodeToken) return;
   if (audio.length < MIN_FRAMES) {
-    setStatus(el.fileStatus, "This clip is shorter than half a second, too short for a ringtone.", true);
+    setStatus(status, "This clip is shorter than half a second, too short for a ringtone.", true);
     return;
   }
   state.audio = audio;
   state.fileName = file.name;
-  el.name.value = displayName(file.name);
+  el.name.value = name;
 
-  const suggestion = suggestSelection(audio.channels, audio.sampleRate, config.maxClipSeconds,
-    { heatmap: null, timestamp: null });
+  const options = { heatmap, timestamp };
+  const suggestion = suggestSelection(audio.channels, audio.sampleRate, config.maxClipSeconds, options);
   state.selection = { start: -1, end: -1 };
   applySelection({
     start: Math.round(suggestion.start * audio.sampleRate),
@@ -546,12 +579,122 @@ el.file.addEventListener("change", async () => {
   waveform.setAudio(audio.channels, audio.sampleRate, audio.length, { maxFrames: MAX_FRAMES, minFrames: MIN_FRAMES });
   waveform.setSelection(state.selection.start, state.selection.end);
   waveform.setFades(fadeSettings().fadeIn, fadeSettings().fadeOut);
-  setStatus(el.fileStatus, file.name + ", " + formatTime(audio.length / audio.sampleRate)
-    + ". The selection starts on the loudest stretch; drag the handles to change it.");
+  const duration = audio.length / audio.sampleRate;
+  setStatus(status, label + ", " + formatTime(duration) + ". "
+    + RULE_WORDS[suggestionRule(duration, options)] + "; drag the handles to change it.");
   setStatus(el.renderStatus, "");
   updateButtons();
   selectionChanged();
+}
+
+el.file.addEventListener("change", async () => {
+  const file = el.file.files !== null && el.file.files.length > 0 ? el.file.files[0] : null;
+  if (file === null) return;
+  resetForNewFile();
+  // A second pick while the first file still decodes wins, and so does a
+  // pick while a fetch runs.
+  const token = supersede();
+  setStatus(el.ytStatus, "");
+  setStatus(el.fileStatus, "Reading the file…");
+  await loadAudio(file, token, { status: el.fileStatus, label: file.name, name: displayName(file.name) });
 });
+
+// --- YouTube ----------------------------------------------------------------------
+
+const FETCH_STATES = {
+  queued: "Waiting in the queue…",
+  running: "Downloading…",
+};
+
+/**
+ * Fetch a YouTube video's audio through the fetcher and load it like a picked
+ * file. Only the ID parsed on this device is sent; the t= timestamp stays here
+ * and only moves the selection.
+ * @param {string} text a pasted or shared link
+ */
+async function fetchFromYouTube(text) {
+  // The box is hidden then too; this keeps any other path from reaching a
+  // fetcher the server did not announce.
+  if (!config.fetchEnabled) return;
+  const link = parseYouTubeLink(text);
+  if (link === null) {
+    setStatus(el.ytStatus, fetchErrorMessage("bad_link"), true);
+    return;
+  }
+  resetForNewFile();
+  const token = supersede();
+  const controller = new AbortController();
+  state.fetchController = controller;
+  const current = () => token === state.decodeToken;
+  // The picker's line goes back to its hint; a file picked earlier is no
+  // longer what the editor shows.
+  setStatus(el.fileStatus, fileHint());
+  el.file.value = "";
+  setStatus(el.ytStatus, "Fetching from YouTube…");
+  try {
+    const jobId = await fetchJob(link.videoId);
+    if (!current()) return;
+    const done = await pollJob(jobId, {
+      signal: controller.signal,
+      onStatus: (status) => {
+        if (current()) setStatus(el.ytStatus, FETCH_STATES[status]);
+      },
+    });
+    if (!current()) return;
+    setStatus(el.ytStatus, "Fetching the audio…");
+    const bytes = await fetchAudio(jobId);
+    if (!current()) return;
+    state.fetchController = null;
+    const title = done.title;
+    // Decoded from memory like a picked file. The title is only the File's
+    // name here and the name field's value; it never goes into a URL.
+    const file = new File([bytes], (title ?? "youtube") + ".m4a", { type: "audio/mp4" });
+    setStatus(el.ytStatus, "Reading the audio…");
+    await loadAudio(file, token, {
+      status: el.ytStatus,
+      label: title ?? "The video",
+      // The title itself: displayName would cut a last ".word" off it as if
+      // it were a file extension. An empty name lets the server choose one.
+      name: title ?? "",
+      heatmap: done.heatmap,
+      timestamp: link.timestamp,
+    });
+  } catch (error) {
+    if (!current()) return;
+    state.fetchController = null;
+    setStatus(el.ytStatus, error instanceof FetchError ? error.message : fetchErrorMessage("failed"), true);
+  }
+}
+
+el.ytFetch.addEventListener("click", () => {
+  void fetchFromYouTube(el.ytLink.value);
+});
+
+el.ytLink.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  void fetchFromYouTube(el.ytLink.value);
+});
+
+/**
+ * The link a "Make Ringtone" Shortcut put in the address as #yt=<URL-encoded
+ * link> (docs/PLAN.md 7.4), read once. A fragment is never sent to the
+ * server, so no proxy log sees it; it is removed from the address and the
+ * history entry before any request, so a reload or a copied address does not
+ * carry it on.
+ * @returns {string | null}
+ */
+function takeSharedLink() {
+  const hash = location.hash;
+  if (typeof hash !== "string" || !hash.startsWith("#yt=")) return null;
+  history.replaceState(null, "", location.pathname + location.search);
+  try {
+    return decodeURIComponent(hash.slice(4));
+  } catch {
+    // Broken %-escapes: parsed as it is, which fails with plain words.
+    return hash.slice(4);
+  }
+}
 
 // --- controls ---------------------------------------------------------------------
 
@@ -644,10 +787,10 @@ document.addEventListener("visibilitychange", () => {
 
 function init() {
   el.maxClipSeconds.textContent = String(config.maxClipSeconds);
-  // The fetcher arrives in milestone 5; until FETCH_ENABLED its place stays hidden.
+  // FETCH_ENABLED only reveals the box: the fetcher is a separate image the
+  // proxy routes /fetch/ to, and without it the box would only fail.
   el.youtube.hidden = !config.fetchEnabled;
-  setStatus(el.fileStatus, "Any audio file up to " + Math.round(MAX_INPUT_SECONDS / 60)
-    + " minutes long. It is decoded on this device; only the selection is sent.");
+  setStatus(el.fileStatus, fileHint());
   el.target.min = String(TARGET_MIN_LUFS);
   el.target.max = String(TARGET_MAX_LUFS);
   el.target.value = String(config.defaultTarget);
@@ -658,6 +801,15 @@ function init() {
   updateFades();
   updateLoudness();
   updateButtons();
+  const shared = takeSharedLink();
+  if (shared !== null) {
+    if (config.fetchEnabled) {
+      el.ytLink.value = shared;
+      void fetchFromYouTube(shared);
+    } else {
+      setStatus(el.fileStatus, "YouTube fetching is not enabled on this server. Pick an audio file instead.", true);
+    }
+  }
 }
 
 init();

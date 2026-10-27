@@ -343,6 +343,29 @@ class TemplateTest(unittest.TestCase):
         # Nothing on the page submits anywhere.
         self.assertNotIn("form", [tag for tag, _ in page.elements])
 
+    def test_youtube_controls(self) -> None:
+        page = _Page()
+        page.feed(self.text)
+        by_id = {dict(attrs).get("id"): (tag, dict(attrs)) for tag, attrs in page.elements}
+        # A plain text field, not type="url": iOS then offers paste and a Go
+        # key, and the page parses whatever arrives itself. No autocomplete,
+        # so links pasted earlier are not offered to whoever holds the phone.
+        tag, attrs = by_id["yt-link"]
+        self.assertEqual(tag, "input")
+        self.assertEqual(attrs["type"], "text")
+        self.assertEqual(attrs["autocomplete"], "off")
+        self.assertEqual(attrs["inputmode"], "url")
+        self.assertEqual(by_id["yt-fetch"], ("button", {"type": "button", "id": "yt-fetch"}))
+        self.assertEqual(by_id["yt-status"][0], "p")
+        self.assertEqual(by_id["yt-status"][1].get("role"), "status")
+        # All three live inside the hidden YouTube section.
+        ids = template_ids(self.text)
+        section = ids.index("youtube")
+        following = ids[section + 1:]
+        self.assertLess(following.index("yt-status"), following.index("pick"))
+        for name in ("yt-link", "yt-fetch"):
+            self.assertLess(following.index(name), following.index("pick"))
+
     def test_help_text(self) -> None:
         text = re.sub(r"\s+", " ", self.text)
         for phrase in (
@@ -351,6 +374,9 @@ class TemplateTest(unittest.TestCase):
             "Duplicate Ringtone",
             "Settings &gt; Sounds &amp; Haptics &gt; Ringtone (or Text Tone), swipe left",
             "If you hear nothing, turn off Silent mode.",
+            "paste a video link under <strong>From YouTube</strong>",
+            "<strong>Make Ringtone</strong> Shortcut",
+            "Only the video's ID reaches the server.",
         ):
             self.assertIn(phrase, text)
 
@@ -470,7 +496,10 @@ class JsFilesTest(unittest.TestCase):
                 self.texts[name] = handle.read()
 
     def test_every_script_passes_the_scan(self) -> None:
-        self.assertIn("app.js", self.files)
+        # fetch.js parses YouTube links and talks to /fetch/; it gets the same
+        # scan, so no absolute URL or markup sink slips in with it.
+        for name in ("app.js", "fetch.js"):
+            self.assertIn(name, self.files)
         for name, text in self.texts.items():
             with self.subTest(name):
                 self.assertEqual(audit_js(text), [])
@@ -491,7 +520,7 @@ class JsFilesTest(unittest.TestCase):
 
     def test_ui_modules_import_the_audio_modules(self) -> None:
         wanted = {"./audio/decode.js", "./audio/loudness.js", "./audio/request.js", "./audio/suggest.js",
-                  "./audio/wav.js", "./player.js", "./share.js", "./waveform.js"}
+                  "./audio/wav.js", "./fetch.js", "./player.js", "./share.js", "./waveform.js"}
         self.assertEqual(wanted - set(js_imports(self.texts["app.js"])), set())
 
 

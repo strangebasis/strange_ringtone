@@ -32,6 +32,7 @@ ALLOWED = {
     "waveform.js": _JS,
     "player.js": _JS,
     "share.js": _JS,
+    "fetch.js": _JS,
     "audio/decode.js": _JS,
     "audio/wav.js": _JS,
     "audio/loudness.js": _JS,

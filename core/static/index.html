@@ -14,7 +14,13 @@
 
 <section id="youtube" class="panel" hidden aria-labelledby="youtube-title">
 <h2 id="youtube-title">From YouTube</h2>
-<p>Fetching a clip from a YouTube link arrives in a later version.</p>
+<label class="field-label" for="yt-link">YouTube link</label>
+<div class="fetch-row">
+<input type="text" id="yt-link" autocomplete="off" inputmode="url" autocapitalize="off" spellcheck="false" enterkeyhint="go" placeholder="youtu.be/…">
+<button type="button" id="yt-fetch">Fetch</button>
+</div>
+<p id="yt-status" class="status" role="status"></p>
+<p class="hint">Only the video's ID is sent. The server fetches the audio (up to 10 minutes) from YouTube.</p>
 </section>
 
 <section id="pick" class="panel" aria-labelledby="pick-title">
@@ -107,6 +113,7 @@
 <section id="help" class="panel" aria-labelledby="help-title">
 <h2 id="help-title">Help</h2>
 <ul>
+<li>Where this server fetches from YouTube, paste a video link under <strong>From YouTube</strong>, or share the video from the YouTube app to a <strong>Make Ringtone</strong> Shortcut that opens this page with the link. Only the video's ID reaches the server.</li>
 <li><strong>Get on this iPhone</strong> opens the share sheet. Choose <strong>Use as Ringtone</strong>, and Settings lists the tone under the name you typed.</li>
 <li>If the share sheet doesn't offer it, tap <strong>Download .m4a</strong> or <strong>Download .m4r</strong>. Open Safari's downloads list (the download icon in the address bar), tap the file, then tap Share and <strong>Use as Ringtone</strong>.</li>
 <li><strong>Duplicate Ringtone</strong> means iOS already has this tone. Delete the old one, or type a new name and tap Hear final again.</li>

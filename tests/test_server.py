@@ -465,6 +465,7 @@ class StaticTest(ServerTestCase):
             "waveform.js": "text/javascript; charset=utf-8",
             "player.js": "text/javascript; charset=utf-8",
             "share.js": "text/javascript; charset=utf-8",
+            "fetch.js": "text/javascript; charset=utf-8",
             "audio/decode.js": "text/javascript; charset=utf-8",
             "audio/wav.js": "text/javascript; charset=utf-8",
             "audio/loudness.js": "text/javascript; charset=utf-8",
