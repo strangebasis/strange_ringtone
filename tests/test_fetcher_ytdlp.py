@@ -331,11 +331,11 @@ class MetadataTest(unittest.TestCase):
         return {"start_time": start, "end_time": end, "value": value}
 
     def test_heatmap_is_re_emitted(self) -> None:
-        raw = [self.point(0, 1.5, 0), self.point(1.5, 3, 1), {**self.point(3, 3, 0.25), "extra": "x"}]
+        raw = [self.point(0, 1.5, 0), self.point(1.5, 3, 1), {**self.point(2.5, 3, 0.25), "extra": "x"}]
         self.assertEqual(clean_heatmap(raw, 3), (
             {"start": 0.0, "end": 1.5, "value": 0.0},
             {"start": 1.5, "end": 3.0, "value": 1.0},
-            {"start": 3.0, "end": 3.0, "value": 0.25},
+            {"start": 2.5, "end": 3.0, "value": 0.25},
         ))
 
     def test_heatmap_may_overrun_whole_second_duration_slightly(self) -> None:
@@ -343,6 +343,29 @@ class MetadataTest(unittest.TestCase):
         self.assertEqual(clean_heatmap([self.point(200, 215.4, 1)], 215),
                          ({"start": 200.0, "end": 215.0, "value": 1.0},))
         self.assertIsNone(clean_heatmap([self.point(200, 216.5, 1)], 215))
+        # A point wholly inside the overrun covers none of the duration: it is
+        # left out rather than sent as a zero-length point, which the page
+        # would refuse together with the rest of the list.
+        self.assertEqual(clean_heatmap([self.point(200, 215, 1), self.point(215, 215.4, 0.5)], 215),
+                         ({"start": 200.0, "end": 215.0, "value": 1.0},))
+        self.assertEqual(clean_heatmap([self.point(214, 215.2, 1), self.point(215.2, 215.9, 0.5)], 215),
+                         ({"start": 214.0, "end": 215.0, "value": 1.0},))
+        self.assertIsNone(clean_heatmap([self.point(215, 215.4, 1)], 215))
+
+    def test_every_emitted_heatmap_is_one_the_page_accepts(self) -> None:
+        # The conditions of validHeatmap in core/static/audio/suggest.js,
+        # against the reported case: 100 even segments of a 45.9 s video
+        # whose yt-dlp duration is 45, so the last ones run past it.
+        for length, duration in ((45.9, 45), (30.99, 30), (215.4, 215), (60.0, 60)):
+            raw = [self.point(i * length / 100, (i + 1) * length / 100, 0.5) for i in range(100)]
+            with self.subTest(length=length):
+                points = clean_heatmap(raw, duration)
+                assert points is not None
+                self.assertLessEqual(len(points), 200)
+                for point in points:
+                    self.assertEqual(set(point), {"start", "end", "value"})
+                    self.assertTrue(0 <= point["start"] < point["end"] <= duration, point)
+                    self.assertTrue(0 <= point["value"] <= 1, point)
 
     def test_bad_heatmaps_are_dropped_whole(self) -> None:
         good = self.point()
@@ -354,6 +377,9 @@ class MetadataTest(unittest.TestCase):
             "missing key": [good, {"start_time": 0, "end_time": 1}],
             "negative start": [good, self.point(-0.1, 1)],
             "end before start": [good, self.point(2, 1)],
+            # The page refuses a list with one zero-length point (suggest.js).
+            "zero length": [good, self.point(5, 5)],
+            "zero length at the end": [good, self.point(10, 10)],
             "past the duration": [good, self.point(1, 12)],
             "value above 1": [good, self.point(value=1.01)],
             "value below 0": [good, self.point(value=-0.01)],

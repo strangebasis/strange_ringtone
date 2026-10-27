@@ -221,6 +221,8 @@ def clean_heatmap(value: Any, duration: int | float | None) -> tuple[dict[str, f
 
     Never truncated or partly kept: a list that is too long or holds one bad
     point is dropped whole, and the page falls back to its loudness rule.
+    Only a point that lies wholly in the tolerated overrun past the duration
+    is left out, because it covers none of the audio.
     """
     if duration is None or not isinstance(value, list) or not 1 <= len(value) <= HEATMAP_MAX_POINTS:
         return None
@@ -234,11 +236,20 @@ def clean_heatmap(value: Any, duration: int | float | None) -> tuple[dict[str, f
         score = _number(point.get("value"))
         if start is None or end is None or score is None:
             return None
-        if not (0 <= start <= end <= limit and 0 <= score <= 1):
+        # start < end, as the page's validHeatmap (core/static/audio/suggest.js)
+        # requires: one zero-length point there turns rule 2 off for the
+        # whole list, so such a list is refused here instead of sent.
+        if not (0 <= start < end <= limit and 0 <= score <= 1):
             return None
-        # Within the duration exactly, as the status JSON promises.
-        points.append({"start": min(start, float(duration)), "end": min(end, float(duration)), "value": score})
-    return tuple(points)
+        # Within the duration exactly, as the status JSON promises. A point
+        # that starts at or after the whole-second duration (the overrun
+        # HEATMAP_TOLERANCE_SECONDS allows) covers none of it and would come
+        # out zero-length, so it is left out; it carries no weight anyway.
+        end = min(end, float(duration))
+        if end <= start:
+            continue
+        points.append({"start": start, "end": end, "value": score})
+    return tuple(points) or None
 
 
 def parse_info(info: Any) -> Metadata:

@@ -184,6 +184,24 @@ test("rule 2: a point may end up to 1 s after the audio does", () => {
   assert.equal(suggestionRule(60, { heatmap: points }), "loudness");
 });
 
+test("rule 2: the fetcher's list for audio longer than its whole-second duration is used", () => {
+  // What strange_ringtone_fetch.ytdlp.clean_heatmap sends for 100 segments
+  // of a 45.9 s video whose yt-dlp duration is 45: the segments that start
+  // past 45 s are left out and the last kept one ends at 45 s, so no point is
+  // zero-length (tests/test_fetcher_ytdlp.py pins that side).
+  const length = 45.9;
+  const points = [];
+  for (let i = 0; i < 100; i += 1) {
+    const start = (i * length) / 100;
+    const end = Math.min(((i + 1) * length) / 100, 45);
+    if (end > start) points.push({ start, end, value: i >= 60 && i < 75 ? 1 : 0.1 });
+  }
+  assert.equal(points.length, 99);
+  assert.equal(suggestionRule(length, { heatmap: points }), "heatmap");
+  // Kept zero-length, the last point would have turned rule 2 off.
+  assert.equal(suggestionRule(length, { heatmap: [...points, { start: 45, end: 45, value: 0.1 }] }), "loudness");
+});
+
 test("an invalid heatmap falls through to rule 3", () => {
   const plain = suggestSelection([LOUD_AT_30], RATE, 15);
   const good = () => heatmap(60, 5, 15);
