@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import argparse
 import math
+import secrets
 import socket
 import socketserver
 import struct
 import sys
 import tempfile
 import threading
+import time
 import wave
 from pathlib import Path
 from typing import Any
@@ -147,6 +149,18 @@ class Proxy(socketserver.ThreadingTCPServer):
         super().__init__((LOOPBACK, port), ProxyHandler)
 
 
+def dev_version() -> str:
+    """A VERSION for this start of the stack, so the browser never runs stale code.
+
+    The core serves /static/<version>/ as immutable, which is right for a
+    release (a release changes the version, and with it every asset path) but
+    would make a browser keep the modules of an earlier start of this stack
+    across code changes. A new segment for every start sidesteps that cache.
+    """
+    # The clock alone can repeat within a tick (Windows), hence the random part.
+    return f"dev-{int(time.time())}-{secrets.token_hex(4)}"
+
+
 def serve(server: socketserver.BaseServer) -> threading.Thread:
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2}, daemon=True)
     thread.start()
@@ -169,7 +183,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             audio = work / "audio.wav"
             duration = make_audio(audio)
-        core_settings = CoreSettings(public_origin=origin, fetch_enabled=True, scratch_dir=work / "core")
+        core_settings = CoreSettings(public_origin=origin, fetch_enabled=True, scratch_dir=work / "core",
+                                     version=dev_version())
         command = (args.ffmpeg,) if args.ffmpeg else (sys.executable, "-I", str(FFMPEG_STUB))
         core = RingtoneServer((LOOPBACK, 0), core_settings,
                               renderer=Renderer(command, core_settings.render_timeout_seconds))
