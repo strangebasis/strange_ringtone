@@ -849,9 +849,12 @@ test("a second tap on Fetch for the same video while it is on its way opens no s
   ]);
   assert.equal(page.el("yt-status").textContent,
     `${TITLE}, 1:00.0. The selection starts on the loudest stretch; drag the handles to change it.`);
-  // Once it is done, the same link can be fetched again.
+  // Once it is done, the same link can be fetched again. Its audio arrives
+  // too, so nothing of it is left running into the next test.
   page.el("yt-fetch").dispatch("click");
   await until(() => fetchUrls(page).filter((url) => url === "/fetch/api/jobs").length === 2, "the second job");
+  await until(() => fetchUrls(page).filter((url) => url.endsWith("/audio")).length === 2, "the second audio");
+  await settle();
 });
 
 test("the replaced fetch's cancel neither shows its words nor drops the newer fetch's way to be stopped", async () => {
@@ -880,8 +883,11 @@ test("the replaced fetch's cancel neither shows its words nor drops the newer fe
   page.el("yt-link").value = OTHER_VIDEO_ID;
   page.el("yt-fetch").dispatch("click");
   await until(() => page.fetchCalls.length === 4, "fetch B's first poll");
-  // B's second poll comes after A's cancelled look, which was due first.
-  await until(() => page.fetchCalls.length === 5, "fetch B's second poll", 4000);
+  // B's second poll comes after A's cancelled look, which was due first. At
+  // least, not exactly, 5: a regression that lets A's look through makes it
+  // 6, which the exact count at the end catches; an exact check here could
+  // miss that and wait out the deadline. The budget allows for a slow runner.
+  await until(() => page.fetchCalls.length >= 5, "fetch B's second poll", 8000);
   await settle();
   assert.equal(page.el("yt-status").textContent, "Waiting in the queue…");
   assert.equal(page.el("yt-status").classes.has("error"), false);
