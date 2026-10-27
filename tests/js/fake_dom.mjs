@@ -231,6 +231,8 @@ let instance = 0;
 let nextDecoded = null;
 const realSetInterval = globalThis.setInterval;
 const realSetTimeout = globalThis.setTimeout;
+// The real File, kept before loadApp swaps in a recording subclass.
+const REAL_FILE = globalThis.File;
 
 class FakeOfflineAudioContext {
   constructor(count, length, sampleRate) {
@@ -295,7 +297,23 @@ export async function loadApp(options = {}) {
     if (ms >= 60_000) timer.unref();
     return timer;
   };
-  globalThis.window = { devicePixelRatio: 2, matchMedia: () => ({ addEventListener() {} }), addEventListener() {} };
+  const windowListeners = new Map();
+  globalThis.window = {
+    devicePixelRatio: 2,
+    matchMedia: () => ({ addEventListener() {} }),
+    addEventListener(type, listener) {
+      if (!windowListeners.has(type)) windowListeners.set(type, []);
+      windowListeners.get(type).push(listener);
+    },
+  };
+  // Every File app.js makes, so a test can see the name and type it gave one.
+  const files = [];
+  globalThis.File = class extends REAL_FILE {
+    constructor(...args) {
+      super(...args);
+      files.push(this);
+    }
+  };
   globalThis.getComputedStyle = () => ({ getPropertyValue: () => "" });
   globalThis.ResizeObserver = class { observe() {} };
   globalThis.Element = FakeElement;
@@ -346,6 +364,10 @@ export async function loadApp(options = {}) {
     fireDocument: (type) => (documentListeners.get(type) ?? []).map((listener) => listener({ type })),
     /** Every delay the page asked setTimeout for, in order. */
     timerDelays: () => [...timerDelays],
+    /** Fire a window event, such as hashchange. */
+    fireWindow: (type) => (windowListeners.get(type) ?? []).map((listener) => listener({ type })),
+    /** The Files app.js created so far. */
+    files: () => [...files],
     /** The AudioContexts app.js created so far. */
     contexts: () => [...contexts],
     /** The bytes decodeFile was given, per call. */

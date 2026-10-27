@@ -696,6 +696,18 @@ function takeSharedLink() {
   }
 }
 
+/** Fetch the #yt= link, if the address has one; at start-up and on hashchange. */
+function useSharedLink() {
+  const shared = takeSharedLink();
+  if (shared === null) return;
+  if (config.fetchEnabled) {
+    el.ytLink.value = shared;
+    void fetchFromYouTube(shared);
+  } else {
+    setStatus(el.fileStatus, "YouTube fetching is not enabled on this server. Pick an audio file instead.", true);
+  }
+}
+
 // --- controls ---------------------------------------------------------------------
 
 function updateFades() {
@@ -801,15 +813,11 @@ function init() {
   updateFades();
   updateLoudness();
   updateButtons();
-  const shared = takeSharedLink();
-  if (shared !== null) {
-    if (config.fetchEnabled) {
-      el.ytLink.value = shared;
-      void fetchFromYouTube(shared);
-    } else {
-      setStatus(el.fileStatus, "YouTube fetching is not enabled on this server. Pick an audio file instead.", true);
-    }
-  }
+  useSharedLink();
+  // Sharing to the Shortcut again while the app is open in that tab changes
+  // only the fragment, which loads nothing: without this the link would
+  // stay in the address bar, unread.
+  window.addEventListener("hashchange", useSharedLink);
 }
 
 init();
