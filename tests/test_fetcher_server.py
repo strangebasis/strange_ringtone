@@ -29,7 +29,7 @@ from strange_ringtone_fetch import server as server_module
 from strange_ringtone_fetch.config import Settings
 from strange_ringtone_fetch.jobs import Jobs, QueueFull
 from strange_ringtone_fetch.server import FetchServer, Handler, parse_job_request, prepare_scratch
-from strange_ringtone_fetch.ytdlp import FetchError
+from strange_ringtone_fetch.ytdlp import FetchError, YtDlp, default_prlimit
 from test_fetcher_jobs import FakeClock, FakeRunner
 from test_fetcher_ytdlp import StubYtDlp, stub_title
 
@@ -249,6 +249,30 @@ class ServerTestCase(unittest.TestCase):
         self.assertEqual(response.headers.get("Content-Type"), "application/json")
         self.assertEqual(response.json(), {"error": code})
         self.assertSecurityHeaders(response, hsts=self.settings.public_origin.startswith("https://"))
+
+
+class DefaultRunnerTest(unittest.TestCase):
+    """The yt-dlp runner the server builds itself gets the operator's settings."""
+
+    def test_settings_reach_the_runner(self) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        proxies = (("HTTPS_PROXY", "http://proxy.example.internal:3128"),)
+        settings = Settings(
+            public_origin=ORIGIN, fetch_max_seconds=300, fetch_max_bytes=2 * 1024 * 1024, fetch_timeout_seconds=45,
+            proxies=proxies, scratch_dir=Path(temp.name) / "scratch",
+        )
+        server = FetchServer(("127.0.0.1", 0), settings)
+        self.addCleanup(server.server_close)
+        runner = server.runner
+        assert isinstance(runner, YtDlp)
+        # A deployment that can reach YouTube only through its proxy would
+        # otherwise fail every fetch, with no setting looking wrong.
+        self.assertEqual(runner.proxies, proxies)
+        env = runner.child_env(Path(temp.name) / "job")
+        self.assertEqual(env.get("HTTPS_PROXY"), "http://proxy.example.internal:3128")
+        self.assertEqual((runner.max_seconds, runner.max_bytes, runner.timeout_seconds), (300, 2 * 1024 * 1024, 45))
+        self.assertEqual(runner.prlimit, default_prlimit())
 
 
 class HeadersTest(ServerTestCase):
