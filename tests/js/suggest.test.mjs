@@ -1,8 +1,10 @@
-// The initial selection, docs/PLAN.md 7.2 rule 3 (core/static/audio/suggest.js).
+// The initial selection, docs/PLAN.md 7.2 rules 1 to 3 (core/static/audio/suggest.js).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { bestWindow, snapToQuiet, suggestSelection } from "../../core/static/audio/suggest.js";
+import {
+  bestWindow, scoreHeatmap, snapToQuiet, suggestionRule, suggestSelection,
+} from "../../core/static/audio/suggest.js";
 
 const RATE = 44100;
 
@@ -118,11 +120,158 @@ test("a cap shorter than the 3 s short-term window still works", () => {
   assert.ok(start >= 4 && start <= 6, `start ${start}`);
 });
 
-test("heatmap and timestamp options are accepted and ignored until milestone 5", () => {
-  const signal = sections([20, 0.01], [15, 0.5], [25, 0.01]);
-  const plain = suggestSelection([signal], RATE, 15);
-  assert.deepEqual(suggestSelection([signal], RATE, 15, { heatmap: [[0, 1, 1]], timestamp: 3 }), plain);
-  assert.deepEqual(suggestSelection([signal], RATE, 15, { heatmap: null, timestamp: null }), plain);
+// --- rules 1 (t=) and 2 (the heatmap) ---------------------------------------------
+
+// 30 s of digital silence, 15 s loud, 15 s of silence: rule 3 picks 30 s, and
+// a start anywhere in the leading silence stays exactly where it is put,
+// because the snap moves only to somewhere strictly quieter than silence.
+const LOUD_AT_30 = sections([30, 0], [15, 0.5], [15, 0]);
+
+// 1 s heatmap points over `seconds`, value 1 from `from` for `length` seconds
+// and `rest` everywhere else.
+function heatmap(seconds, from, length, rest = 0) {
+  return Array.from({ length: seconds }, (_, i) => ({
+    start: i, end: i + 1, value: i >= from && i < from + length ? 1 : rest,
+  }));
+}
+
+test("rule 1: the t= timestamp places the start, over the loudest stretch", () => {
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, { timestamp: 10, heatmap: null }), { start: 10, end: 25 });
+  // Without it, rule 3 goes to the loud part.
+  const plain = suggestSelection([LOUD_AT_30], RATE, 15);
+  assert.ok(plain.start >= 29 && plain.start <= 31, `rule 3 start ${plain.start}`);
+  // 0 is a timestamp too (t=0 means the very start).
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, { timestamp: 0 }), { start: 0, end: 15 });
+});
+
+test("rule 1 wins over the heatmap", () => {
+  const options = { timestamp: 10, heatmap: heatmap(60, 40, 15, 0.1) };
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, options), { start: 10, end: 25 });
+  assert.equal(suggestionRule(60, options), "timestamp");
+});
+
+test("a t= in the last half second, past the end or not a number falls through", () => {
+  const plain = suggestSelection([LOUD_AT_30], RATE, 15);
+  for (const timestamp of [59.5, 59.9, 60, 61, 1e9, -1, -0.001, NaN, Infinity, -Infinity, "10", null, undefined,
+    [10], { valueOf: () => 10 }]) {
+    assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, { timestamp, heatmap: null }), plain, String(timestamp));
+  }
+  // Falling through reaches rule 2 when there is a heatmap.
+  const options = { timestamp: 59.5, heatmap: heatmap(60, 5, 15) };
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, options), { start: 5, end: 20 });
+  assert.equal(suggestionRule(60, options), "heatmap");
+});
+
+test("rule 1: the end slides back at the file's end, keeping the full length", () => {
+  // Just inside the margin: 59.4 + 0.5 < 60.
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, { timestamp: 59.4 }), { start: 45, end: 60 });
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, { timestamp: 50 }), { start: 45, end: 60 });
+});
+
+test("rule 2: the heatmap window with the highest sum wins over a louder stretch", () => {
+  const options = { timestamp: null, heatmap: heatmap(60, 5, 15) };
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, options), { start: 5, end: 20 });
+  assert.equal(suggestionRule(60, options), "heatmap");
+  // A heatmap that peaks at the end slides back like any other window.
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, { heatmap: heatmap(60, 50, 10) }), { start: 45, end: 60 });
+});
+
+test("rule 2: a point may end up to 1 s after the audio does", () => {
+  const points = heatmap(60, 5, 15);
+  points[59] = { start: 59, end: 61, value: 0 };
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, { heatmap: points }), { start: 5, end: 20 });
+  points[59] = { start: 59, end: 61.01, value: 0 };
+  assert.equal(suggestionRule(60, { heatmap: points }), "loudness");
+});
+
+test("an invalid heatmap falls through to rule 3", () => {
+  const plain = suggestSelection([LOUD_AT_30], RATE, 15);
+  const good = () => heatmap(60, 5, 15);
+  const withPoint = (point) => {
+    const points = good();
+    points[3] = point;
+    return points;
+  };
+  const cases = {
+    "not an array": { 0: { start: 0, end: 1, value: 1 } },
+    "empty": [],
+    "201 points": Array.from({ length: 201 }, (_, i) => ({ start: i * 0.25, end: (i + 1) * 0.25, value: 1 })),
+    "null point": withPoint(null),
+    "a number": withPoint(1),
+    "value above 1": withPoint({ start: 3, end: 4, value: 1.5 }),
+    "negative value": withPoint({ start: 3, end: 4, value: -0.1 }),
+    "NaN value": withPoint({ start: 3, end: 4, value: NaN }),
+    "string value": withPoint({ start: 3, end: 4, value: "1" }),
+    "missing value": withPoint({ start: 3, end: 4 }),
+    "negative start": withPoint({ start: -1, end: 4, value: 1 }),
+    "start after end": withPoint({ start: 4, end: 3, value: 1 }),
+    "empty span": withPoint({ start: 3, end: 3, value: 1 }),
+    "end past the audio": withPoint({ start: 3, end: 62, value: 1 }),
+    "infinite end": withPoint({ start: 3, end: Infinity, value: 1 }),
+    "the server's names": withPoint({ start_time: 3, end_time: 4, value: 1 }),
+  };
+  for (const [label, points] of Object.entries(cases)) {
+    assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, { heatmap: points }), plain, label);
+    assert.equal(suggestionRule(60, { heatmap: points }), "loudness", label);
+  }
+  // The same list without the bad point is used.
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, { heatmap: good() }), { start: 5, end: 20 });
+  // 200 points are still fine.
+  const many = Array.from({ length: 200 }, (_, i) => ({ start: i * 0.3, end: (i + 1) * 0.3, value: i < 50 ? 1 : 0 }));
+  assert.equal(suggestionRule(60, { heatmap: many }), "heatmap");
+});
+
+test("the snap applies to rules 1 and 2", () => {
+  // Quiet tone throughout, 100 ms of digital silence at 19.4 s, and a much
+  // louder stretch at 40 s that rule 3 would choose.
+  const signal = sections([19.4, 0.01], [0.1, 0], [20.5, 0.01], [15, 0.5], [5, 0.01]);
+  const byTimestamp = suggestSelection([signal], RATE, 15, { timestamp: 20 });
+  assert.ok(byTimestamp.start >= 19.4 && byTimestamp.start <= 19.5, `t= start ${byTimestamp.start}`);
+  near(byTimestamp.end - byTimestamp.start, 15, 1e-9, "t= length");
+  const byHeatmap = suggestSelection([signal], RATE, 15, { heatmap: heatmap(60, 20, 15) });
+  assert.ok(byHeatmap.start >= 19.4 && byHeatmap.start <= 19.5, `heatmap start ${byHeatmap.start}`);
+  near(byHeatmap.end - byHeatmap.start, 15, 1e-9, "heatmap length");
+  // Out of reach: a timestamp 2 s after the gap stays within 1 s of itself.
+  const far = suggestSelection([signal], RATE, 15, { timestamp: 21.5 });
+  assert.ok(far.start >= 20.5 && far.start <= 22.5, `far start ${far.start}`);
+});
+
+test("the options are ignored when the whole input fits", () => {
+  const short = sections([10, 0.5]);
+  assert.deepEqual(suggestSelection([short], RATE, 15, { timestamp: 5, heatmap: heatmap(10, 2, 3) }), { start: 0, end: 10 });
+  // And a missing or null options object is rule 3.
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, null), suggestSelection([LOUD_AT_30], RATE, 15));
+  assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, {}), suggestSelection([LOUD_AT_30], RATE, 15));
+});
+
+test("scoreHeatmap weights each point by the seconds the window covers", () => {
+  // One strong point of 2 s against a weak one of 10 s: 0.9 x 2 = 1.8 beats
+  // 0.15 x 10 = 1.5 for a 10 s window that can hold only one of them.
+  const points = [{ start: 2, end: 4, value: 0.9 }, { start: 20, end: 30, value: 0.15 }];
+  assert.equal(scoreHeatmap(points, 10, 30, 0.1), 0);
+  // At 0.7 (1.4) the long one wins, in the one window that covers it whole.
+  points[0].value = 0.7;
+  near(scoreHeatmap(points, 10, 30, 0.1), 20, 1e-9, "the long point");
+  // A window shorter than a point scores the seconds it covers: 1 s windows
+  // from 10 to 11 all score 1, the one at 9.5 only 0.5, and the earliest wins.
+  assert.equal(scoreHeatmap([{ start: 10, end: 12, value: 1 }], 1, 20, 0.5), 10);
+});
+
+test("scoreHeatmap: of equal windows the earliest wins, and candidates step by the hop", () => {
+  // Every window covering [5, 6] scores 1: starts 0 to 5 are equal.
+  assert.equal(scoreHeatmap([{ start: 5, end: 6, value: 1 }], 10, 30, 0.1), 0);
+  // Equal sums from many small products still tie.
+  const flat = Array.from({ length: 100 }, (_, i) => ({ start: i * 0.3, end: (i + 1) * 0.3, value: 0.1 }));
+  assert.equal(scoreHeatmap(flat, 10, 30, 0.1), 0);
+  // A 1 s point at 7.4 s and 1 s windows: with a 0.1 s hop the window at 7.4
+  // covers it whole (7.3 and 7.5 cover 0.9); with a 0.5 s hop only 7.0 (0.6)
+  // and 7.5 (0.9) exist.
+  const peak = [{ start: 7.4, end: 8.4, value: 1 }];
+  near(scoreHeatmap(peak, 1, 30, 0.1), 7.4, 1e-9, "0.1 s hop");
+  near(scoreHeatmap(peak, 1, 30, 0.5), 7.5, 1e-9, "0.5 s hop");
+  // The last candidate ends exactly at the input's end, although 20 / 0.1
+  // falls just short of 200 in floating point.
+  near(scoreHeatmap([{ start: 29, end: 30, value: 1 }], 10, 30, 0.1), 20, 1e-9, "last window");
 });
 
 test("bad arguments are refused", () => {

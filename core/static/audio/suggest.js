@@ -1,14 +1,19 @@
-// The initial selection: docs/PLAN.md 7.2, rule 3.
+// The initial selection: docs/PLAN.md 7.2. The first rule that applies wins:
 //
-// Choruses tend to be the loudest part of a song, so the selection goes on the
-// MAX_CLIP_SECONDS window with the highest mean short-term loudness, and its
-// start then moves to the quietest 50 ms within +-1 s so it does not cut into
-// a word. Rules 1 (a t= timestamp) and 2 (YouTube's heatmap) are milestone 5.
+// 1. A t= timestamp from the shared link: the selection starts there.
+// 2. YouTube's "Most Replayed" heatmap: the window with the highest summed
+//    value, each point weighted by the seconds of it the window covers.
+// 3. Otherwise the MAX_CLIP_SECONDS window with the highest mean short-term
+//    loudness, since choruses tend to be the loudest part of a song.
+//
+// Whichever rule placed it, the start then moves to the quietest 50 ms within
+// +-1 s so it does not cut into a word, and the window keeps its full length.
 //
 // Everything is O(N) in the input: one K-weighting pass builds a prefix sum of
 // energy per 10 ms (loudness.js), after which every 3 s window and every 50 ms
 // RMS is a subtraction, and a second prefix sum over the curve scores every
-// candidate window in O(1). A 10-minute file stays fast on a phone.
+// candidate window in O(1). A 10-minute file stays fast on a phone. The
+// heatmap's score is O(points x candidates), with at most 200 points.
 
 import { GRANULES_PER_SECOND, SHORT_TERM_SECONDS, energyPrefix, windowCurve } from "./loudness.js";
 
@@ -20,20 +25,34 @@ const RMS_GRANULES = GRANULES_PER_SECOND / 20;
 // Silence and anything below the absolute gate count as -70 LUFS, so one
 // silent gap does not drag a window's mean to -Infinity.
 const FLOOR_LUFS = -70;
+// Rule 1 needs at least this much audio after the timestamp: a t= in the last
+// half second would leave nothing of what the link pointed at once the
+// window slides back to fit.
+const TIMESTAMP_MARGIN_SECONDS = 0.5;
+// The fetcher re-emits at most 200 heatmap points (docs/PLAN.md 6). A longer
+// list did not come from it, and would make the O(points) scoring slow.
+const MAX_HEATMAP_POINTS = 200;
+// YouTube's last heatmap segment follows the video's duration, which can run
+// a little past the decoded audio's.
+const HEATMAP_END_SLACK_SECONDS = 1;
+// Candidate heatmap windows start every 100 ms, as rule 3's do.
+const HOP_SECONDS = 0.1;
+// Sums of a few hundred products differ in their last bits for windows that
+// are really equal; within this they tie, and the earliest wins.
+const SCORE_EPSILON = 1e-9;
 
 /**
  * Suggest the initial selection.
  * @param {Float32Array[]} channels 1 or 2 channels of equal length
  * @param {number} sampleRate in Hz
  * @param {number} maxSeconds MAX_CLIP_SECONDS
- * @param {{heatmap?: unknown, timestamp?: unknown}} [options] accepted and
- *   ignored until milestone 5 (rules 1 and 2)
+ * @param {{heatmap?: unknown, timestamp?: unknown}} [options] the shared
+ *   link's t= in seconds (rule 1) and the fetcher's heatmap, an array of
+ *   {start, end, value} (rule 2); an invalid value is ignored, never thrown on
  * @returns {{start: number, end: number}} seconds; end - start is maxSeconds,
  *   or the whole input when it is no longer than that
  */
 export function suggestSelection(channels, sampleRate, maxSeconds, options = { heatmap: null, timestamp: null }) {
-  // Read in milestone 5; named here so the signature is already final.
-  void options;
   if (!(Number.isFinite(maxSeconds) && maxSeconds > 0)) {
     throw new RangeError("maxSeconds must be positive");
   }
@@ -46,18 +65,28 @@ export function suggestSelection(channels, sampleRate, maxSeconds, options = { h
   }
   const energy = energyPrefix(channels, sampleRate);
   const { prefix, granule, count } = energy;
-  const maxGranules = Math.round(maxSeconds * GRANULES_PER_SECOND);
-  // A cap under 3 s gets windows as long as the cap, so every candidate still
-  // has at least one loudness value inside it.
-  const windowGranules = Math.min(SHORT_TERM_SECONDS * GRANULES_PER_SECOND, maxGranules);
-  const curve = windowCurve(energy, windowGranules, HOP_GRANULES);
-  if (!curve.some((value) => value > FLOOR_LUFS)) {
-    return { start: 0, end: Math.min(maxSeconds, duration) };
-  }
+  const toGranule = (seconds) => Math.min(Math.max(Math.round((seconds * sampleRate) / granule), 0), count);
+  const { heatmap = null, timestamp = null } = options ?? {};
 
-  const perWindow = Math.floor((maxGranules - windowGranules) / HOP_GRANULES) + 1;
-  const candidates = Math.max(0, Math.floor((count - maxGranules) / HOP_GRANULES)) + 1;
-  const chosen = bestWindow(curve, perWindow, candidates) * HOP_GRANULES;
+  let chosen;
+  const rule = suggestionRule(duration, { heatmap, timestamp });
+  if (rule === "timestamp") {
+    chosen = toGranule(timestamp);
+  } else if (rule === "heatmap") {
+    chosen = toGranule(scoreHeatmap(heatmap, maxSeconds, duration, HOP_SECONDS));
+  } else {
+    const maxGranules = Math.round(maxSeconds * GRANULES_PER_SECOND);
+    // A cap under 3 s gets windows as long as the cap, so every candidate
+    // still has at least one loudness value inside it.
+    const windowGranules = Math.min(SHORT_TERM_SECONDS * GRANULES_PER_SECOND, maxGranules);
+    const curve = windowCurve(energy, windowGranules, HOP_GRANULES);
+    if (!curve.some((value) => value > FLOOR_LUFS)) {
+      return { start: 0, end: Math.min(maxSeconds, duration) };
+    }
+    const perWindow = Math.floor((maxGranules - windowGranules) / HOP_GRANULES) + 1;
+    const candidates = Math.max(0, Math.floor((count - maxGranules) / HOP_GRANULES)) + 1;
+    chosen = bestWindow(curve, perWindow, candidates) * HOP_GRANULES;
+  }
   const snapped = snapToQuiet(prefix, count, chosen);
 
   let start = (snapped * granule) / sampleRate;
@@ -68,6 +97,81 @@ export function suggestSelection(channels, sampleRate, maxSeconds, options = { h
     start = duration - maxSeconds;
   }
   return { start, end };
+}
+
+/**
+ * Which rule places the selection in input this long, when it is longer than
+ * MAX_CLIP_SECONDS (shorter input is selected whole). Exported so the page
+ * can say why the selection is where it is.
+ * @param {number} duration the input's length in seconds
+ * @param {{heatmap?: unknown, timestamp?: unknown}} [options] as suggestSelection's
+ * @returns {"timestamp" | "heatmap" | "loudness"}
+ */
+export function suggestionRule(duration, options = {}) {
+  const { heatmap = null, timestamp = null } = options ?? {};
+  // typeof first: a string such as "90" must never be coerced into a position.
+  if (isFiniteNumber(timestamp) && timestamp >= 0 && timestamp < duration - TIMESTAMP_MARGIN_SECONDS) {
+    return "timestamp";
+  }
+  if (validHeatmap(heatmap, duration)) {
+    return "heatmap";
+  }
+  return "loudness";
+}
+
+function isFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+/**
+ * Whether every heatmap point is usable. One bad point disables rule 2
+ * altogether: a list that is partly wrong is not trusted to be partly right,
+ * and the loudness rule is a better guess than a window placed by bad data.
+ */
+function validHeatmap(points, duration) {
+  if (!Array.isArray(points) || points.length === 0 || points.length > MAX_HEATMAP_POINTS) {
+    return false;
+  }
+  return points.every((point) => point !== null && typeof point === "object"
+    && isFiniteNumber(point.start) && isFiniteNumber(point.end) && isFiniteNumber(point.value)
+    && point.start >= 0 && point.start < point.end && point.end <= duration + HEATMAP_END_SLACK_SECONDS
+    && point.value >= 0 && point.value <= 1);
+}
+
+/**
+ * Rule 2's choice: of the windows [s, s + maxSeconds] that start every
+ * hopSeconds and end within the input, the one with the highest sum over the
+ * points of value x the seconds of the point the window covers. Exported for
+ * the tests. The points must already be valid (see validHeatmap).
+ * @param {{start: number, end: number, value: number}[]} points
+ * @param {number} maxSeconds the window's length
+ * @param {number} duration the input's length in seconds (more than maxSeconds)
+ * @param {number} hopSeconds the distance between candidate starts
+ * @returns {number} the best window's start in seconds; of equal ones the earliest
+ */
+export function scoreHeatmap(points, maxSeconds, duration, hopSeconds) {
+  // The allowance keeps the window that ends exactly at the input's end, when
+  // that is a whole number of hops, from being lost to rounding.
+  const candidates = Math.max(0, Math.floor((duration - maxSeconds) / hopSeconds + 1e-9)) + 1;
+  let best = 0;
+  let bestScore = -Infinity;
+  for (let k = 0; k < candidates; k += 1) {
+    const from = k * hopSeconds;
+    const to = from + maxSeconds;
+    let score = 0;
+    for (const point of points) {
+      const overlap = Math.min(to, point.end) - Math.max(from, point.start);
+      if (overlap > 0) {
+        score += point.value * overlap;
+      }
+    }
+    // Clearly greater only: of equal windows the earliest wins.
+    if (score > bestScore + SCORE_EPSILON) {
+      bestScore = score;
+      best = from;
+    }
+  }
+  return best;
 }
 
 /**
