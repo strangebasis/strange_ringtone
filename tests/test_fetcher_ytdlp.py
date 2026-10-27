@@ -309,6 +309,11 @@ class MetadataTest(unittest.TestCase):
             "\ud800lone": "lone",
             "x" * 300: "x" * 200,
             "x" * 199 + " y": "x" * 199,
+            # A tab between words is a space, not nothing.
+            "a	b": "a b",
+            "a b": "a b",
+            # Unassigned code points (Cn) go too.
+            "a͸b󠂀": "ab",
         }
         for raw, cleaned in cases.items():
             with self.subTest(raw=raw):
@@ -519,7 +524,16 @@ class FetchTest(StubTestCase):
         self.assertEqual(ytdlp.read_result(self.job, VIDEO_ID, 11).audio, audio)
         with self.assertRaises(FetchError):
             ytdlp.read_result(self.job, VIDEO_ID, 10)
-        # An info JSON past its size limit is never parsed.
+        # An info JSON past its size limit is never parsed: 4 MiB, a few times
+        # what a real one holds. Valid JSON, so only the cap refuses it.
+        self.assertEqual(ytdlp.INFO_MAX_BYTES, 4 * MIB)
+        info.write_bytes(b'{"title": "T"}' + b" " * (4 * MIB + 1 - 14))
+        self.assertEqual(info.stat().st_size, 4 * MIB + 1)
+        with self.assertRaises(FetchError) as raised:
+            ytdlp.read_result(self.job, VIDEO_ID, MIB)
+        self.assertEqual(raised.exception.code, "failed")
+        info.write_bytes(b'{"title": "T"}' + b" " * (4 * MIB - 14))
+        self.assertEqual(ytdlp.read_result(self.job, VIDEO_ID, MIB).metadata.title, "T")
         with mock.patch.object(ytdlp, "INFO_MAX_BYTES", info.stat().st_size - 1), self.assertRaises(FetchError):
             ytdlp.read_result(self.job, VIDEO_ID, MIB)
         # A directory where the audio should be.
