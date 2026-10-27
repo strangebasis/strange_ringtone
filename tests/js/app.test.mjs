@@ -829,6 +829,45 @@ test("a second fetch replaces one that is still polling", async () => {
   ]);
 });
 
+test("the replaced fetch's cancel neither shows its words nor drops the newer fetch's way to be stopped", async () => {
+  // Fetch A polls queued, then fetch B replaces it and polls queued too.
+  // A's next look, 2 s on, ends in "cancelled" while B's next poll (held
+  // here) is still out, so nothing of B's overwrites what A's catch does.
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let polls = 0;
+  const core = server();
+  const fetch = (url, init) => {
+    if (url === "/fetch/api/jobs") return Promise.resolve(json({ job_id: JOB_ID }, 202));
+    if (url === `/fetch/api/jobs/${JOB_ID}`) {
+      polls += 1;
+      if (polls <= 2) return Promise.resolve(json({ status: "queued" }));
+      if (polls === 3) return held;
+      // Only a regression gets here; failing ends the polling.
+      return Promise.resolve(json({ status: "failed", error: "failed" }));
+    }
+    return core(url, init);
+  };
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 2, "fetch A's first poll");
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 4, "fetch B's first poll");
+  // B's second poll comes after A's cancelled look, which was due first.
+  await until(() => page.fetchCalls.length === 5, "fetch B's second poll", 4000);
+  await settle();
+  assert.equal(page.el("yt-status").textContent, "Waiting in the queue…");
+  assert.equal(page.el("yt-status").classes.has("error"), false);
+  // A pick must still stop B: its controller was not A's catch to drop.
+  await pickFile(page, "My Song.mp3", [SONG]);
+  release(json({ status: "queued" }));
+  await sleep(2300);
+  assert.equal(page.fetchCalls.filter((call) => call.url.startsWith("/fetch/")).length, 5, "no poll after the pick");
+  assert.equal(page.el("yt-status").textContent, "");
+  assert.equal(page.el("name").value, "My Song");
+});
+
 test("a file picked while the audio downloads wins, and the stale audio is never decoded", async () => {
   let release;
   const firstAudio = new Promise((resolve) => { release = resolve; });
