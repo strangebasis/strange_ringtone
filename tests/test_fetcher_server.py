@@ -412,6 +412,7 @@ class OriginTest(ServerTestCase):
                 self.assertJsonError(self.request("POST", JOBS, headers, body), 403, "bad_origin")
         self.assertEqual(len(self.server.jobs), 0)
         self.assertEqual(self.runner.calls, [])
+        self.assertScratchEmpty()
 
     def test_exact_origin_passes(self) -> None:
         response = self.post_job()
@@ -430,6 +431,7 @@ class ContentTypeTest(ServerTestCase):
                 headers += [("Content-Type", value) for value in types]
                 self.assertJsonError(self.request("POST", JOBS, headers, body), 415, "unsupported_media_type")
         self.assertEqual(len(self.server.jobs), 0)
+        self.assertScratchEmpty()
 
 
 class LengthTest(ServerTestCase):
@@ -440,9 +442,13 @@ class LengthTest(ServerTestCase):
         headers = self.base() + [("Transfer-Encoding", "chunked"), ("Content-Length", "27")]
         response = self.request("POST", JOBS, headers, b"1b\r\n" + job_body() + b"\r\n0\r\n\r\n")
         self.assertJsonError(response, 400, "transfer_encoding")
+        self.assertEqual(len(self.server.jobs), 0)
+        self.assertScratchEmpty()
 
     def test_missing_length(self) -> None:
         self.assertJsonError(self.request("POST", JOBS, self.base()), 411, "length_required")
+        self.assertEqual(len(self.server.jobs), 0)
+        self.assertScratchEmpty()
 
     def test_malformed_lengths(self) -> None:
         for values in (["+27"], [" 27x"], ["27", "27"], ["2_7"], ["-1"], ["0x1b"], ["٢٧"]):
@@ -452,12 +458,16 @@ class LengthTest(ServerTestCase):
                     ("\r\n".join([f"POST {JOBS} HTTP/1.1", "Host: x", *(f"{n}: {v}" for n, v in headers)])
                      + "\r\n\r\n").encode("utf-8")
                 self.assertJsonError(exchange(self.port, data), 400, "bad_length")
+        self.assertEqual(len(self.server.jobs), 0)
+        self.assertScratchEmpty()
 
     def test_too_large(self) -> None:
         headers = self.base() + [("Content-Length", "1025")]
         self.assertJsonError(self.request("POST", JOBS, headers, b" " * 1025), 413, "too_large")
         headers = self.base() + [("Content-Length", "9" * 400)]
         self.assertJsonError(self.request("POST", JOBS, headers), 413, "too_large")
+        self.assertEqual(len(self.server.jobs), 0)
+        self.assertScratchEmpty()
 
     def test_exactly_the_limit_is_accepted(self) -> None:
         body = job_body()
@@ -504,6 +514,7 @@ class BodyTest(ServerTestCase):
             response = self.post(job_body())
         self.assertJsonError(response, 400, "bad_json")
         self.assertEqual(len(self.server.jobs), 0)
+        self.assertScratchEmpty()
 
     def test_parse_job_request(self) -> None:
         self.assertEqual(parse_job_request(b'  {"video_id" : "-_-_-_-_-_-"}\n'), "-_-_-_-_-_-")
@@ -512,6 +523,7 @@ class BodyTest(ServerTestCase):
         data = build_request("POST", JOBS, self.job_headers(100), job_body())
         self.assertJsonError(exchange(self.port, data, half_close=True), 400, "incomplete_body")
         self.assertEqual(len(self.server.jobs), 0)
+        self.assertScratchEmpty()
 
     def test_bytes_past_the_declared_length_are_never_read(self) -> None:
         body = job_body()
@@ -526,6 +538,7 @@ class BodyTest(ServerTestCase):
                 sock.sendall(build_request("POST", JOBS, self.job_headers(100), b"{"))
                 self.wait_for_log("POST /fetch/api/jobs 400")
         self.assertEqual(len(self.server.jobs), 0)
+        self.assertScratchEmpty()
 
     def test_body_deadline_is_checked_before_every_read(self) -> None:
         # A clock that jumps 30 s per read, like a client sending one byte
@@ -580,6 +593,7 @@ class BodyTest(ServerTestCase):
                 self.wait_for_log("POST /fetch/api/jobs 408")
                 self.assertLess(time.monotonic() - started, 0.5 + 1.5)
         self.assertEqual(len(self.server.jobs), 0)
+        self.assertScratchEmpty()
 
 
 class CheckOrderTest(ServerTestCase):
@@ -605,9 +619,12 @@ class CheckOrderTest(ServerTestCase):
         self.gate(VIDEO_ID)
         self.create_job(VIDEO_ID)
         # The body is not JSON: a 429 proves it was never read.
+        wait_for(lambda: self.runner.running == 1, "the first job to run")
         response = self.request("POST", JOBS, self.job_headers(3), b"???")
         self.assertJsonError(response, 429, "rate_limited")
         self.assertTrue(response.headers.get("Retry-After", "").isdigit())
+        # Only the running job's directory: the refusal left nothing.
+        self.assertEqual(self.scratch_contents(), [self.runner.dirs[0].name])
 
     def test_busy_before_the_body(self) -> None:
         self.gate(VIDEO_ID)
@@ -618,6 +635,7 @@ class CheckOrderTest(ServerTestCase):
         response = self.request("POST", JOBS, self.job_headers(3), b"???")
         self.assertJsonError(response, 503, "busy")
         self.assertEqual(response.headers.get("Retry-After"), "5")
+        self.assertEqual(self.scratch_contents(), [self.runner.dirs[0].name])
 
     def test_refused_requests_do_not_use_up_the_rate_limit(self) -> None:
         self.start(rate_limit_fetches_per_minute=1)
