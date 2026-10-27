@@ -510,11 +510,15 @@ const LOUD_AT_30 = sections([30, 0], [15, 0.5], [15, 0]);
 const TITLE = "Never Gonna (Live).Remix";
 const DONE = { status: "done", title: TITLE, duration: 60, heatmap: null };
 
+const audioResponse = () => new Response(new Uint8Array(AUDIO_BYTES), { headers: { "Content-Type": "audio/mp4" } });
+
 // The fetcher behind /fetch/, answering in order from `statuses` (the last
 // one repeats), or with `firstStatus` (a promise a test holds) to the first
-// poll; the core's routes answer as server() does.
-function fetcher({ statuses = [DONE], post = null, firstStatus = null } = {}) {
+// poll, and with `firstAudio` (likewise) to the first audio request; the
+// core's routes answer as server() does.
+function fetcher({ statuses = [DONE], post = null, firstStatus = null, firstAudio = null } = {}) {
   let polls = 0;
+  let audios = 0;
   const core = server();
   return (url, init) => {
     if (url === "/fetch/api/jobs") return post ?? Promise.resolve(json({ job_id: JOB_ID }, 202));
@@ -528,7 +532,9 @@ function fetcher({ statuses = [DONE], post = null, firstStatus = null } = {}) {
       return Promise.resolve(json(status));
     }
     if (url === `/fetch/api/jobs/${JOB_ID}/audio`) {
-      return Promise.resolve(new Response(new Uint8Array(AUDIO_BYTES), { headers: { "Content-Type": "audio/mp4" } }));
+      audios += 1;
+      if (audios === 1 && firstAudio !== null) return firstAudio;
+      return Promise.resolve(audioResponse());
     }
     return core(url, init);
   };
@@ -806,4 +812,56 @@ test("a second fetch replaces one that is still polling", async () => {
     "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`,
     "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}/audio`,
   ]);
+});
+
+test("a file picked while the audio downloads wins, and the stale audio is never decoded", async () => {
+  let release;
+  const firstAudio = new Promise((resolve) => { release = resolve; });
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ firstAudio }) });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 3, "the audio request");
+  assert.equal(page.el("yt-status").textContent, "Fetching the audio…");
+  await pickFile(page, "My Song.mp3", [SONG]);
+  // The audio arrives after the file replaced the fetch.
+  release(audioResponse());
+  await settle();
+  await sleep(50);
+  assert.equal(page.decodedInputs().length, 1, "only the picked file is decoded");
+  assert.notDeepEqual([...page.decodedInputs()[0]], AUDIO_BYTES);
+  assert.equal(page.el("yt-status").textContent, "");
+  assert.equal(page.el("name").value, "My Song");
+  assert.match(page.el("file-status").textContent, /^My Song\.mp3, 1:00\.0\. The selection starts on the loudest stretch;/);
+});
+
+test("a fetch replaced while its audio downloads leaves the newer fetch alone", async () => {
+  let release;
+  const firstAudio = new Promise((resolve) => { release = resolve; });
+  // The first fetch's poll answers done, the second fetch's first poll
+  // queued. Its next one, which only a regression makes, ends the polling,
+  // so a failure here can't keep the run alive for MAX_POLLS.
+  const statuses = [DONE, { status: "queued" }, { status: "failed", error: "failed" }];
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ statuses, firstAudio }) });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 3, "the first fetch's audio request");
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 5, "the second fetch's first poll");
+  await settle();
+  assert.equal(page.el("yt-status").textContent, "Waiting in the queue…");
+  // The first fetch's audio lands now: it must not touch the status line,
+  // decode anything, or take the second fetch's way to be stopped.
+  release(audioResponse());
+  await settle();
+  await sleep(50);
+  assert.equal(page.el("yt-status").textContent, "Waiting in the queue…");
+  assert.deepEqual(page.decodedInputs(), []);
+  // A pick now must still stop the second fetch's polling.
+  await pickFile(page, "My Song.mp3", [SONG]);
+  await sleep(2300);
+  assert.deepEqual(fetchUrls(page), [
+    "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}/audio`,
+    "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`,
+  ], "no poll after the pick");
+  assert.equal(page.el("name").value, "My Song");
 });
