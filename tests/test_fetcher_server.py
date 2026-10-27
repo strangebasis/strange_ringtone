@@ -27,7 +27,7 @@ from unittest import mock
 import helpers  # noqa: F401  (puts core/ and fetcher/ on sys.path)
 from strange_ringtone_fetch import server as server_module
 from strange_ringtone_fetch.config import Settings
-from strange_ringtone_fetch.jobs import Jobs
+from strange_ringtone_fetch.jobs import Jobs, QueueFull
 from strange_ringtone_fetch.server import FetchServer, Handler, parse_job_request, prepare_scratch
 from strange_ringtone_fetch.ytdlp import FetchError
 from test_fetcher_jobs import FakeClock, FakeRunner
@@ -148,7 +148,7 @@ class ServerTestCase(unittest.TestCase):
         self.clock = FakeClock()
         self.start()
 
-    def start(self, runner: Any = None, **overrides: Any) -> None:
+    def start(self, runner: Any = None, jobs_class: type[Jobs] = Jobs, **overrides: Any) -> None:
         values: dict[str, Any] = {
             "public_origin": ORIGIN,
             # High, so only the rate-limit tests ever meet the limit.
@@ -159,7 +159,7 @@ class ServerTestCase(unittest.TestCase):
         self.settings = Settings(**values)
         if runner is not None:
             self.runner = runner
-        factory = functools.partial(Jobs, clock=self.clock)
+        factory = functools.partial(jobs_class, clock=self.clock)
         self.server = self.server_class(("127.0.0.1", 0), self.settings, self.runner, factory)
         thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         thread.start()
@@ -723,6 +723,25 @@ class QueueTest(ServerTestCase):
         gate.set()
         wait_for(lambda: not self.server.jobs.is_full() and self.runner.running == 0, "the queue to drain")
         self.assertEqual(self.post_job(OTHER_ID).status, 202)
+
+    def test_a_queue_that_fills_after_the_first_look_is_still_busy(self) -> None:
+        # Two requests can both pass is_full() before either submits; the
+        # loser's QueueFull must still be a 503 busy, not a dropped connection.
+        self.start(jobs_class=_RacingJobs)
+        response = self.post_job()
+        self.assertJsonError(response, 503, "busy")
+        self.assertEqual(response.headers.get("Retry-After"), "5")
+        self.assertEqual(len(self.server.jobs), 0)
+
+
+class _RacingJobs(Jobs):
+    """Reports room, then finds the queue full, as when another request took the last slot in between."""
+
+    def is_full(self) -> bool:
+        return False
+
+    def submit(self, video_id: str) -> str:
+        raise QueueFull()
 
 
 class StatusTest(ServerTestCase):
