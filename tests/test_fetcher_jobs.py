@@ -115,6 +115,31 @@ class SubmitTest(JobsTestCase):
             self.assertTrue(JOB_ID_RE.fullmatch(job_id))
             self.assertEqual(self.jobs.status(job_id), {"status": "queued"})
 
+    def test_ids_come_from_secrets_token_hex_16(self) -> None:
+        # The ID is the only thing that lets a client see a job's title and
+        # take its audio, so it must be unguessable: 128 bits from the
+        # secrets module, never a counter or anything derived from the job.
+        values = ["0123456789abcdef" * 2, "fedcba9876543210" * 2]
+        with mock.patch.object(jobs_module.secrets, "token_hex", side_effect=values) as token_hex:
+            ids = [self.jobs.submit(VIDEO_ID) for _ in values]
+        self.assertEqual(ids, values)
+        self.assertEqual(token_hex.call_args_list, [mock.call(16)] * len(values))
+
+    def test_a_repeated_id_is_drawn_again(self) -> None:
+        first = "0123456789abcdef" * 2
+        second = "fedcba9876543210" * 2
+        with mock.patch.object(jobs_module.secrets, "token_hex", side_effect=[first, first, second]):
+            self.assertEqual(self.jobs.submit(VIDEO_ID), first)
+            self.assertEqual(self.jobs.submit(OTHER_ID), second)
+        self.assertEqual(len(self.jobs), 2)
+
+    def test_ids_are_not_sequential(self) -> None:
+        ids = [self.jobs.submit(VIDEO_ID) for _ in range(4)]
+        numbers = sorted(int(job_id, 16) for job_id in ids)
+        # Four draws of 128 bits land within 2**64 of each other with
+        # vanishing probability; a counter or a clock always would.
+        self.assertGreater(numbers[-1] - numbers[0], 2**64)
+
     def test_the_queue_is_bounded(self) -> None:
         self.assertEqual(jobs_module.QUEUE_SIZE, 4)
         for _ in range(4):
@@ -276,6 +301,15 @@ class HeldResultTest(JobsTestCase):
         self.run_job(OTHER_ID)
         self.assertEqual(self.jobs.status(held)["status"], "done")  # type: ignore[index]
 
+    def test_a_newer_download_does_not_evict_a_failed_job(self) -> None:
+        # Only older downloads are evicted: a client still polling a failed
+        # job must see its error code, not a 404.
+        self.runner.failures[OTHER_ID] = FetchError("too_long")
+        failed = self.run_job(OTHER_ID)
+        done = self.run_job(VIDEO_ID)
+        self.assertEqual(self.jobs.status(failed), {"status": "failed", "error": "too_long"})
+        self.assertEqual(self.jobs.status(done)["status"], "done")  # type: ignore[index]
+
     def test_a_download_being_streamed_is_not_evicted(self) -> None:
         older = self.run_job(VIDEO_ID)
         path = self.jobs.claim(older)
@@ -305,6 +339,30 @@ class ExpiryTest(JobsTestCase):
         self.assertIsNone(self.jobs.status(failed))
         self.assertEqual(self.jobs.sweep(), 1)
         self.assertEqual(len(self.jobs), 0)
+
+    def test_the_ttl_runs_from_completion_not_submission(self) -> None:
+        # A job that waited in the queue for most of the TTL must still be
+        # collectable once it finishes: the page fetches its audio only then.
+        job_id = self.jobs.submit(VIDEO_ID)
+        self.clock.now += 599
+        self.assertTrue(self.jobs.run_next(timeout=0))
+        self.clock.now += 599
+        self.assertEqual(self.jobs.sweep(), 0)
+        self.assertEqual(self.jobs.status(job_id)["status"], "done")  # type: ignore[index]
+        self.assertIsNotNone(self.jobs.claim(job_id))
+        self.jobs.release(job_id)
+
+    def test_a_job_expires_the_ttl_after_completion(self) -> None:
+        job_id = self.jobs.submit(VIDEO_ID)
+        self.clock.now += 300
+        self.assertTrue(self.jobs.run_next(timeout=0))
+        self.clock.now += 599
+        self.assertEqual(self.jobs.status(job_id)["status"], "done")  # type: ignore[index]
+        self.clock.now += 1
+        self.assertIsNone(self.jobs.status(job_id))
+        self.assertIsNone(self.jobs.claim(job_id))
+        self.assertEqual(self.jobs.sweep(), 1)
+        self.assertEqual(self.scratch_contents(), [])
 
     def test_queued_and_running_jobs_never_expire(self) -> None:
         queued = self.jobs.submit(VIDEO_ID)
