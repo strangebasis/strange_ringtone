@@ -13,6 +13,11 @@ SCRIPTS = ROOT / "scripts"
 CORE = ROOT / "core"
 if str(CORE) not in sys.path:
     sys.path.insert(0, str(CORE))
+# The fetcher's package lives under fetcher/ and imports the core's shared
+# modules (strange_ringtone.config and http_guard) from CORE above.
+FETCHER = ROOT / "fetcher"
+if str(FETCHER) not in sys.path:
+    sys.path.insert(0, str(FETCHER))
 
 
 def load_script(name: str) -> ModuleType:
