@@ -433,6 +433,14 @@ class StubRunTest(JobsTestCase):
                 self.assertEqual(self.jobs.status(job_id), {"status": "failed", "error": code})
                 self.assertEqual(self.scratch_contents(), [])
 
+    @unittest.skipUnless(hasattr(os, "killpg"), "Windows can end only the direct child (see Jobs.run_next)")
+    def test_a_timed_out_run_with_a_grandchild_leaves_nothing_behind(self) -> None:
+        # Runs in the image (tests/image_fetcher): killpg ends the grandchild
+        # too, so nothing holds the job directory and it is removed.
+        job_id = self.run_job("grandchild_")
+        self.assertEqual(self.jobs.status(job_id), {"status": "failed", "error": "timeout"})
+        self.assertEqual(self.scratch_contents(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

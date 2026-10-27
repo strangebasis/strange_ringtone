@@ -208,6 +208,14 @@ class Jobs:
             held = None
         finally:
             # Every path, success included: what is kept was moved out above.
+            # ignore_errors covers one known gap, on Windows only (development,
+            # never a deployment): there a timed-out yt-dlp's own children
+            # survive, because only the direct child can be ended (see
+            # ytdlp._kill_group), and one that still has the job directory as
+            # its working directory keeps it from being removed. The server
+            # empties the scratch directory when it next starts. On Linux,
+            # killpg ends the whole group first and nothing is left; the
+            # in-image tests check that.
             if job_dir is not None:
                 shutil.rmtree(job_dir, ignore_errors=True)
         with self._lock:
