@@ -13,6 +13,7 @@ import json
 import math
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -507,6 +508,16 @@ class FetchTest(StubTestCase):
                 info.write_bytes(bad)
                 with self.assertRaises(FetchError):
                     ytdlp.read_result(self.job, VIDEO_ID, MIB)
+
+    def test_a_path_that_is_a_link_is_refused_before_it_is_opened(self) -> None:
+        # Windows has no O_NOFOLLOW, so the lstat is what refuses a symlink
+        # there; reported as one here, whatever the platform.
+        self.runner().fetch(VIDEO_ID, self.job)
+        link = os.stat_result((stat.S_IFLNK | 0o777,) + tuple(os.lstat(self.job / f"{VIDEO_ID}.m4a"))[1:])
+        with mock.patch.object(ytdlp.os, "lstat", return_value=link), \
+                mock.patch.object(ytdlp.os, "open", side_effect=AssertionError("opened")):
+            with self.assertRaises(FetchError):
+                ytdlp.read_result(self.job, VIDEO_ID, MIB)
 
     @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW is POSIX")
     def test_the_open_itself_never_follows_a_symlink(self) -> None:

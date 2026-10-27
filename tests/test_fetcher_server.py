@@ -527,6 +527,42 @@ class BodyTest(ServerTestCase):
                 self.wait_for_log("POST /fetch/api/jobs 400")
         self.assertEqual(len(self.server.jobs), 0)
 
+    def test_body_deadline_is_checked_before_every_read(self) -> None:
+        # A clock that jumps 30 s per read, like a client sending one byte
+        # just inside each socket timeout: the deadline must end the body
+        # before a read is even attempted, never by a wait that went negative.
+        now = [0.0]
+        reads: list[int] = []
+        timeouts: list[float] = []
+
+        class Clock:
+            @staticmethod
+            def monotonic() -> float:
+                return now[0]
+
+        class Connection:
+            @staticmethod
+            def settimeout(value: float) -> None:
+                timeouts.append(value)
+
+        class Body:
+            @staticmethod
+            def read1(size: int) -> bytes:
+                reads.append(size)
+                now[0] += 30
+                return b"x"
+
+        handler = Handler.__new__(Handler)
+        handler.connection = Connection()  # type: ignore[assignment]
+        handler.rfile = Body()  # type: ignore[assignment]
+        with mock.patch.object(server_module, "time", Clock), \
+                mock.patch.object(server_module, "BODY_DEADLINE_SECONDS", 60):
+            with self.assertRaises(server_module.GuardError) as raised:
+                handler._receive_body(100)
+        self.assertEqual((raised.exception.status, raised.exception.code), (408, "body_timeout"))
+        self.assertEqual(reads, [100, 99])
+        self.assertEqual(timeouts, [30, 30, Handler.timeout])
+
     def test_trickled_body_meets_the_deadline(self) -> None:
         self.assertGreater(server_module.BODY_DEADLINE_SECONDS, 0)
         self.assertLessEqual(server_module.BODY_DEADLINE_SECONDS, 60)
