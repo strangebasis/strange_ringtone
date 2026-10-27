@@ -359,7 +359,14 @@ the user types becomes the filename. Decision 9 keeps it readable:
 
 The core has no secrets in v0.1.0, so `.env.example` holds only
 `PUBLIC_ORIGIN=` and commented optional settings. Any later secret arrives as
-`*_FILE`, with no usable default.
+`*_FILE`, with no usable default. The same file carries the optional fetcher's
+settings in a block of their own, all commented out; `compose.example.yaml`
+gives both services that one `.env`, and each server reads only its own
+variables (`PUBLIC_ORIGIN` and `TRUSTED_PROXIES` are shared).
+
+The fetcher image is a second, separate contract with its own table in the
+README (section 6, "Fetcher contract"). Nothing in it changes the core's: the
+core still needs no egress, and `FETCH_ENABLED` only shows the YouTube box.
 
 ## 6. Fetcher image (opt-in)
 
@@ -368,23 +375,46 @@ The core has no secrets in v0.1.0, so `.env.example` holds only
   typed ever reaches yt-dlp, which removes the SSRF path (yt-dlp's generic
   extractor would otherwise fetch anything).
 - **Invocation:** `python -I -m yt_dlp`, run as a subprocess with an argument
-  list:
-  - `--ignore-config --no-playlist --use-extractors youtube` (verify flag names
-    against the pinned version)
+  list. The flags were checked against the pinned yt-dlp 2026.10.26, and an
+  in-image test runs the real yt-dlp with the exact list (offline, so it can
+  only fail at name resolution) to prove that version accepts every one:
+  - `--ignore-config --no-playlist --use-extractors youtube`
+  - `--js-runtimes deno:/usr/local/bin/deno` (the image's fixed path) and
+    `--no-cache-dir`
   - `-f "bestaudio[ext=m4a]"` (AAC, which Safari decodes, so the fetcher needs
     no ffmpeg)
-  - `--match-filter "duration <= FETCH_MAX_SECONDS & !is_live"`
-  - `--max-filesize`
-  - `--write-info-json`, with `-o`/`-P` pointing into a fresh `/tmp` job directory
+  - `--break-match-filters "duration <= FETCH_MAX_SECONDS & !is_live"`, not
+    `--match-filter`: a plain filter skips the video and exits 0 having
+    written nothing, while the breaking one exits 101, which is how
+    `too_long` is told apart
+  - `--max-filesize FETCH_MAX_BYTES` (checked before the download; a larger
+    file is skipped with exit 0 and no audio, which maps to `failed`)
+  - `--write-info-json --quiet --no-warnings --no-progress --socket-timeout 20`
+  - `-P <job directory> -o "%(id)s.%(ext)s"`, so file names come from the
+    validated ID only, then `--` and the URL the server built
 
-  It runs under `prlimit` and a wall-clock timeout, one job at a time
-  (`FETCH_CONCURRENCY=1`), with its own per-IP rate limit. The fetcher's
-  `prlimit` set is CPU seconds, file size, open files and process count, with
-  no address-space limit: Deno reserves a huge virtual address space at
-  startup, so `RLIMIT_AS` would kill it. Memory is bounded by the deployment's
-  cgroup limit (`mem_limit` in `compose.example.yaml`), which the contract
-  documents as the operator's job. `DENO_DIR` and yt-dlp's cache directory
-  point under `/tmp`, because the root filesystem is read-only.
+  It runs under `prlimit` and a wall-clock timeout (`communicate()`; on
+  timeout the whole process group is killed and the pipes drained), in its
+  own session, one job at a time (`FETCH_CONCURRENCY=1`, with 4 more queued
+  and 503 `busy` beyond), with its own per-IP rate limit. The fetcher's
+  `prlimit` set is CPU seconds, file size, open files and process count
+  (512, because `RLIMIT_NPROC` counts every thread of UID 10001, V8's
+  included), with no address-space limit: Deno reserves a huge virtual
+  address space at startup, so `RLIMIT_AS` would kill it. Memory is bounded
+  by the deployment's cgroup limit (`mem_limit` in `compose.example.yaml`),
+  which the contract documents as the operator's job. yt-dlp's environment
+  is built from scratch: fixed values, `HOME` and `DENO_DIR` inside the job
+  directory under `/tmp` (the root filesystem is read-only, and nothing
+  carries over between jobs), and `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`
+  when the operator set them, never the server's own environment. yt-dlp
+  hands that environment to Deno, which it runs with `--no-remote
+  --cached-only`.
+- **Success** is judged by exactly `<id>.m4a` (a regular file of at most
+  `FETCH_MAX_BYTES`) and `<id>.info.json` being in the job directory, never
+  by exit 0 alone. Exit 101 is `too_long`, a timeout is `timeout`, and other
+  failures are `blocked` or `not_found` when stderr matches a few fixed
+  phrases (bot checks, HTTP 403; unavailable, private or removed videos) and
+  `failed` otherwise. The job directory is removed in `finally` on every path.
 - **Logging:** yt-dlp runs with `--quiet --no-warnings --no-progress`, and its
   stdout and stderr are never logged: they carry the destination filename,
   which contains the title that becomes the tone name (CLAUDE.md: tone names
@@ -400,26 +430,50 @@ The core has no secrets in v0.1.0, so `.env.example` holds only
   - `heatmap`, validated as at most 200 points with times within the duration
     and values from 0 to 1
 
-  `GET …/audio` streams the file once, then deletes it. A TTL sweep catches any
-  file that was never collected.
-- **Runtime:** Deno is copied from the official image, pinned by digest so
-  Dependabot tracks it. yt-dlp and yt-dlp-ejs come from a hashed pip-tools lock
-  (`--require-hashes --no-deps --only-binary :all:`).
+  `GET …/audio` claims the job atomically (a concurrent second request gets
+  404), streams the file once as `audio/mp4` with `no-store`, then deletes it
+  and forgets the job, so a later status request is a 404 too. A TTL sweep
+  (`FETCH_RESULT_TTL_SECONDS` from completion) catches any file that was never
+  collected. The fetcher holds **at most one** finished, uncollected result:
+  `/tmp` is sized for one download in flight plus one waiting, so when a
+  download finishes, an older one still waiting is deleted. This rule is the
+  fetcher's only; the core's no-early-eviction rule (5.5) is unchanged.
+- **Runtime:** the same `python:3.12-slim-bookworm` base and digest as the
+  core, with its `prlimit`. Deno (2.9.8; yt-dlp needs at least 2.3.0) is
+  copied from the official `denoland/deno:bin` image, a named build stage
+  pinned by digest so Dependabot tracks it. yt-dlp and yt-dlp-ejs come from a
+  hashed pip-tools lock (`fetcher/requirements.txt`, compiled from
+  `requirements.in`; `--require-hashes --no-deps --only-binary :all:`), which
+  holds exactly those two distributions: yt-dlp declares no required
+  dependencies, and yt-dlp-ejs must equal the version yt-dlp's own `default`
+  extra pins (an in-image test checks both, and Dependabot bumps them as one
+  group). Without `requests`, yt-dlp talks to a proxy through urllib, so only
+  `http://` proxies work. The fetcher shares the core's
+  `strange_ringtone.config` and `strange_ringtone.http_guard` (the Origin,
+  length, `X-Forwarded-For` and rate-limit rules): `fetcher/__main__.py` puts
+  `../core` first on `sys.path`, and the image copies exactly those modules
+  to `/app/core`.
 - **Contract:** the same UID, read-only and capability rules as the core. It
   needs **internet egress** to YouTube's hosts and no access to any private
   network. Restricting egress (an allowlisting proxy, firewall rules for private
   ranges) is documented as the deployment's job. It honours `HTTPS_PROXY`.
   Settings: `PUBLIC_ORIGIN` (required), `TRUSTED_PROXIES`, `FETCH_MAX_SECONDS`
-  (900), `FETCH_MAX_BYTES` (40 MB), `FETCH_TIMEOUT_SECONDS` (120),
-  `RATE_LIMIT_FETCHES_PER_MINUTE` (5), `FETCH_RESULT_TTL_SECONDS` (600).
+  (600, at most 600: `decode.js` refuses input over 10 minutes, so a longer
+  video would be downloaded only for the phone to refuse it), `FETCH_MAX_BYTES`
+  (40 MiB; 10 minutes of YouTube's AAC is about 10 MB),
+  `FETCH_TIMEOUT_SECONDS` (120), `RATE_LIMIT_FETCHES_PER_MINUTE` (5),
+  `FETCH_RESULT_TTL_SECONDS` (600).
 - **Fetcher contract (the README gets a second table):** image
   `ghcr.io/<owner>/strange_ringtone-fetcher:<semver>`, linux/amd64, UID/GID
   10001, port 8080/tcp plain HTTP. The fetcher serves the `/fetch/` prefix
   itself (`GET /fetch/healthz`, `POST /fetch/api/jobs`,
   `GET /fetch/api/jobs/<id>` and `…/audio`), and the proxy forwards those
   paths unchanged, so no rewriting is needed. Writable: `/tmp` (tmpfs) only,
-  sized at `2 × FETCH_MAX_BYTES + 16 MB` for the audio, the info JSON and the
-  Deno and yt-dlp caches: 96 MB with the defaults.
+  sized at `2 × FETCH_MAX_BYTES + 16 MB` for one download in flight, one
+  finished result, the info JSON and Deno's cache: 96 MB with the defaults.
+  Health: `GET /fetch/healthz` answers 200 `ok`. The in-image tests live in
+  `tests/image_fetcher/` (not `tests/image/`, which is the core's), gated by
+  `STRANGE_RINGTONE_FETCHER_IMAGE_TESTS=1`.
 
 ## 7. Web app
 
@@ -569,6 +623,13 @@ Local jobs run with `permissions: contents: read`:
   checks and the container contract. It is a
   required check, because it is the only test that proves the ffmpeg
   allowlist, `--network none` and `read_only`.
+- **Fetcher image tests** (from milestone 5 on): the fetcher image built the
+  same way (in its own cache scope), then `tests/image_fetcher` in it under
+  the same flags with a 96 MB tmpfs: the container contract, the installed
+  yt-dlp and yt-dlp-ejs against the lock and each other, Deno under the
+  fetcher's `prlimit` set, the real yt-dlp accepting the exact argument list
+  (offline), the CMD answering `/fetch/healthz`, and the fetcher's unit tests
+  again under the image's Python 3.12, with the yt-dlp stub.
 - A **PR-title check** (conventional commits, so release-please works). It is a
   stdlib script that reads the title from an `env:` variable, never from inline
   `${{ }}`.
@@ -607,6 +668,8 @@ required, all reported by GitHub Actions:
 - Trivy / Trivy filesystem scan
 - Gitleaks / Gitleaks history scan
 - Image tests (from milestone 3; the owner adds it to the ruleset)
+- Fetcher image tests (from milestone 5; the owner adds it to the ruleset,
+  named exactly so)
 
 The repository squash-merges with the PR title as the commit subject, which is
 what release-please reads. A **tag ruleset** on `v*` lets only organisation

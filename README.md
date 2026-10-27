@@ -204,6 +204,45 @@ why it is there, and the container against the contract. Outside the image
 (`STRANGE_RINGTONE_IMAGE_TESTS` unset), `unittest discover -s tests` skips them.
 `compose.example.yaml` shows the same restrictions as a Compose service.
 
+**The fetcher.** The optional YouTube fetcher (`fetcher/`) is a second
+server that needs yt-dlp and Deno, so it runs for real only in its image. To
+try the whole YouTube flow on this machine without any YouTube traffic, run
+`python -I tools/dev_fetch_stack.py` and open <http://127.0.0.1:8080/>: it
+starts the core, the fetcher with the stub yt-dlp (`tests/stubs/ytdlp_stub.py`)
+and a proxy that sends `/fetch/` to the fetcher, all on loopback. Build its
+image from the repository root:
+
+```bash
+docker build -f fetcher/Dockerfile -t strange_ringtone-fetcher:local .
+```
+
+The build installs exactly the wheels in `fetcher/requirements.txt`, a
+hashed pip-tools lock compiled from `fetcher/requirements.in`, and copies
+Deno from the official `denoland/deno` image pinned by digest. To change a
+pin, edit `requirements.in` (yt-dlp-ejs must stay at the version yt-dlp's own
+metadata pins), then recompile in Git Bash from the repository root:
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(cygpath -w "$PWD/fetcher"):/work" -w /work python:3.12-slim sh -c 'pip install -q pip-tools==7.5.3 && pip-compile --generate-hashes --strip-extras --output-file=requirements.txt requirements.in'
+```
+
+Run its in-image tests under the fetcher's contract flags. The tmpfs is
+`2 × FETCH_MAX_BYTES + 16 MB`, and `--network none` matters: one test starts
+the real yt-dlp with the fetcher's exact arguments to prove the pinned
+version accepts them, and without a network it can only fail at name
+resolution. Every other fetch in the tests is the stub's.
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm --name strange_ringtone-fetcher-image-tests   --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=96m,mode=1777   --cap-drop ALL --security-opt no-new-privileges:true   --ipc none --ulimit msgqueue=0   -e PUBLIC_ORIGIN=https://example.internal -e STRANGE_RINGTONE_FETCHER_IMAGE_TESTS=1   -v "$(cygpath -w "$PWD/tests"):/tests:ro"   strange_ringtone-fetcher:local python -I -m unittest discover -s /tests/image_fetcher -t /tests -v
+```
+
+These are the CI job **Fetcher image tests**. They check the container
+contract, that the installed yt-dlp and yt-dlp-ejs are the lock and agree
+with each other, that yt-dlp finds Deno and Deno runs under the fetcher's
+resource limits, and they run the fetcher's unit tests (`tests/test_fetcher_*.py`)
+again under the image's Python 3.12. Outside the image
+(`STRANGE_RINGTONE_FETCHER_IMAGE_TESTS` unset) they are skipped.
+
 **Pull requests:** branch from `main` as `feat/…` or `fix/…`. PRs are
 squash-merged, so their titles must be conventional-commit subjects (`feat:`,
 `fix:`, `docs:`, `ci:`, `chore:`, with `!` for a breaking change). release-please
@@ -215,6 +254,37 @@ Not defined yet. v0.1.0 will define it here: the image, UID/GID, port, writable
 paths, environment variables and limits. The draft is in
 [docs/PLAN.md](docs/PLAN.md), section 5.7. After the first release, CI refuses any
 change to this section unless the PR is marked as breaking.
+
+### Fetcher image (opt-in)
+
+Run it only if you want YouTube links (set `FETCH_ENABLED=true` on the core
+too). It is the only part that needs the internet, and it never talks to the
+core: the phone downloads the audio from the fetcher and sends the core only
+the trimmed WAV, as for a picked file. Draft, from
+[docs/PLAN.md](docs/PLAN.md) section 6.
+
+| Item | Value |
+| --- | --- |
+| Image | `ghcr.io/<owner>/strange_ringtone-fetcher:<semver>`, consumed by digest, linux/amd64 |
+| User | UID 10001, GID 10001 (fixed, non-root), the same as the core |
+| Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
+| Paths | The fetcher serves the `/fetch/` prefix itself: `GET /fetch/healthz`, `POST /fetch/api/jobs`, `GET /fetch/api/jobs/<id>` and `GET /fetch/api/jobs/<id>/audio`. The reverse proxy forwards every path under `/fetch/` to it unchanged, on the same origin as the core (no rewriting), and everything else to the core. |
+| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`, and a memory limit (`mem_limit`, 512 MB in `compose.example.yaml`): yt-dlp runs under `prlimit` for CPU time, file size, open files and processes, but with no address-space limit, because Deno reserves a huge virtual range, so the cgroup limit is what bounds memory. |
+| Egress | Needs outbound HTTPS to YouTube's hosts and nothing else. Restricting it to them (an allowlisting proxy, firewall rules) and blocking private address ranges is the deployment's job. It never needs to reach the core, so give it a network of its own shared only with the proxy (`compose.example.yaml`). It honours `HTTPS_PROXY`, but only `http://` proxies: yt-dlp is installed without `requests`, so it reaches a proxy through urllib (CONNECT for HTTPS). |
+| Writable | `/tmp` (tmpfs) and nothing else, sized `2 × FETCH_MAX_BYTES + 16 MB`: one download in flight, one finished result waiting to be collected, the info JSON and Deno's cache. 96 MB with the defaults. No volumes, and nothing survives a restart. |
+| Results | One job runs at a time, with up to 4 more queued (503 `busy` beyond that). At most one finished, uncollected result is held: when a newer download finishes, an older one still waiting is deleted, and its page gets a 404. A result is deleted when the page collects it, and in any case `FETCH_RESULT_TTL_SECONDS` after it finished. |
+| Health | `GET /fetch/healthz` returns 200 with the body `ok` and nothing else |
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `PUBLIC_ORIGIN` | *(required)* | The same value as the core's. Every `POST` must carry exactly one `Origin` equal to it. |
+| `TRUSTED_PROXIES` | empty | As for the core: CIDRs whose `X-Forwarded-For` is honoured for the per-client rate limit. |
+| `FETCH_MAX_SECONDS` | 600 | Longest video, 1 to 600. Must not exceed the page's 10-minute decode limit, or a video is downloaded only for the phone to refuse it. |
+| `FETCH_MAX_BYTES` | 41943040 (40 MiB) | Largest audio download, 1 MiB to 512 MiB. Size `/tmp` from it. |
+| `FETCH_TIMEOUT_SECONDS` | 120 | Wall clock per yt-dlp run, 1 to 600 |
+| `RATE_LIMIT_FETCHES_PER_MINUTE` | 5 | Per client IP, counted on accepted jobs |
+| `FETCH_RESULT_TTL_SECONDS` | 600 | How long a finished result waits to be collected |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | unset | Passed to yt-dlp, and the only part of the fetcher's environment it sees. `http://host:port` only, with no credentials. |
 
 ## Security
 

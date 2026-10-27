@@ -1,12 +1,16 @@
-# A hardened example of running the core (docs/PLAN.md 5.7). Copy it into your
-# own infrastructure repository and adapt it there; this repository stays
-# generic, so it names no host, domain or proxy.
+# A hardened example of running the core (docs/PLAN.md 5.7) and, optionally,
+# the fetcher (section 6). Copy it into your own infrastructure repository and
+# adapt it there; this repository stays generic, so it names no host, domain
+# or proxy.
 #
 #   cp .env.example .env    # then set PUBLIC_ORIGIN
-#   docker compose -f compose.example.yaml up -d
+#   docker compose -f compose.example.yaml up -d core
+#   docker compose -f compose.example.yaml up -d    # with the fetcher too
 #
-# The service publishes no ports. A reverse proxy that terminates TLS joins
-# the `core` network and forwards to core:8080.
+# The services publish no ports. A reverse proxy that terminates TLS joins
+# the `core` network and forwards to core:8080. With the fetcher, the proxy
+# also joins the `fetcher` network and forwards paths under /fetch/ to
+# fetcher:8080 unchanged, on the same origin, and everything else to the core.
 
 name: strange_ringtone
 
@@ -64,8 +68,66 @@ services:
     # ports:
     #   - "127.0.0.1:8080:8080"
 
+  fetcher:
+    # Optional: only for YouTube links, and only with FETCH_ENABLED=true for
+    # the core. Deployments pin a released image by digest, for example
+    #   image: ghcr.io/strangebasisdevs/strange_ringtone-fetcher@sha256:<digest>
+    build:
+      context: .
+      dockerfile: fetcher/Dockerfile
+    image: strange_ringtone-fetcher:local
+    # The same .env: PUBLIC_ORIGIN and TRUSTED_PROXIES are shared, and the
+    # fetcher reads its FETCH_* settings and an optional HTTPS_PROXY.
+    env_file: .env
+    # The same hardening as the core.
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ipc: none
+    ulimits:
+      msgqueue: 0
+    tmpfs:
+      # One download in flight and one uncollected result, plus the info
+      # JSON and Deno's cache: 2 x FETCH_MAX_BYTES + 16 MB (96 MB with the
+      # defaults). noexec: nothing downloaded can be run.
+      - /tmp:rw,noexec,nosuid,size=96m,mode=1777
+    # prlimit bounds yt-dlp's CPU time, file size, open files and processes,
+    # but not its address space, because Deno reserves a huge virtual range
+    # at startup. This cgroup limit is what bounds the fetcher's memory.
+    mem_limit: 512m
+    # `fetcher` for the proxy to reach it; `egress` because it is the one
+    # part that needs the internet. It needs YouTube's hosts only:
+    # restricting egress to them (an allowlisting proxy through HTTPS_PROXY,
+    # firewall rules) and blocking private address ranges is this
+    # deployment's job. Not on `core`: the fetcher never calls the core, and
+    # a separate network means a compromised fetcher can't reach it either.
+    networks:
+      - fetcher
+      - egress
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -I
+        - -c
+        - "import http.client as h; c = h.HTTPConnection('127.0.0.1', 8080, timeout=3); c.request('GET', '/fetch/healthz'); raise SystemExit(c.getresponse().status != 200)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
 networks:
   core:
     # internal: no route out of this network. The core never makes an
     # outbound connection, so it needs none.
     internal: true
+  fetcher:
+    # Between the proxy and the fetcher only, with no route out of its own.
+    internal: true
+  egress:
+    # A normal network with a route out, for the fetcher only. The core
+    # never joins it.
+    internal: false

@@ -14,6 +14,7 @@ from strange_ringtone import config
 from strange_ringtone.config import ConfigError, Settings
 
 ORIGIN = "https://ringtones.example.internal"
+ENV_EXAMPLE_FETCHER_MARKER = "# ---- Fetcher image (opt-in, docs/PLAN.md section 6) ----\n"
 
 
 def from_env(**values: str) -> Settings:
@@ -343,15 +344,33 @@ class ContractDocsTest(unittest.TestCase):
         section = text.split("### 5.7 ", 1)[1].split("\n## ", 1)[0]
         return set(re.findall(r"^\| `([A-Z][A-Z0-9_]*)` \|", section, re.MULTILINE))
 
-    def env_example_variables(self) -> set[str]:
+    def env_example_blocks(self) -> tuple[str, str]:
+        # .env.example serves both images (compose.example.yaml gives both the
+        # same .env); the fetcher's settings follow its marker line.
         text = (helpers.ROOT / ".env.example").read_text(encoding="utf-8")
+        core, marker, fetcher = text.partition(ENV_EXAMPLE_FETCHER_MARKER)
+        self.assertTrue(marker, "the fetcher block's marker line is missing from .env.example")
+        return core, fetcher
+
+    @staticmethod
+    def variables_in(text: str) -> set[str]:
         return set(re.findall(r"^(?:# )?([A-Z][A-Z0-9_]*)=", text, re.MULTILINE))
 
     def test_plan_table_lists_every_variable_read(self) -> None:
         self.assertEqual(self.plan_variables(), self.read_variables())
 
     def test_env_example_lists_every_variable_read(self) -> None:
-        self.assertEqual(self.env_example_variables(), self.read_variables())
+        self.assertEqual(self.variables_in(self.env_example_blocks()[0]), self.read_variables())
+
+    def test_env_example_fetcher_block_lists_every_fetcher_variable(self) -> None:
+        from strange_ringtone_fetch.config import Settings as FetcherSettings
+
+        environ = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN})
+        FetcherSettings.from_env(environ)
+        # PUBLIC_ORIGIN and TRUSTED_PROXIES are shared, documented once above.
+        shared = {"PUBLIC_ORIGIN", "TRUSTED_PROXIES"}
+        self.assertLessEqual(shared, environ.looked_up)
+        self.assertEqual(self.variables_in(self.env_example_blocks()[1]), environ.looked_up - shared)
 
 
 if __name__ == "__main__":
