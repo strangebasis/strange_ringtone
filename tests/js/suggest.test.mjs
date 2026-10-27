@@ -176,6 +176,15 @@ test("rule 2: the heatmap window with the highest sum wins over a louder stretch
   assert.deepEqual(suggestSelection([LOUD_AT_30], RATE, 15, { heatmap: heatmap(60, 50, 10) }), { start: 45, end: 60 });
 });
 
+test("rule 2: candidate windows start every 100 ms", () => {
+  // The best window starts at 1.3 s, which a coarser step would miss: with
+  // 0.5 s it would be 1.5 s. The start is in silence, so the snap keeps it.
+  const points = [{ start: 0, end: 1.3, value: 0 }, { start: 1.3, end: 16.3, value: 1 }, { start: 16.3, end: 60, value: 0 }];
+  const { start, end } = suggestSelection([LOUD_AT_30], RATE, 15, { heatmap: points });
+  near(start, 1.3, 1e-9, "start");
+  near(end, 16.3, 1e-9, "end");
+});
+
 test("rule 2: a point may end up to 1 s after the audio does", () => {
   const points = heatmap(60, 5, 15);
   points[59] = { start: 59, end: 61, value: 0 };
