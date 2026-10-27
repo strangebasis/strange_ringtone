@@ -713,20 +713,22 @@ security repository, and never patched with a local copy here.
 ```
 LICENSE  README.md  SECURITY.md  CHANGELOG.md  CLAUDE.md  .env.example
 compose.example.yaml        # hardened example, ports only in a commented dev snippet
-.dockerignore               # allowlist: only core/ reaches the build context
+.dockerignore               # allowlist: only core/ and fetcher/ reach the build context
 core/
   Dockerfile  ffmpeg/{VERSION,SHA256SUMS,ffmpeg-devel.asc,configure.txt,components.txt}
   __main__.py               # checkout entry point: python -I core
   strange_ringtone/{__main__.py,config.py,server.py,http_guard.py,static.py,wav.py,render.py,names.py,results.py}
-  static/{index.html,style.css,app.js,waveform.js,player.js,share.js}
+  static/{index.html,style.css,app.js,waveform.js,player.js,share.js,fetch.js}   # fetch.js: link parser, /fetch/ client
   static/audio/{decode,wav,loudness,suggest,fades,request}.js   # pure audio code, unit-tested under Node
   static/package.json       # {"type": "module"} for the Node tests only: not served, not in the image
 fetcher/
-  Dockerfile  requirements.in  requirements.txt
-  strange_ringtone_fetch/{server.py,ytdlp.py}
-tests/  tests/corpus/  tests/image/  tests/stubs/
+  Dockerfile  requirements.in  requirements.txt   # yt-dlp and yt-dlp-ejs, hashed lock
+  __main__.py               # checkout entry point: python -I fetcher; puts ../core on sys.path
+  strange_ringtone_fetch/{__init__,__main__,config,server,jobs,ytdlp}.py   # imports only config and http_guard from core
+tests/  tests/corpus/  tests/image/  tests/image_fetcher/  tests/stubs/{ffmpeg_stub,ytdlp_stub}.py  tests/js/
 scripts/{check_pr_title.py,check_contract_change.py,check_ffmpeg_release.py}   # stdlib checks CI runs
 tools/spike/phase0.py       # regenerates the iOS test tones into spike-out/
+tools/dev_fetch_stack.py    # loopback dev stack: core, stubbed fetcher and one origin, for the offline product check
 .github/{dependabot.yml,workflows/{ci,pr-checks,security_gate,release-please,ffmpeg-watch}.yml}
 release-please-config.json  .release-please-manifest.json
 docs/PLAN.md
@@ -811,6 +813,29 @@ docs/PLAN.md
    the owner's phone test of the share sheet, recorded in 7.3.
 5. **Fetcher** image and UI integration (paste a link, the `#yt=` fragment,
    heatmap suggestions), plus the Shortcut docs.
+
+   Implemented: the opt-in fetcher image (section 6) and, in the page, the
+   **From YouTube** box that `FETCH_ENABLED` reveals. `core/static/fetch.js`
+   parses a pasted link or the `#yt=` fragment on the device (7.4), posts
+   only the video ID to `/fetch/api/jobs`, polls the job every 2 s, fetches
+   the audio once into memory and hands it to the same decode path as a
+   picked file, with plain words for every fetcher error code. The fragment
+   is removed with `history.replaceState` before any request, and with
+   `FETCH_ENABLED` off no `/fetch/` request is ever made. `suggest.js` now
+   applies rules 1 (`t=`) and 2 (the heatmap) of 7.2 before rule 3, with the
+   same snap; an invalid timestamp or heatmap falls through to the next rule.
+   The README documents the YouTube flow, the Shortcut with a placeholder
+   origin, and the privacy notes of section 13. The CSP is unchanged: every
+   URL the page fetches is a same-origin `/fetch/` path.
+
+   The product check runs offline: the UI is driven in a browser against
+   `tools/dev_fetch_stack.py`, which serves the core and the fetcher with the
+   stubbed yt-dlp on one loopback origin, so no YouTube traffic leaves the
+   development machine. Still open: the owner's decision on one real fetch
+   from a throwaway container before v0.1.0, to confirm that
+   `bestaudio[ext=m4a]` is still served without a PO token; without it the
+   first real fetch happens in a deployment. Also open: the owner's phone test
+   of the Shortcut.
 6. **Release:** release-please, publish with provenance, SBOM and image scans, a
    complete README contract, then **v0.1.0**. Stop there. Integration into an
    infrastructure repository happens from that repository.

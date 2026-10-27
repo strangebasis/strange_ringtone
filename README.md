@@ -11,8 +11,8 @@ iOS 26's **Share → Use as Ringtone**. No GarageBand, no computer and no cable.
 
 1. Open the app in Safari on an iPhone running iOS 26 or later and pick an
    audio file (up to 10 minutes). The phone decodes it; nothing is uploaded
-   yet. A later version adds an optional fetcher, so you can share a YouTube
-   link to the app instead.
+   yet. Where the server runs the optional fetcher, you can paste or share a
+   YouTube link instead ([below](#from-a-youtube-link)).
 2. The app pre-selects the loudest stretch, up to `MAX_CLIP_SECONDS` (30 s by
    default), and moves its start to a quiet moment. Drag the handles or nudge
    them by 0.1 s or 1 s. **Play selection** loops it the way a ringtone
@@ -31,6 +31,65 @@ iOS 26's **Share → Use as Ringtone**. No GarageBand, no computer and no cable.
 iOS names the tone after the file, so the name you type is the name Settings
 shows. Finished tones stay on the server for a few minutes only; when one has
 gone, the page says so, and **Hear final** makes it again.
+
+### From a YouTube link
+
+Where the deployment runs the optional fetcher image and sets
+`FETCH_ENABLED=true` on the core, a **From YouTube** box appears above the
+file picker. Paste a link and tap **Fetch**, or share the video to the
+[Make Ringtone Shortcut](#ios-shortcut-make-ringtone), which opens the app with
+the link.
+
+- The page reads the link on the phone. It takes `watch?v=`, `youtu.be/`,
+  `/shorts/`, `/live/` and `/embed/` links on `youtube.com`, `m.youtube.com`
+  and `music.youtube.com`, or a bare 11-character video ID. **Only the ID is
+  sent** to the fetcher, which builds the YouTube address itself.
+- Videos can be up to 10 minutes long (`FETCH_MAX_SECONDS`, which must not be
+  set above the page's 10-minute decode limit). A longer video is refused with
+  a message saying so.
+- The page asks for the job's status every 2 seconds, then downloads the
+  audio once (the fetcher deletes it as it sends it) and decodes it on the
+  phone like a picked file. From there it is the same trimmer, with the name
+  field set to the video's title.
+- The selection starts at the link's `t=` timestamp when it has one.
+  Otherwise it goes on YouTube's "Most Replayed" stretch when the video has
+  that heatmap, and otherwise on the loudest stretch, as for a file. Either
+  way its start then moves to a quiet moment within a second.
+
+With `FETCH_ENABLED` off the box stays hidden and the page never contacts
+`/fetch/`, even when it is opened from the Shortcut.
+
+## iOS Shortcut: Make Ringtone
+
+The Shortcut puts the app on the share sheet of the YouTube app (and of
+Safari). Build it once in the **Shortcuts** app:
+
+1. Create a shortcut named **Make Ringtone**. In its details, turn on
+   **Show in Share Sheet**, so its first action reads **Receive URLs from
+   Share Sheet**.
+2. Add **URL Encode** with the **Shortcut Input**, so the link can be put
+   after `#yt=` intact.
+3. Add **Open URLs** with
+   `https://ringtones.example.internal/#yt=` followed by the **URL Encoded
+   Text** variable. Use your deployment's `PUBLIC_ORIGIN` in place of
+   `https://ringtones.example.internal`.
+
+Then, in the YouTube app, tap **Share**, then **More**, then **Make
+Ringtone**. Safari opens the app and the fetch starts by itself.
+
+Privacy:
+
+- The link travels in the address's fragment (the part after `#`), which the
+  browser never sends to any server, so no proxy log shows which video was
+  shared. The page also removes it from the address bar and the history
+  before it fetches anything.
+- `si=` share tracking and every other parameter are dropped on the phone;
+  only the 11-character ID leaves it.
+- YouTube sees the server's IP address fetch the video, the same as watching
+  it. No account or cookies are used, and the phone itself makes no request to
+  YouTube.
+- The video's title becomes the tone's name. Like any tone name it never goes
+  into a URL or a log.
 
 ## Design
 
