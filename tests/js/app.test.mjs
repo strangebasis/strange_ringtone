@@ -676,6 +676,21 @@ test("the heatmap places the selection (rule 2), and each state is shown while p
   assert.match(page.el("yt-status").textContent, /The selection is on the most replayed stretch;/);
 });
 
+test("a clip no longer than the cap is selected whole, and the status does not name t= or the heatmap", async () => {
+  // suggestSelection takes such a clip whole from 0 before any rule applies.
+  const heatmap = Array.from({ length: 10 }, (_, i) => ({ start: i, end: i + 1, value: i === 6 ? 1 : 0.1 }));
+  for (const statuses of [[{ ...DONE, duration: 10 }], [{ ...DONE, duration: 10, heatmap }]]) {
+    setDecoded([sections([10, 0.3])]);
+    const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ statuses }) });
+    page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=5`;
+    page.el("yt-fetch").dispatch("click");
+    await until(() => !page.el("editor").hidden, "the editor");
+    assert.match(page.el("selection-readout").textContent, /^0:00\.0 to 0:10\.0, 10\.0 s/);
+    assert.equal(page.el("yt-status").textContent,
+      `${TITLE}, 0:10.0. The whole clip is selected; drag the handles to change it.`);
+  }
+});
+
 test("other keys in the link field do nothing", async () => {
   const page = await loadApp({ fetchEnabled: "true", fetch: fetcher() });
   page.el("yt-link").value = VIDEO_ID;

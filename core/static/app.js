@@ -526,6 +526,7 @@ const RULE_WORDS = {
   timestamp: "The selection starts at the link's timestamp",
   heatmap: "The selection is on the most replayed stretch",
   loudness: "The selection starts on the loudest stretch",
+  whole: "The whole clip is selected",
 };
 
 // A new pick or fetch replaces whatever was loading: the token makes an
@@ -580,8 +581,11 @@ async function loadAudio(file, token, { status, label, name, heatmap = null, tim
   waveform.setSelection(state.selection.start, state.selection.end);
   waveform.setFades(fadeSettings().fadeIn, fadeSettings().fadeOut);
   const duration = audio.length / audio.sampleRate;
+  // suggestSelection takes a clip no longer than the cap whole, from 0, before
+  // any rule looks at it, so naming the t= or the heatmap there would be wrong.
+  const rule = duration <= config.maxClipSeconds ? "whole" : suggestionRule(duration, options);
   setStatus(status, label + ", " + formatTime(duration) + ". "
-    + RULE_WORDS[suggestionRule(duration, options)] + "; drag the handles to change it.");
+    + RULE_WORDS[rule] + "; drag the handles to change it.");
   setStatus(el.renderStatus, "");
   updateButtons();
   selectionChanged();
