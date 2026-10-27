@@ -24,6 +24,9 @@ export const MAX_POLLS = 450;
 // such as youtube.com.example.internal is not YouTube.
 const HOSTS = new Set(["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"]);
 const SHORT_HOST = "youtu.be";
+// Every host a link is accepted from, read-only, so a test pins the exact list
+// and a host added by mistake fails it.
+export const LINK_HOSTS = Object.freeze([...HOSTS, SHORT_HOST]);
 // /shorts/<id>, /live/<id>, /embed/<id> and /v/<id>.
 const ID_PATHS = new Set(["shorts", "live", "embed", "v"]);
 // Only text that starts like a web address is parsed as one.

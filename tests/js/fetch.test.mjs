@@ -4,8 +4,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  FETCH_ERROR_CODES, FetchError, MAX_POLLS, POLL_INTERVAL_MS, VIDEO_ID_RE, fetchAudio, fetchErrorMessage, fetchJob,
-  parseTimestamp, parseYouTubeLink, pollJob,
+  FETCH_ERROR_CODES, FetchError, LINK_HOSTS, MAX_POLLS, POLL_INTERVAL_MS, VIDEO_ID_RE, fetchAudio, fetchErrorMessage,
+  fetchJob, parseTimestamp, parseYouTubeLink, pollJob,
 } from "../../core/static/fetch.js";
 
 const ID = "dQw4w9WgXcQ";
@@ -140,6 +140,23 @@ test("anything that is not a YouTube video link is refused", () => {
   }
   for (const value of [null, undefined, 42, {}, [ID]]) {
     assert.equal(parseYouTubeLink(value), null, String(value));
+  }
+});
+
+test("links are accepted from exactly the five YouTube hosts", () => {
+  // Pinned, so a host added to the allowlist fails here: only these names
+  // ever turn text into a request to the fetcher.
+  assert.deepEqual([...LINK_HOSTS].sort(),
+    ["m.youtube.com", "music.youtube.com", "www.youtube.com", "youtu.be", "youtube.com"]);
+  assert.ok(Object.isFrozen(LINK_HOSTS));
+  for (const host of LINK_HOSTS) {
+    const link = host === "youtu.be" ? `https://${host}/${ID}` : `https://${host}/watch?v=${ID}`;
+    assert.deepEqual(parseYouTubeLink(link), { videoId: ID, timestamp: null }, host);
+  }
+  for (const host of ["evil.example.internal", "www.youtube-nocookie.com", "studio.youtube.com", "gaming.youtube.com",
+    "youtube.googleapis.com", "www.youtu.be", "m.youtu.be", "youtube.example.internal"]) {
+    assert.equal(parseYouTubeLink(`https://${host}/watch?v=${ID}`), null, host);
+    assert.equal(parseYouTubeLink(`https://${host}/${ID}`), null, host);
   }
 });
 
