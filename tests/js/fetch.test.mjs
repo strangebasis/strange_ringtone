@@ -118,8 +118,20 @@ test("anything that is not a YouTube video link is refused", () => {
     `ftp://youtu.be/${ID}`,
     `javascript:alert(1)//youtu.be/${ID}`,
     `//youtu.be/${ID}`,
+    // Only text that starts with http(s):// is read as a link (the field's
+    // placeholder shows no example link; tests/test_frontend_html.py).
     `youtu.be/${ID}`,
     `www.youtube.com/watch?v=${ID}`,
+    `youtube.com/watch?v=${ID}`,
+    `Watch this youtu.be/${ID}`,
+    // Paths that only look like a video's.
+    `https://www.youtube.com/playlist/${ID}`,
+    `https://www.youtube.com/playlist?v=${ID}`,
+    `https://www.youtube.com/watch/x?v=${ID}`,
+    `https://www.youtube.com/x/watch?v=${ID}`,
+    // A password alone is still a credential.
+    `https://:pass@youtu.be/${ID}`,
+    `https://:pass@www.youtube.com/watch?v=${ID}`,
     `https://example.internal/?u=https://youtu.be/${ID}`,
     `https://youtu.be/${ID}`.padEnd(2049, " ") + "x",
   ];
@@ -223,6 +235,20 @@ const DONE = {
   duration: 215.5,
   heatmap: [{ start: 0, end: 2.155, value: 1 }],
 };
+
+test("pollJob asks at once the first time, before any wait", async (t) => {
+  const calls = fakeFetch(t, () => json(DONE));
+  // With 5 s between polls, a first look that waited loses the race.
+  let timer;
+  const late = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("late"), 1000);
+  });
+  const done = await Promise.race([pollJob(JOB, { intervalMs: 5000 }), late]);
+  clearTimeout(timer);
+  assert.notEqual(done, "late", "the first poll waited for the interval");
+  assert.equal(done.status, "done");
+  assert.equal(calls.length, 1);
+});
 
 test("pollJob asks every interval until done and reports each state", async (t) => {
   const answers = [{ status: "queued" }, { status: "queued" }, { status: "running" }, DONE];
