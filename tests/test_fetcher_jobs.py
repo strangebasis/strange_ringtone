@@ -166,6 +166,26 @@ class SubmitTest(JobsTestCase):
                 self.assertIsNone(self.jobs.claim(job_id))  # type: ignore[arg-type]
         self.assertIsNone(self.jobs.status("0" * 32))
 
+    def test_the_id_shape_is_checked_before_the_index(self) -> None:
+        # The index is keyed by what secrets.token_hex(16) returns, so a
+        # malformed ID never matches an entry anyway; the shape check must
+        # still refuse it on its own, before any lookup. Planting entries under
+        # malformed keys shows that: only the check stands between them and
+        # the caller.
+        for job_id in ("A" * 32, "0123456789ABCDEF" * 2, "0" * 31, "0" * 33, "g" * 32, " " + "0" * 31):
+            with self.subTest(job_id=job_id):
+                with mock.patch.object(jobs_module.secrets, "token_hex", return_value=job_id):
+                    self.assertEqual(self.run_job(), job_id)
+                self.assertEqual(self.jobs._jobs[job_id].status, "done")
+                self.assertIsNone(self.jobs.status(job_id))
+                self.assertIsNone(self.jobs.claim(job_id))
+                self.assertEqual(self.jobs._jobs[job_id].status, "done")
+        # A valid ID, and anything that is not a string, never reaches the index either.
+        for job_id in (None, 0, b"0" * 32, ["0" * 32]):
+            with self.subTest(job_id=job_id):
+                self.assertIsNone(self.jobs.status(job_id))  # type: ignore[arg-type]
+                self.assertIsNone(self.jobs.claim(job_id))  # type: ignore[arg-type]
+
 
 class RunTest(JobsTestCase):
     def test_a_done_job_shows_only_the_whitelisted_metadata(self) -> None:
@@ -235,6 +255,16 @@ class RunTest(JobsTestCase):
         wait_for(lambda: (self.jobs.status(second) or {}).get("status") == "done", "the second job")
         self.assertEqual(self.runner.max_running, 1)
         self.assertEqual(self.runner.calls, [VIDEO_ID, OTHER_ID])
+
+    def test_only_a_queued_job_is_started(self) -> None:
+        # An ID taken from the queue whose job has moved on (or was never a
+        # waiting one) must not run again: that would fetch twice under one ID.
+        job_id = self.jobs.submit(VIDEO_ID)
+        self.jobs._jobs[job_id].status = "failed"
+        self.assertFalse(self.jobs.run_next(timeout=0))
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(self.jobs._jobs[job_id].status, "failed")
+        self.assertEqual(self.scratch_contents(), [])
 
     def test_the_worker_logs_only_the_exception_type(self) -> None:
         # The worker survives an unexpected error with one line on stderr. An
@@ -404,6 +434,33 @@ class ExpiryTest(JobsTestCase):
         self.assertIsNone(self.jobs.claim(job_id))
         self.assertTrue(path.exists())
         self.assertEqual(self.jobs.sweep(), 1)
+        self.assertFalse(path.exists())
+        self.assertEqual(len(self.jobs), 0)
+
+    def test_a_file_that_would_not_go_hides_its_job_before_it_expires(self) -> None:
+        # An eviction whose unlink failed leaves a GONE entry for the sweep to
+        # retry; until then the job is invisible, though its TTL has not run out.
+        older = self.run_job(VIDEO_ID)
+        with mock.patch.object(Path, "unlink", side_effect=PermissionError("in use")):
+            newer = self.run_job(OTHER_ID)
+        self.assertEqual(self.jobs._jobs[older].status, "gone")
+        self.assertIsNone(self.jobs.status(older))
+        self.assertIsNone(self.jobs.claim(older))
+        self.assertEqual(self.jobs.status(newer)["status"], "done")  # type: ignore[index]
+        self.assertEqual(self.jobs.sweep(), 1)
+        self.assertEqual(self.scratch_contents(), [f"results/{newer}.m4a"])
+
+    def test_a_download_being_streamed_outlives_its_ttl(self) -> None:
+        # The sweep must not pull the file from under a stream in progress;
+        # release() deletes it when the stream ends.
+        job_id = self.run_job()
+        path = self.jobs.claim(job_id)
+        assert path is not None
+        self.clock.now += 10_000
+        self.assertEqual(self.jobs.sweep(), 0)
+        self.assertTrue(path.exists())
+        self.assertEqual(len(self.jobs), 1)
+        self.jobs.release(job_id)
         self.assertFalse(path.exists())
         self.assertEqual(len(self.jobs), 0)
 
