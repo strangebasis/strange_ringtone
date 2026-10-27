@@ -27,6 +27,8 @@ what tools/dev_fetch_stack.py relies on.
     bare_info     an info JSON with neither title, duration nor heatmap
     not_a_dict    an info JSON that is a list
     symlink       <id>.m4a is a symlink to a file outside the job directory
+    files_101     both files as "ok", then exit 101
+    files_1       both files as "ok", then exit 1
     hang          sleep 60 s
     grandchild    start a sleeping grandchild, write its PID to grandchild.pid
                   in the working directory, then sleep 60 s
@@ -53,7 +55,7 @@ AUDIO_VAR = "STRANGE_RINGTONE_YTDLP_STUB_AUDIO"
 DURATION_VAR = "STRANGE_RINGTONE_YTDLP_STUB_DURATION"
 MODES = (
     "ok", "too_long", "blocked", "not_found", "fail", "oversize", "no_audio", "ctrl_title", "huge_heatmap",
-    "bad_heatmap", "bare_info", "not_a_dict", "symlink", "hang", "grandchild",
+    "bad_heatmap", "bare_info", "not_a_dict", "symlink", "files_101", "files_1", "hang", "grandchild",
 )
 # Eleven characters each, so they pass the fetcher's ID check.
 BY_ID = {
@@ -69,6 +71,8 @@ BY_ID = {
     "bareInfo___": "bare_info",
     "notADict___": "not_a_dict",
     "symlinked__": "symlink",
+    "tooLongFile": "files_101",
+    "failedFiles": "files_1",
     "hanging____": "hang",
     "grandchild_": "grandchild",
 }
@@ -247,6 +251,11 @@ def main(argv: list[str]) -> int:
         else:
             data = AUDIO_MAGIC + video_id.encode("ascii")
         write_bytes(audio, data)
+    # A failed run that still left both files behind: the exit status wins.
+    if mode == "files_101":
+        return 101
+    if mode == "files_1":
+        return 1
     return 0
 
 

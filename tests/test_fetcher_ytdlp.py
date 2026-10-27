@@ -477,6 +477,15 @@ class FetchTest(StubTestCase):
             with self.subTest(video_id=video_id):
                 self.assertEqual(self.fetch_error(video_id, max_bytes=1024), code)
 
+    def test_a_failed_exit_is_failure_even_with_both_files(self) -> None:
+        # Success needs exit 0 and the files: a rejected or failed run that
+        # still left <id>.m4a and <id>.info.json behind is not a download.
+        for video_id, code in (("tooLongFile", "too_long"), ("failedFiles", "failed")):
+            with self.subTest(video_id=video_id):
+                self.assertEqual(self.fetch_error(video_id), code)
+                self.assertTrue((self.job / f"{video_id}.m4a").is_file())
+                self.assertTrue((self.job / f"{video_id}.info.json").is_file())
+
     def test_too_long_writes_nothing(self) -> None:
         self.assertEqual(self.fetch_error("tooLong____"), "too_long")
         self.assertEqual(self.job_names(), [])
