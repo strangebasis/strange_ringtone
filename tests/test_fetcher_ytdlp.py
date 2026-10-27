@@ -409,6 +409,15 @@ class MetadataTest(unittest.TestCase):
         self.assertEqual(metadata, ytdlp.Metadata(title="T", duration=10,
                                                   heatmap=({"start": 0.0, "end": 1.0, "value": 0.5},)))
 
+    def test_a_duration_that_is_not_a_positive_number_is_dropped(self) -> None:
+        # The status answer promises a number; with no duration the heatmap,
+        # which is checked against it, goes too.
+        for raw in ("600", -5, 0, True, math.inf, math.nan, None, [600]):
+            with self.subTest(raw=raw):
+                metadata = parse_info({"title": "T", "duration": raw, "heatmap": [self.point()]})
+                self.assertEqual(metadata, ytdlp.Metadata(title="T", duration=None, heatmap=None))
+        self.assertEqual(parse_info({"duration": 215}).duration, 215)
+
     def test_info_that_is_not_an_object_fails(self) -> None:
         for info in ([], "x", None, 5):
             with self.subTest(info=info), self.assertRaises(FetchError) as raised:
