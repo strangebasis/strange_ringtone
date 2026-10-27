@@ -853,6 +853,35 @@ class AudioTest(ServerTestCase):
         wait_for(lambda: not path.exists(), "the audio to be deleted")
         self.assertJsonError(self.status(job_id), 404, "not_found")
 
+    def test_a_stream_stops_when_the_worker_needs_its_space(self) -> None:
+        # Jobs.streaming turns False once the next fetch needs the space a
+        # slow stream holds (see test_fetcher_jobs); the handler must then stop
+        # short and still delete the audio.
+        job_id = self.create_job()
+        self.wait_done(job_id)
+        path = self.scratch / "results" / f"{job_id}.m4a"
+        size = 4 * server_module.CHUNK_BYTES
+        path.write_bytes(b"x" * size)
+        checks: list[str] = []
+
+        def streaming(checked: str) -> bool:
+            checks.append(checked)
+            return len(checks) == 1
+
+        with mock.patch.object(self.server.jobs, "streaming", side_effect=streaming):
+            with socket.create_connection(("127.0.0.1", self.port), timeout=DEADLINE) as sock:
+                sock.sendall(build_request("GET", f"{JOBS}/{job_id}/audio"))
+                raw = b""
+                while chunk := sock.recv(65536):
+                    raw += chunk
+        head, _, body = raw.partition(b"\r\n\r\n")
+        self.assertTrue(head.startswith(b"HTTP/1.0 200 "), head)
+        self.assertIn(f"\r\nContent-Length: {size}\r\n".encode(), head + b"\r\n")
+        self.assertEqual(len(body), server_module.CHUNK_BYTES)
+        self.assertEqual(checks, [job_id, job_id])
+        wait_for(lambda: not path.exists(), "the audio to be deleted")
+        self.assertJsonError(self.status(job_id), 404, "not_found")
+
     def test_one_held_result(self) -> None:
         older = self.create_job(VIDEO_ID)
         self.wait_done(older)

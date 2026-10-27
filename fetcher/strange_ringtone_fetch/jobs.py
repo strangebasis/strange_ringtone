@@ -7,11 +7,13 @@ doesn't know is never served. Only one yt-dlp runs at a time
 address, and holds up to FETCH_MAX_BYTES on the tmpfs, so a short queue and a
 fast 503 beyond it keep all three bounded.
 
-/tmp is sized for one download in flight plus one finished, uncollected
-download (2 x FETCH_MAX_BYTES + 16 MB). So when a download finishes, any
-older one still waiting is deleted: the fetcher never holds more than one.
-The TTL remains the upper bound of a result's life, and nothing survives a
-restart.
+/tmp is sized for one download in flight plus one finished download
+(2 x FETCH_MAX_BYTES + 16 MB). So when a download finishes, any older one
+still waiting is deleted, and before the next one starts, the worker makes
+sure at most one finished download is left on the tmpfs. A download that is
+being streamed counts too: its file holds its space until the stream closes
+it, however slowly the client reads. The TTL remains the upper bound of a
+result's life, and nothing survives a restart.
 """
 from __future__ import annotations
 
@@ -37,6 +39,11 @@ JOB_ID_RE = re.compile(r"[0-9a-f]{32}")
 # last in the queue waits at most ten minutes, which the page's polling covers.
 QUEUE_SIZE = 4
 RESULTS_DIR = "results"
+# Finished downloads, held or being streamed, that may stay on the tmpfs while
+# the next one runs: with that one, 2 x FETCH_MAX_BYTES, as the tmpfs is sized.
+MAX_HELD = 1
+# How often a worker waiting for streams to let go checks for stop().
+ROOM_POLL_SECONDS = 0.2
 # How long stop() waits for each thread; the running yt-dlp is killed first.
 STOP_SECONDS = 10.0
 
@@ -71,6 +78,9 @@ class Job:
     error: str | None = None
     metadata: Metadata | None = None
     audio: Path | None = None
+    # Set on a download being streamed when the worker needs its space; the
+    # stream stops at its next chunk.
+    abort: bool = False
 
 
 class Jobs:
@@ -89,6 +99,8 @@ class Jobs:
         self.ttl_seconds = ttl_seconds
         self._clock = clock
         self._lock = threading.Lock()
+        # Signalled whenever a stream lets go of its download.
+        self._released = threading.Condition(self._lock)
         self._jobs: dict[str, Job] = {}
         self._queue: queue.Queue[str] = queue.Queue(maxsize=queue_size)
         self._stop = threading.Event()
@@ -170,6 +182,17 @@ class Jobs:
             job = self._jobs.get(job_id)
             if job is not None and job.status == COLLECTING:
                 self._delete(job)
+            self._released.notify_all()
+
+    def streaming(self, job_id: str) -> bool:
+        """Whether the stream of a claimed download may send its next chunk.
+
+        False once the worker needs the space for the next download (see
+        _make_room), or when the job is no longer being streamed.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return job is not None and job.status == COLLECTING and not job.abort
 
     # --- the worker -------------------------------------------------------------
 
@@ -190,6 +213,8 @@ class Jobs:
         held: Path | None = None
         job_dir: Path | None = None
         try:
+            if not self._make_room():
+                raise FetchError("failed")
             # A fresh directory per job, named by the server, owner-only
             # (mkdtemp creates it 0o700).
             job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=self.scratch))
@@ -222,7 +247,8 @@ class Jobs:
             job.finished = self._clock()
             if error is None:
                 job.status, job.metadata, job.audio = DONE, metadata, held
-                # At most one finished download on the tmpfs: this one.
+                # At most one uncollected download: this one. One still
+                # being streamed stays until the next job needs its space.
                 for other in list(self._jobs.values()):
                     if other is not job and other.status == DONE:
                         self._delete(other)
@@ -283,6 +309,40 @@ class Jobs:
             thread.join(STOP_SECONDS)
 
     # --- internals ----------------------------------------------------------------
+
+    def _make_room(self) -> bool:
+        """Before a download starts: leave at most MAX_HELD finished downloads; False if stopped first.
+
+        A download being streamed counts like a held one, because its file
+        keeps its space until the stream closes it (on Linux an unlinked file
+        that is still open stays on the tmpfs). The oldest uncollected
+        download goes first (docs/PLAN.md 6). If streams alone fill the
+        budget, the oldest are told to stop and the worker waits until they
+        let go. A stream checks between chunks and each write is bounded by
+        the handler's socket timeout, so a client that reads slowly can delay
+        the next fetch by that much but never hold the queue, nor make a
+        third download share the tmpfs.
+        """
+        with self._lock:
+            while True:
+                held = sorted(
+                    (job for job in self._jobs.values() if job.status in (DONE, COLLECTING)),
+                    key=lambda job: job.finished or 0.0,
+                )
+                excess = len(held) - MAX_HELD
+                if excess <= 0:
+                    return True
+                uncollected = [job for job in held if job.status == DONE]
+                if uncollected:
+                    # An unlink that fails (Windows only, never a deployment)
+                    # leaves a GONE entry for the sweep, which no longer counts.
+                    self._delete(uncollected[0])
+                    continue
+                for job in held[:excess]:
+                    job.abort = True
+                if self._stop.is_set():
+                    return False
+                self._released.wait(ROOM_POLL_SECONDS)
 
     def _expired(self, job: Job) -> bool:
         return job.finished is not None and self._clock() - job.finished >= self.ttl_seconds

@@ -342,7 +342,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     [("Content-Disposition", 'attachment; filename="audio.m4a"')],
                 )
                 remaining = size
-                while remaining > 0:
+                # Checked before every chunk: once the worker needs this
+                # download's space for the next one (Jobs._make_room), the
+                # stream stops short and the client sees a truncated body.
+                while remaining > 0 and jobs.streaming(job_id):
                     chunk = handle.read(min(CHUNK_BYTES, remaining))
                     if not chunk:
                         break

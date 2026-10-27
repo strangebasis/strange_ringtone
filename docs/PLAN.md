@@ -436,7 +436,11 @@ core still needs no egress, and `FETCH_ENABLED` only shows the YouTube box.
   (`FETCH_RESULT_TTL_SECONDS` from completion) catches any file that was never
   collected. The fetcher holds **at most one** finished, uncollected result:
   `/tmp` is sized for one download in flight plus one waiting, so when a
-  download finishes, an older one still waiting is deleted. This rule is the
+  download finishes, an older one still waiting is deleted. A result being
+  streamed counts too, because its file keeps its space until the stream
+  closes it: before the next download starts, the oldest uncollected result
+  goes, and if streams alone fill the budget, the oldest stream is cut at its
+  next chunk and the worker waits for it to let go. This rule is the
   fetcher's only; the core's no-early-eviction rule (5.5) is unchanged.
 - **Runtime:** the same `python:3.12-slim-bookworm` base and digest as the
   core, with its `prlimit`. Deno (2.9.8; yt-dlp needs at least 2.3.0) is

@@ -43,6 +43,8 @@ class FakeRunner:
         self.dirs: list[Path] = []
         self.dir_modes: list[int] = []
         self.calls: list[str] = []
+        # The finished downloads on the tmpfs as each fetch starts.
+        self.held: list[list[str]] = []
         self.running = 0
         self.max_running = 0
         self.cancelled = 0
@@ -55,6 +57,7 @@ class FakeRunner:
             self.calls.append(video_id)
             self.dirs.append(job_dir)
             self.dir_modes.append(stat.S_IMODE(os.stat(job_dir).st_mode))
+            self.held.append(sorted(path.name for path in (job_dir.parent / jobs_module.RESULTS_DIR).iterdir()))
         try:
             gate = self.gates.get(video_id)
             if gate is not None and not gate.wait(DEADLINE):
@@ -368,8 +371,67 @@ class HeldResultTest(JobsTestCase):
         assert path is not None
         self.run_job(OTHER_ID)
         self.assertTrue(path.exists())
+        self.assertTrue(self.jobs.streaming(older))
         self.jobs.release(older)
         self.assertFalse(path.exists())
+        self.assertFalse(self.jobs.streaming(older))
+
+    def test_a_slow_stream_counts_against_the_tmpfs(self) -> None:
+        # The tmpfs holds 2 x FETCH_MAX_BYTES: the download in flight and one
+        # finished. A client that keeps its audio stream open keeps that file
+        # on the tmpfs, so while it lasts, the oldest uncollected download goes
+        # before the next fetch starts, rather than a third file joining them.
+        self.assertEqual(jobs_module.MAX_HELD, 1)
+        slow = self.run_job(VIDEO_ID)
+        slow_path = self.jobs.claim(slow)
+        assert slow_path is not None
+        held = self.run_job(OTHER_ID)
+        later = [self.run_job(video_id) for video_id in ("ccccccccccc", "ddddddddddd")]
+        self.assertEqual(self.runner.held, [[], [f"{slow}.m4a"], [f"{slow}.m4a"], [f"{slow}.m4a"]])
+        self.assertIsNone(self.jobs.status(held))
+        self.assertIsNone(self.jobs.status(later[0]))
+        self.assertEqual(self.jobs.status(later[1])["status"], "done")  # type: ignore[index]
+        # The slow stream itself was never cut: one held download is room enough.
+        self.assertTrue(self.jobs.streaming(slow))
+        self.assertTrue(slow_path.exists())
+        self.jobs.release(slow)
+        self.assertEqual(self.scratch_contents(), [f"results/{later[1]}.m4a"])
+
+    def test_streams_alone_over_budget_stop_the_oldest_and_the_next_fetch_waits(self) -> None:
+        older = self.run_job(VIDEO_ID)
+        self.assertIsNotNone(self.jobs.claim(older))
+        newer = self.run_job(OTHER_ID)
+        self.assertIsNotNone(self.jobs.claim(newer))
+        waiting = self.jobs.submit("ccccccccccc")
+        thread = threading.Thread(target=self.jobs.run_next, kwargs={"timeout": 0}, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, DEADLINE)
+        wait_for(lambda: not self.jobs.streaming(older), "the oldest stream to be told to stop")
+        self.assertTrue(self.jobs.streaming(newer))
+        time.sleep(0.3)
+        # Still waiting for the stream to let go: no third download yet.
+        self.assertEqual(self.runner.calls, [VIDEO_ID, OTHER_ID])
+        self.assertEqual(self.jobs.status(waiting), {"status": "running"})
+        self.jobs.release(older)
+        thread.join(DEADLINE)
+        self.assertEqual(self.runner.held[-1], [f"{newer}.m4a"])
+        self.assertEqual(self.jobs.status(waiting)["status"], "done")  # type: ignore[index]
+        self.jobs.release(newer)
+        self.assertEqual(self.scratch_contents(), [f"results/{waiting}.m4a"])
+
+    def test_stop_ends_a_wait_for_room(self) -> None:
+        for video_id in (VIDEO_ID, OTHER_ID):
+            self.assertIsNotNone(self.jobs.claim(self.run_job(video_id)))
+        waiting = self.jobs.submit("ccccccccccc")
+        # A daemon, so a wait that never ends fails this test instead of hanging the run.
+        thread = threading.Thread(target=self.jobs.run_next, kwargs={"timeout": 0}, daemon=True)
+        thread.start()
+        wait_for(lambda: self.jobs.status(waiting) == {"status": "running"}, "the job to wait for room")
+        self.jobs.stop()
+        thread.join(DEADLINE)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.jobs.status(waiting), {"status": "failed", "error": "failed"})
+        self.assertEqual(self.runner.calls, [VIDEO_ID, OTHER_ID])
 
 
 class ExpiryTest(JobsTestCase):
