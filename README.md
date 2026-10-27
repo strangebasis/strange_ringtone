@@ -110,12 +110,14 @@ Privacy:
 | --- | --- |
 | `docs/PLAN.md` | Research, decisions and the v0.1.0 plan |
 | `core/` | The core server: the `strange_ringtone` package and its static files, the image's `Dockerfile`, and in `core/ffmpeg/` the pinned, verified ffmpeg build inputs (version, checksum, signing key, configure line, component allowlist) |
-| `.env.example` | The core's settings, with placeholders and defaults |
+| `fetcher/` | The optional YouTube fetcher, a second image: the `strange_ringtone_fetch` package, its `Dockerfile`, and the hashed lock for yt-dlp and yt-dlp-ejs (`requirements.txt`, compiled from `requirements.in`). It shares the core's request checks by importing them from `core/` |
+| `.env.example` | The core's settings and the optional fetcher's, with placeholders and defaults |
 | `compose.example.yaml` | A hardened Compose example, with no published ports |
-| `.dockerignore` | An allowlist: only `core/` reaches the image build context |
+| `.dockerignore` | An allowlist: only `core/` and `fetcher/` reach the build context the two images share |
 | `tools/spike/phase0.py` | Generates the test tones that established the share sheet's rules |
+| `tools/dev_fetch_stack.py` | An offline development stack on loopback: the core, the fetcher with a stub yt-dlp, and one origin, for trying the YouTube flow without touching YouTube |
 | `scripts/` | Stdlib checks that CI runs: the PR title and contract checks on pull requests, and the weekly FFmpeg release watch |
-| `tests/` | Stdlib `unittest` tests, plus `node:test` unit tests for the browser's audio code in `tests/js/` |
+| `tests/` | Stdlib `unittest` tests (the in-image suites in `tests/image/` and `tests/image_fetcher/`, the ffmpeg and yt-dlp stubs in `tests/stubs/`), plus `node:test` unit tests for the browser's code in `tests/js/` |
 | `.github/` | CI workflows, Dependabot, and hashed lockfiles for the CI tools |
 
 ## Development
