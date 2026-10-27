@@ -128,6 +128,9 @@ const state = {
   decodeToken: 0,
   // Stops the polling of a fetch that a newer pick or fetch replaced.
   fetchController: null,
+  // The video the fetch in flight is for, so a second tap on Fetch for the
+  // same link does not open a second job (and spend a second rate-limit slot).
+  fetchVideoId: null,
 };
 
 let audioContext = null;
@@ -607,7 +610,7 @@ el.file.addEventListener("change", async () => {
 
 const FETCH_STATES = {
   queued: "Waiting in the queue…",
-  running: "Downloading…",
+  running: "The server is downloading it…",
 };
 
 /**
@@ -625,10 +628,14 @@ async function fetchFromYouTube(text) {
     setStatus(el.ytStatus, fetchErrorMessage("bad_link"), true);
     return;
   }
+  // The same video is already on its way: a second tap would only queue a
+  // second job that nobody collects. A different link still replaces it.
+  if (state.fetchController !== null && state.fetchVideoId === link.videoId) return;
   resetForNewFile();
   const token = supersede();
   const controller = new AbortController();
   state.fetchController = controller;
+  state.fetchVideoId = link.videoId;
   const current = () => token === state.decodeToken;
   // The picker's line goes back to its hint; a file picked earlier is no
   // longer what the editor shows.

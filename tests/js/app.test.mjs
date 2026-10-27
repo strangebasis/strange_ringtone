@@ -502,6 +502,7 @@ test("a new file frees Hear final at once, and the old render's end says nothing
 // --- YouTube ------------------------------------------------------------------------
 
 const VIDEO_ID = "dQw4w9WgXcQ";
+const OTHER_VIDEO_ID = "Lmnopqrstuv";
 const JOB_ID = "fedcba9876543210fedcba9876543210";
 const AUDIO_BYTES = [9, 8, 7, 6, 5];
 // 30 s of digital silence, 15 s loud, 15 s of silence: rule 3 would start at
@@ -670,7 +671,7 @@ test("the heatmap places the selection (rule 2), and each state is shown while p
   assert.equal(page.fetchCalls.length, 2);
   await until(() => page.fetchCalls.length === 3, "the second poll");
   await settle();
-  assert.equal(page.el("yt-status").textContent, "Downloading…");
+  assert.equal(page.el("yt-status").textContent, "The server is downloading it…");
   await until(() => !page.el("editor").hidden, "the editor", 4000);
   assert.equal(page.el("selection-readout").textContent, "0:05.0 to 0:20.0, 15.0 s (the maximum)");
   assert.match(page.el("yt-status").textContent, /The selection is on the most replayed stretch;/);
@@ -811,7 +812,7 @@ test("a fetch replaced while its status is on the way never downloads the audio"
   assert.equal(page.el("yt-status").textContent, "");
 });
 
-test("a second fetch replaces one that is still polling", async () => {
+test("a fetch for a different video replaces one that is still polling", async () => {
   setDecoded([LOUD_AT_30]);
   const statuses = [{ status: "queued" }, DONE];
   const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ statuses }) });
@@ -819,6 +820,7 @@ test("a second fetch replaces one that is still polling", async () => {
   page.el("yt-fetch").dispatch("click");
   await until(() => page.fetchCalls.length === 2, "the first poll");
   // The second fetch's first poll answers done at once.
+  page.el("yt-link").value = OTHER_VIDEO_ID;
   page.el("yt-fetch").dispatch("click");
   await until(() => !page.el("editor").hidden, "the editor");
   // The first fetch's next poll, due 2 s after its first, never happens.
@@ -827,6 +829,29 @@ test("a second fetch replaces one that is still polling", async () => {
     "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`,
     "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}/audio`,
   ]);
+  assert.equal(page.fetchCalls[0].init.body, `{"video_id":"${VIDEO_ID}"}`);
+  assert.equal(page.fetchCalls[2].init.body, `{"video_id":"${OTHER_VIDEO_ID}"}`);
+});
+
+test("a second tap on Fetch for the same video while it is on its way opens no second job", async () => {
+  setDecoded([LOUD_AT_30]);
+  const statuses = [{ status: "queued" }, DONE];
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ statuses }) });
+  page.el("yt-link").value = VIDEO_ID;
+  // A double tap, then an impatient one while the job is still queued.
+  page.el("yt-fetch").dispatch("click");
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 2, "the first poll");
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor", 5000);
+  assert.deepEqual(fetchUrls(page), [
+    "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}/audio`,
+  ]);
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE}, 1:00.0. The selection starts on the loudest stretch; drag the handles to change it.`);
+  // Once it is done, the same link can be fetched again.
+  page.el("yt-fetch").dispatch("click");
+  await until(() => fetchUrls(page).filter((url) => url === "/fetch/api/jobs").length === 2, "the second job");
 });
 
 test("the replaced fetch's cancel neither shows its words nor drops the newer fetch's way to be stopped", async () => {
@@ -852,6 +877,7 @@ test("the replaced fetch's cancel neither shows its words nor drops the newer fe
   page.el("yt-link").value = VIDEO_ID;
   page.el("yt-fetch").dispatch("click");
   await until(() => page.fetchCalls.length === 2, "fetch A's first poll");
+  page.el("yt-link").value = OTHER_VIDEO_ID;
   page.el("yt-fetch").dispatch("click");
   await until(() => page.fetchCalls.length === 4, "fetch B's first poll");
   // B's second poll comes after A's cancelled look, which was due first.
@@ -899,6 +925,7 @@ test("a fetch replaced while its audio downloads leaves the newer fetch alone", 
   page.el("yt-link").value = VIDEO_ID;
   page.el("yt-fetch").dispatch("click");
   await until(() => page.fetchCalls.length === 3, "the first fetch's audio request");
+  page.el("yt-link").value = OTHER_VIDEO_ID;
   page.el("yt-fetch").dispatch("click");
   await until(() => page.fetchCalls.length === 5, "the second fetch's first poll");
   await settle();
