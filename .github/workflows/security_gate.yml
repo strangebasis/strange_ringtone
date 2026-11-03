@@ -1,10 +1,8 @@
 name: Security gate
 
 # Every security scan comes from the organisation's shared security repository;
-# this repository runs none of its own. These are referenced at @main, the
-# owner's explicit exception (2026-10-25) to pinning by commit SHA. It applies
-# only to strangebasisdevs-owned reusable workflows, so a fix made there reaches
-# every repository at once (CLAUDE.md, Supply chain).
+# this repository runs none of its own. They are pinned by full commit SHA with
+# a version comment and bumped by Dependabot (CLAUDE.md, Supply chain).
 on:
   pull_request:
   push:
@@ -20,12 +18,12 @@ permissions:
 jobs:
   semgrep:
     name: Semgrep
-    uses: strangebasisdevs/strange_security/.github/workflows/semgrep.yml@main
+    uses: strangebasisdevs/strange_security/.github/workflows/semgrep.yml@26c089bb86b845fac6e3417c24469bef6bf9a713 # v1.0.0
 
   trivy:
     name: Trivy
-    uses: strangebasisdevs/strange_security/.github/workflows/trivy.yml@main
+    uses: strangebasisdevs/strange_security/.github/workflows/trivy.yml@26c089bb86b845fac6e3417c24469bef6bf9a713 # v1.0.0
 
   gitleaks:
     name: Gitleaks
-    uses: strangebasisdevs/strange_security/.github/workflows/gitleaks.yml@main
+    uses: strangebasisdevs/strange_security/.github/workflows/gitleaks.yml@26c089bb86b845fac6e3417c24469bef6bf9a713 # v1.0.0
