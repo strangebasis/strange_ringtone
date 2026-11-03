@@ -127,10 +127,8 @@ def prepare_scratch(directory: Path) -> None:
         raise RuntimeError(f"scratch path is not a plain directory: {directory}")
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise RuntimeError(f"scratch directory is owned by another user: {directory}")
-    # Safe because 0o700 lets only this user list, enter or write the directory
-    # that holds downloads; the execute bit is what makes a directory enterable.
-    # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
-    os.chmod(directory, 0o700)
+    # Safe because 0o700 lets only this user list, enter or write the download directory (execute makes it enterable).
+    os.chmod(directory, 0o700)  # noqa: E501  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
     # The fetcher keeps no state across restarts.
     for child in directory.iterdir():
         if child.is_dir() and not child.is_symlink():
