@@ -1,7 +1,9 @@
 # strange_ringtone: research and v0.1.0 plan
 
 Status: design agreed on 2026-10-24 (decisions in section 3). Milestones 0
-to 2 are done, and milestone 3 (render) is implemented (section 12).
+to 2 are done, milestone 3 (render) is implemented, and milestone 4 (web app)
+is implemented with its Web Share check pending the owner's phone test
+(section 12).
 This file is the design record; the README's "Deployment contract" becomes the
 source of truth for operators once v0.1.0 ships.
 
@@ -96,7 +98,8 @@ install through Finder or iMazing.
   of 0 to 5 s. Ringtones loop while ringing, so a fade-out plus a short fade-in
   makes the loop seamless and avoids clicks.
 - Loudness normalisation is on by default. The baseline (`DEFAULT_TARGET_LUFS`)
-  is −14 LUFS, with a slider from −24 (softer) to −9 (louder) and a true-peak
+  is −14 LUFS, with a slider from −24 (softer) to −9 (louder) in 0.1 LU steps
+  (the page rounds a baseline with more decimals to one) and a true-peak
   ceiling of −1 dBTP. Phase 0 didn't compare it by ear with a built-in tone, so
   the baseline is adjusted later through the slider or the env var.
 - The frontend has no dependencies: plain ES modules, with a canvas waveform
@@ -142,8 +145,20 @@ without the fetcher.
 
 That is the whole API. Nothing else reads or writes state.
 
-`<audio>` elements play responses regardless of `Content-Disposition`, so
-"Hear final" can use the attachment URL.
+"Hear final" fetches `/api/result/<id>.m4a` once with `fetch()`, decodes the
+bytes with `decodeAudioData` and loops them through Web Audio, with no fades or
+gain of its own because the file already has them. The page learns
+`RESULT_TTL_SECONDS` from a data attribute and drops its download links when
+that time has passed (counted from the render request, so never later than the
+server), so they never point at a tone the sweeper has deleted; the file in
+memory still plays and shares, and "Hear final" then renders again. A tone
+finished while the page is hidden waits for the next "Hear final" instead of
+starting a loop in a background tab. An `<audio>` element
+pointed at the attachment URL would not work: Safari's media loader sends
+`Range` (and `HEAD`) requests, and the result route supports neither. The
+same bytes become the `File` for Web Share (7.3), and nothing needs a `blob:`
+URL, which the CSP's `'self'` does not cover. The download links point at the
+result URLs directly.
 
 ### 5.2 Input checks, in order, before ffmpeg runs
 
@@ -261,8 +276,9 @@ option), and fails on anything outside the committed allowlist
 
 ### 5.4 Fades and loudness preview
 
-The browser previews everything immediately. Fades are gain ramps on an
-`AudioBufferSourceNode`. Loudness uses a small JS BS.1770 meter (K-weighting
+The browser previews everything immediately. Fades are quarter-sine gain
+curves, the same shape as the server's `afade=curve=qsin`, drawn with one
+`setValueCurveAtTime` per loop iteration. Loudness uses a small JS BS.1770 meter (K-weighting
 filters, 400 ms blocks, absolute and relative gating) applied to the selection,
 so the slider moves the preview gain live. The server's measurement is the
 authority. "Hear final" plays the real render.
@@ -432,8 +448,8 @@ The first rule that applies places the selection:
 3. Otherwise, it goes on the window with the highest mean short-term loudness,
    since choruses tend to be the loudest part.
 
-The start then moves to the nearest local energy minimum within ±1 s, to avoid
-cutting a word.
+The start then moves to the quietest 50 ms (lowest RMS) within ±1 s, to avoid
+cutting a word, and the window keeps its full length.
 
 ### 7.3 Getting it onto the phone
 
@@ -443,7 +459,18 @@ Phase 0 confirmed that path: in Safari's downloads list, tap the file, then
 Share offers "Use as Ringtone".
 
 Phase 4 checks whether the Web Share sheet offers it too. If it doesn't, the
-download becomes the main button. The help text covers the Duplicate Ringtone
+download becomes the main button.
+
+As built in milestone 4, the page fetches the `.m4a` right after the render
+and enables **Get on this iPhone** only once the bytes are in hand. Its click
+handler calls `navigator.share({files: [file]})` with no `await` before it,
+because WebKit's user activation does not survive an awaited fetch. The file
+is `new File([bytes], <name>.m4a, {type: 'audio/mp4'})`, with the name the
+server sanitised (read from `Content-Disposition`), and `navigator.canShare`
+checks that very file. Cancelling the sheet is silent; any other failure, or a
+browser without the sheet, shows the plain download link. A status line says
+"Share sheet: available" or "not available". **Pending the owner's phone
+test:** whether the sheet lists "Use as Ringtone", and what it does. The help text covers the Duplicate Ringtone
 error, and explains that tones are removed by swiping left in the Ringtone or
 Text Tone list. Web Share needs a secure
 context, so the origin must use a certificate the phone trusts. With a private
@@ -691,7 +718,9 @@ core/
   Dockerfile  ffmpeg/{VERSION,SHA256SUMS,ffmpeg-devel.asc,configure.txt,components.txt}
   __main__.py               # checkout entry point: python -I core
   strange_ringtone/{__main__.py,config.py,server.py,http_guard.py,static.py,wav.py,render.py,names.py,results.py}
-  static/{index.html,app.js,waveform.js,loudness.js,suggest.js,share.js,style.css}
+  static/{index.html,style.css,app.js,waveform.js,player.js,share.js}
+  static/audio/{decode,wav,loudness,suggest,fades,request}.js   # pure audio code, unit-tested under Node
+  static/package.json       # {"type": "module"} for the Node tests only: not served, not in the image
 fetcher/
   Dockerfile  requirements.in  requirements.txt
   strange_ringtone_fetch/{server.py,ytdlp.py}
@@ -772,6 +801,14 @@ docs/PLAN.md
 4. **Web app:** decode, waveform, selection, preview (fades and JS loudness),
    render and "Hear final", share or download, and energy-based suggestions.
    Finish the Web Share part of the spike here.
+
+   Implemented: the browser decodes the file (up to 10 minutes) and resamples
+   it to 44100 Hz, suggests the loudest window, and previews the selection
+   with qsin fades and a BS.1770 meter. The page sends exactly the selection
+   as 16-bit WAV, then fetches and plays the result (5.1) and offers the share
+   sheet or the downloads (7.3). The pure audio modules have Node unit tests
+   (`tests/js/`), run by the stdlib suite when `node` is present. Still open:
+   the owner's phone test of the share sheet, recorded in 7.3.
 5. **Fetcher** image and UI integration (paste a link, the `#yt=` fragment,
    heatmap suggestions), plus the Shortcut docs.
 6. **Release:** release-please, publish with provenance, SBOM and image scans, a

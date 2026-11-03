@@ -7,18 +7,30 @@ iOS 26's **Share → Use as Ringtone**. No GarageBand, no computer and no cable.
 > **Status: pre-release.** There is nothing to deploy yet. v0.1.0 is being built
 > in the open, and the design record is [docs/PLAN.md](docs/PLAN.md).
 
-## How it will work
+## How it works
 
-1. Open the app on an iPhone running iOS 26 or later and pick an audio file. With
-   the optional fetcher, you can instead share a YouTube link to it from the
-   YouTube app.
-2. Drag the selection (up to 30 s), set the fade-in and fade-out, and choose how
-   loud the tone should be. Everything previews instantly in the browser.
-3. Tap **Get on this iPhone**, then **Use as Ringtone**. If the share sheet doesn't
-   offer it, download the file and share it from Safari's downloads list.
+1. Open the app in Safari on an iPhone running iOS 26 or later and pick an
+   audio file (up to 10 minutes). The phone decodes it; nothing is uploaded
+   yet. A later version adds an optional fetcher, so you can share a YouTube
+   link to the app instead.
+2. The app pre-selects the loudest stretch, up to `MAX_CLIP_SECONDS` (30 s by
+   default), and moves its start to a quiet moment. Drag the handles or nudge
+   them by 0.1 s or 1 s. **Play selection** loops it the way a ringtone
+   rings, with the fade-in and fade-out (toggles and 0 to 5 s sliders) and the
+   loudness (a Softer to Louder slider from -24 to -9 LUFS, measured on the
+   phone) applied as you change them.
+3. Type a name and tap **Hear final**. Only the selection travels to the
+   server, as plain 16-bit WAV; the server measures, fades, levels and
+   encodes it, and the app plays the finished file back on a loop.
+4. Tap **Get on this iPhone**, then **Use as Ringtone** in the share sheet.
+   Where the share sheet isn't available, or doesn't offer it, use
+   **Download .m4a** or **Download .m4r** and share the file from Safari's
+   downloads list. (Whether the share sheet itself offers "Use as Ringtone" is
+   still to be confirmed on a phone; the download path is.)
 
 iOS names the tone after the file, so the name you type is the name Settings
-shows.
+shows. Finished tones stay on the server for a few minutes only; when one has
+gone, the page says so, and **Hear final** makes it again.
 
 ## Design
 
@@ -44,7 +56,7 @@ shows.
 | `.dockerignore` | An allowlist: only `core/` reaches the image build context |
 | `tools/spike/phase0.py` | Generates the test tones that established the share sheet's rules |
 | `scripts/` | Stdlib checks that CI runs: the PR title and contract checks on pull requests, and the weekly FFmpeg release watch |
-| `tests/` | Stdlib `unittest` tests |
+| `tests/` | Stdlib `unittest` tests, plus `node:test` unit tests for the browser's audio code in `tests/js/` |
 | `.github/` | CI workflows, Dependabot, and hashed lockfiles for the CI tools |
 
 ## Development
@@ -54,6 +66,11 @@ The code targets Python 3.12 and uses the standard library only. Run the tests:
 ```bash
 python -I -m unittest discover -s tests
 ```
+
+The same command runs the JavaScript unit tests (`tests/js/`, with Node's
+built-in `node:test`) when `node` is on `PATH` (Node 20 or newer; CI's runner
+has it), and skips them otherwise. There is no `npm install`: the frontend is
+plain ES modules with no dependencies and no build step.
 
 Lint with the same ruff that CI uses, installed from its hashed lockfile:
 

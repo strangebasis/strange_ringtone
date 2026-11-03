@@ -4,3 +4,7 @@
 !core
 **/__pycache__
 **/*.pyc
+# Marks core/static/**/*.js as ES modules for `node --test` only. It is not in
+# the static allowlist, so it is never served; leaving it out of the image
+# keeps /app/core/static to the files the server actually loads.
+core/static/package.json

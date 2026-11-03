@@ -3,6 +3,43 @@
   color-scheme: light dark;
   font-family: system-ui, -apple-system, sans-serif;
   line-height: 1.5;
+  --accent: #0a64d8;
+  --accent-text: #ffffff;
+  --muted: #5f6368;
+  --border: #c7c9cc;
+  --panel: rgba(127, 127, 127, 0.08);
+  --warning: #9a4b00;
+  --error: #b3261e;
+  /* Read by waveform.js through getComputedStyle, so the canvas follows the
+     colour scheme without any colour living in script. */
+  --wave: #0a64d8;
+  --wave-dim: #9aa5b1;
+  --selection: rgba(10, 100, 216, 0.12);
+  --fade: rgba(0, 0, 0, 0.35);
+  --handle: #d93025;
+  /* The range thumb's width, used to place the baseline marker under it. */
+  --thumb: 28px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --accent: #8ab4f8;
+    --accent-text: #0b1b33;
+    --muted: #a8adb3;
+    --border: #4a4d52;
+    --warning: #f6ae55;
+    --error: #f28b82;
+    --wave: #8ab4f8;
+    --wave-dim: #5f6670;
+    --selection: rgba(138, 180, 248, 0.16);
+    --fade: rgba(0, 0, 0, 0.5);
+    --handle: #f28b82;
+  }
+}
+
+/* [hidden] must win over the display rules below, or a hidden panel shows. */
+[hidden] {
+  display: none !important;
 }
 
 body {
@@ -14,6 +51,241 @@ main,
 footer {
   max-width: 40rem;
   margin: 0 auto;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin: 0 0 0.5rem;
+}
+
+h2 {
+  font-size: 1.125rem;
+  margin: 0 0 0.75rem;
+}
+
+.panel {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--panel);
+}
+
+button,
+.button,
+input[type="file"],
+input[type="text"] {
+  font: inherit;
+}
+
+/* 44 px is Apple's minimum comfortable touch target. */
+button,
+.button {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0.5rem 0.875rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: transparent;
+  color: inherit;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  cursor: pointer;
+}
+
+button.primary {
+  width: 100%;
+  margin: 0.75rem 0;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.field-label {
+  display: block;
+  font-weight: 600;
+  margin: 0.75rem 0 0.25rem;
+}
+
+input[type="file"] {
+  max-width: 100%;
+  min-height: 44px;
+}
+
+input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 44px;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+input[type="range"] {
+  min-height: 44px;
+  min-width: 0;
+  flex: 1;
+  margin: 0;
+}
+
+input[type="checkbox"] {
+  width: 1.25rem;
+  height: 1.25rem;
+}
+
+/* Without touch-action: none iOS scrolls or zooms the page while a handle is
+   dragged, and without user-select a long press selects or magnifies it. */
+#waveform {
+  display: block;
+  width: 100%;
+  height: 160px;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  border-radius: 0.5rem;
+}
+
+.readout,
+.hint {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  margin: 0.25rem 0;
+}
+
+.nudges {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+}
+
+.nudge-group {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.nudge-label {
+  width: 2.75rem;
+  font-weight: 600;
+}
+
+.nudge-group button {
+  flex: 1;
+  padding: 0.25rem;
+}
+
+/* A fieldset defaults to min-width: min-content, which pushes the slider rows
+   past the panel's edge on a phone. */
+fieldset {
+  min-width: 0;
+  margin: 0.75rem 0;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+legend {
+  font-weight: 600;
+  padding: 0 0.25rem;
+}
+
+.control {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 44px;
+  min-width: 7rem;
+}
+
+output {
+  min-width: 3.5rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.loudness-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.slider-track {
+  position: relative;
+  flex: 1;
+  display: flex;
+}
+
+/* The baseline marker: app.js sets --at (0 to 1) through the CSSOM, which the
+   CSP allows, unlike a style attribute. The thumb's centre travels from half
+   a thumb in from either end, so the marker does the same. */
+.marker {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  width: 2px;
+  margin-left: -1px;
+  left: calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--at, 0.5));
+  background: var(--muted);
+  pointer-events: none;
+}
+
+.warning {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.status.error {
+  color: var(--error);
+  font-weight: 600;
+}
+
+.result-info {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 1rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.result-info dt {
+  color: var(--muted);
+}
+
+.result-info dd {
+  margin: 0;
+}
+
+.deliver {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.deliver .button {
+  width: 100%;
+}
+
+#help ul {
+  padding-left: 1.25rem;
+  margin: 0;
+}
+
+#help li + li {
+  margin-top: 0.5rem;
 }
 
 footer {
@@ -30,5 +302,14 @@ footer a {
 @media (min-width: 48rem) {
   body {
     padding: 2rem;
+  }
+
+  .nudges {
+    flex-direction: row;
+    gap: 1rem;
+  }
+
+  .nudge-group {
+    flex: 1;
   }
 }

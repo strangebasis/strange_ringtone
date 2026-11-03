@@ -8,10 +8,113 @@
 <script type="module" src="{{static_prefix}}/app.js"></script>
 </head>
 <body>
-<main id="app" data-max-clip-seconds="{{max_clip_seconds}}" data-default-target-lufs="{{default_target_lufs}}" data-fetch-enabled="{{fetch_enabled}}" data-source-url="{{source_url}}" data-version="{{version}}" data-static-prefix="{{static_prefix}}">
+<main id="app" data-max-clip-seconds="{{max_clip_seconds}}" data-default-target-lufs="{{default_target_lufs}}" data-fetch-enabled="{{fetch_enabled}}" data-result-ttl-seconds="{{result_ttl_seconds}}" data-source-url="{{source_url}}" data-version="{{version}}" data-static-prefix="{{static_prefix}}">
 <h1>strange_ringtone</h1>
 <p>Turns an audio clip into an iPhone ringtone. Clips can be up to <span id="max-clip-seconds"></span> seconds long.</p>
-<p>The trimmer arrives in a later milestone.</p>
+
+<section id="youtube" class="panel" hidden aria-labelledby="youtube-title">
+<h2 id="youtube-title">From YouTube</h2>
+<p>Fetching a clip from a YouTube link arrives in a later version.</p>
+</section>
+
+<section id="pick" class="panel" aria-labelledby="pick-title">
+<h2 id="pick-title">1. Pick a clip</h2>
+<label class="field-label" for="file">Audio file</label>
+<input type="file" id="file" accept="audio/*">
+<p id="file-status" class="status" role="status"></p>
+</section>
+
+<section id="editor" class="panel" hidden aria-labelledby="editor-title">
+<h2 id="editor-title">2. Trim, fade and level</h2>
+<canvas id="waveform" aria-label="Waveform with the selection. Use the buttons below to move its edges."></canvas>
+<p id="selection-readout" class="readout" aria-live="polite"></p>
+
+<div class="nudges">
+<div class="nudge-group" role="group" aria-labelledby="nudge-start-label">
+<span id="nudge-start-label" class="nudge-label">Start</span>
+<button type="button" data-edge="start" data-step="-1" aria-label="Start 1 second earlier">-1 s</button>
+<button type="button" data-edge="start" data-step="-0.1" aria-label="Start 0.1 second earlier">-0.1</button>
+<button type="button" data-edge="start" data-step="0.1" aria-label="Start 0.1 second later">+0.1</button>
+<button type="button" data-edge="start" data-step="1" aria-label="Start 1 second later">+1 s</button>
+</div>
+<div class="nudge-group" role="group" aria-labelledby="nudge-end-label">
+<span id="nudge-end-label" class="nudge-label">End</span>
+<button type="button" data-edge="end" data-step="-1" aria-label="End 1 second earlier">-1 s</button>
+<button type="button" data-edge="end" data-step="-0.1" aria-label="End 0.1 second earlier">-0.1</button>
+<button type="button" data-edge="end" data-step="0.1" aria-label="End 0.1 second later">+0.1</button>
+<button type="button" data-edge="end" data-step="1" aria-label="End 1 second later">+1 s</button>
+</div>
+</div>
+
+<button type="button" id="play" class="primary">Play selection</button>
+
+<fieldset>
+<legend>Fades</legend>
+<div class="control">
+<label class="toggle"><input type="checkbox" id="fade-in-on" checked> Fade in</label>
+<input type="range" id="fade-in" min="0" max="5" step="0.1" value="0.2" aria-label="Fade-in length in seconds">
+<output id="fade-in-value" for="fade-in"></output>
+</div>
+<div class="control">
+<label class="toggle"><input type="checkbox" id="fade-out-on" checked> Fade out</label>
+<input type="range" id="fade-out" min="0" max="5" step="0.1" value="1.5" aria-label="Fade-out length in seconds">
+<output id="fade-out-value" for="fade-out"></output>
+</div>
+</fieldset>
+
+<fieldset>
+<legend>Loudness</legend>
+<label class="toggle"><input type="checkbox" id="normalize" checked> Level the loudness</label>
+<div class="loudness-row">
+<span aria-hidden="true">Softer</span>
+<div class="slider-track">
+<input type="range" id="target" min="-24" max="-9" step="0.1" list="target-marks" aria-label="Target loudness, softer to louder">
+<span id="target-marker" class="marker" aria-hidden="true"></span>
+</div>
+<span aria-hidden="true">Louder</span>
+</div>
+<datalist id="target-marks"><option id="target-baseline"></option></datalist>
+<div class="control">
+<output id="target-value" for="target"></output>
+<button type="button" id="target-reset">Reset</button>
+</div>
+<p id="meter-readout" class="readout" aria-live="polite"></p>
+<p id="target-warning" class="warning" hidden>Above -11 LUFS the limiter has to squeeze the clip hard, so the tone may sound flat or distorted.</p>
+</fieldset>
+
+<label class="field-label" for="name">Name</label>
+<input type="text" id="name" autocomplete="off" autocapitalize="off" spellcheck="false">
+<p class="hint">Settings shows the tone under this name.</p>
+</section>
+
+<section id="final" class="panel" hidden aria-labelledby="final-title">
+<h2 id="final-title">3. Hear it and get it on the phone</h2>
+<button type="button" id="render" class="primary">Hear final</button>
+<p id="render-status" class="status" role="status"></p>
+<dl id="result-info" class="result-info" hidden>
+<dt>Length</dt><dd id="result-duration"></dd>
+<dt>Measured</dt><dd id="result-lufs"></dd>
+<dt>Gain applied</dt><dd id="result-gain"></dd>
+</dl>
+<div id="deliver" class="deliver" hidden>
+<button type="button" id="share" class="primary" disabled>Get on this iPhone</button>
+<a id="fallback" class="button" download hidden>Download .m4a</a>
+<a id="download-m4r" class="button" download>Download .m4r</a>
+<p id="share-status" class="status" role="status"></p>
+</div>
+</section>
+
+<section id="help" class="panel" aria-labelledby="help-title">
+<h2 id="help-title">Help</h2>
+<ul>
+<li><strong>Get on this iPhone</strong> opens the share sheet. Choose <strong>Use as Ringtone</strong>, and Settings lists the tone under the name you typed.</li>
+<li>If the share sheet doesn't offer it, tap <strong>Download .m4a</strong> or <strong>Download .m4r</strong>. Open Safari's downloads list (the download icon in the address bar), tap the file, then tap Share and <strong>Use as Ringtone</strong>.</li>
+<li><strong>Duplicate Ringtone</strong> means iOS already has this tone. Delete the old one, or type a new name and tap Hear final again.</li>
+<li>To delete a tone, open Settings &gt; Sounds &amp; Haptics &gt; Ringtone (or Text Tone), swipe left on the tone and tap Delete.</li>
+<li>If you hear nothing, turn off Silent mode.</li>
+<li>A finished tone is kept on the server for a few minutes only. When it has gone, the page says so, and Hear final makes it again.</li>
+</ul>
+</section>
 </main>
 <footer>
 <a href="{{source_url}}">Source</a>
