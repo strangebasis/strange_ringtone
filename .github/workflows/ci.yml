@@ -92,3 +92,51 @@ jobs:
             -v "$GITHUB_WORKSPACE/tests:/tests:ro" \
             strange_ringtone:ci \
             python -I -m unittest discover -s /tests/image -t /tests -v
+
+  fetcher-image:
+    name: Fetcher image tests
+    # The fetcher image under the same contract flags as the core's: its
+    # yt-dlp, yt-dlp-ejs and Deno, the container contract, and the fetcher's
+    # unit tests under the image's Python 3.12 (docs/PLAN.md 9.2). The yt-dlp
+    # stub stands in for every fetch, and --network none keeps the one test
+    # that starts the real yt-dlp from reaching anything.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the fetcher image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          # The same allowlisted path context as the core image (.dockerignore).
+          context: .
+          file: fetcher/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: strange_ringtone-fetcher:ci
+          # Its own cache scope: with one shared scope each job's export would
+          # replace the other's, and the core job would rebuild ffmpeg.
+          cache-from: type=gha,scope=fetcher
+          cache-to: type=gha,mode=max,scope=fetcher
+
+      - name: Run the in-image tests
+        # The fetcher's contract flags (README, Development); the tmpfs is
+        # 2 x FETCH_MAX_BYTES + 16 MB. The tests are mounted read-only and
+        # nothing is published.
+        run: |
+          docker run --rm --name "fetcher-image-tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --network none --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=96m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            --ipc none --ulimit msgqueue=0 \
+            -e PUBLIC_ORIGIN=https://example.internal -e STRANGE_RINGTONE_FETCHER_IMAGE_TESTS=1 \
+            -v "$GITHUB_WORKSPACE/tests:/tests:ro" \
+            strange_ringtone-fetcher:ci \
+            python -I -m unittest discover -s /tests/image_fetcher -t /tests -v

@@ -9,7 +9,8 @@ dependencies, and core/static/package.json only marks them as ES modules.
 Two checks tie the client to the server instead of trusting that they agree:
 the browser's WAV encoder must produce files wav.py accepts up to exactly
 MAX_CLIP_SECONDS and refuses one frame later, and every error code the server
-can answer with must have its own plain words in request.js.
+can answer with must have its own plain words in request.js. The same holds
+for the fetcher and fetch.js, once fetcher/ is in the checkout.
 """
 from __future__ import annotations
 
@@ -32,7 +33,20 @@ JS_TESTS = ROOT / "tests" / "js"
 MAKE_WAV = JS_TESTS / "make_wav.mjs"
 AUDIO = ROOT / "core" / "static" / "audio"
 REQUEST_JS = AUDIO / "request.js"
+FETCH_JS = ROOT / "core" / "static" / "fetch.js"
 SERVER_SOURCES = sorted((ROOT / "core" / "strange_ringtone").glob("*.py"))
+FETCHER_PACKAGE = ROOT / "fetcher" / "strange_ringtone_fetch"
+# The fetcher refuses requests with the core's shared guards as well as its own.
+HTTP_GUARD = ROOT / "core" / "strange_ringtone" / "http_guard.py"
+NO_FETCHER = "fetcher/strange_ringtone_fetch/ is not in this checkout"
+# A job's outcome travels in the status JSON's "error" field rather than as a
+# refusal, so the source patterns below need not see it (docs/PLAN.md 6).
+FETCH_JOB_ERRORS = frozenset({"blocked", "too_long", "not_found", "timeout", "failed"})
+# The fetcher's request refusals, pinned with its API for milestone 5.
+FETCH_REFUSALS = frozenset({
+    "bad_json", "bad_video_id", "bad_origin", "too_large", "unsupported_media_type", "transfer_encoding",
+    "bad_length", "length_required", "rate_limited", "busy", "not_found", "method_not_allowed",
+})
 NODE = shutil.which("node")
 NO_NODE = "node is not on PATH; the JS unit tests need Node 20 or newer (no npm install)"
 RATE = 44100
@@ -46,13 +60,34 @@ _CODE_PATTERNS = (
 )
 
 
-def server_error_codes() -> set[str]:
+def codes_in(paths: list[Path]) -> set[str]:
     codes: set[str] = set()
-    for path in SERVER_SOURCES:
+    for path in paths:
         text = path.read_text(encoding="utf-8")
         for pattern in _CODE_PATTERNS:
             codes.update(pattern.findall(text))
     return codes
+
+
+def server_error_codes() -> set[str]:
+    return codes_in(SERVER_SOURCES)
+
+
+def fetcher_sources() -> list[Path]:
+    return sorted(FETCHER_PACKAGE.glob("*.py"))
+
+
+def fetcher_error_codes() -> set[str]:
+    return codes_in([*fetcher_sources(), HTTP_GUARD]) | FETCH_JOB_ERRORS
+
+
+def message_keys(path: Path) -> set[str]:
+    """The keys of the `const MESSAGES = {...};` table in a client module."""
+    text = path.read_text(encoding="utf-8")
+    block = re.search(r"const MESSAGES = \{(.*?)\n\};", text, re.S)
+    if block is None:
+        raise AssertionError(f"no MESSAGES table in {path.name}")
+    return set(re.findall(r"^\s+([a-z_]+):", block.group(1), re.M))
 
 
 def run_node(args: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -174,6 +209,55 @@ class ErrorMessagesCoverServerCodesTest(unittest.TestCase):
                 if detail is not None:
                     # Either its own words or the detail named for a bug report.
                     self.assertTrue(detail in message or detail in ("too_short", "too_long"), message)
+
+
+class FetchMessagesCoverFetcherCodesTest(unittest.TestCase):
+    """fetch.js has plain words for every code the fetcher answers with."""
+
+    def test_fetch_js_has_words_for_the_pinned_codes(self) -> None:
+        # Runs without fetcher/ too: the API was pinned before the server existed.
+        keys = message_keys(FETCH_JS)
+        self.assertEqual(sorted((FETCH_JOB_ERRORS | FETCH_REFUSALS) - keys), [])
+
+    @unittest.skipUnless(FETCHER_PACKAGE.is_dir(), NO_FETCHER)
+    def test_the_fetcher_code_scan_finds_the_codes(self) -> None:
+        # Guards the scan itself, as the core's test does: if the patterns
+        # stop matching the fetcher's source, coverage would pass on the
+        # pinned sets alone.
+        own = codes_in(fetcher_sources())
+        self.assertTrue(own, "no error code found in the fetcher's source")
+        # Each job outcome is spelled out in the fetcher's source, so the
+        # fixed set above is the one it actually uses.
+        text = "\n".join(path.read_text(encoding="utf-8") for path in fetcher_sources())
+        for code in sorted(FETCH_JOB_ERRORS):
+            with self.subTest(code=code):
+                self.assertRegex(text, rf"""["']{code}["']""")
+
+    @unittest.skipUnless(FETCHER_PACKAGE.is_dir(), NO_FETCHER)
+    def test_every_fetcher_code_is_a_key_in_fetch_js(self) -> None:
+        self.assertEqual(sorted(fetcher_error_codes() - message_keys(FETCH_JS)), [])
+
+    @unittest.skipIf(NODE is None, NO_NODE)
+    def test_fetch_error_message_gives_every_code_its_own_words(self) -> None:
+        scanned = fetcher_error_codes() if FETCHER_PACKAGE.is_dir() else set()
+        codes = sorted(FETCH_JOB_ERRORS | FETCH_REFUSALS | scanned)
+        script = (
+            "import { pathToFileURL } from 'node:url';"
+            "const [path, payload] = process.argv.slice(1);"
+            "const { fetchErrorMessage } = await import(pathToFileURL(path).href);"
+            "process.stdout.write(JSON.stringify(JSON.parse(payload).map((code) => fetchErrorMessage(code))));"
+        )
+        proc = run_node(["--input-type=module", "-e", script, str(FETCH_JS), json.dumps([*codes, "zz_unknown_code"])],
+                        timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        messages = json.loads(proc.stdout)
+        fallback = messages.pop()
+        for code, message in zip(codes, messages, strict=True):
+            with self.subTest(code=code):
+                self.assertNotEqual(message, fallback)
+                self.assertGreater(len(message), 10)
+                # Its own words, not the http_<status> fallback either.
+                self.assertNotIn("(HTTP ", message)
 
 
 if __name__ == "__main__":

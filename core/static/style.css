@@ -130,6 +130,26 @@ input[type="text"] {
   border-radius: 0.5rem;
 }
 
+/* The link field and its Fetch button on one row; min-width: 0 lets the
+   field shrink on a narrow phone instead of pushing the button off the panel. */
+.fetch-row {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.fetch-row input[type="text"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.fetch-row button {
+  flex: none;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
 input[type="range"] {
   min-height: 44px;
   min-width: 0;

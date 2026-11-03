@@ -2,15 +2,16 @@
 // the real index.html. The pure modules have their own tests; these pin what
 // app.js adds on top: the caps it hands them, the loudness controls and the
 // preview gain they drive, the one playback context, the render request built
-// from the controls, the share click, the hidden YouTube place, and what a
-// render that went stale shows.
+// from the controls, the share click, the YouTube box and the #yt= fragment,
+// and what a render or fetch that went stale shows.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { integratedLufs } from "../../core/static/audio/loudness.js";
+import { fetchErrorMessage } from "../../core/static/fetch.js";
 import { dbToGain } from "../../core/static/player.js";
 import { resultUrl, ShareError } from "../../core/static/share.js";
-import { loadApp, pickFile, settle, sleep, wavShape } from "./fake_dom.mjs";
+import { loadApp, pickFile, setDecoded, settle, sleep, wavShape } from "./fake_dom.mjs";
 
 const RATE = 44100;
 const RESULT_ID = "0123456789abcdef0123456789abcdef";
@@ -496,4 +497,458 @@ test("a new file frees Hear final at once, and the old render's end says nothing
   await renderNow(page);
   assert.equal(page.el("render").textContent, "Stop final");
   assert.equal(page.el("render-status").textContent, "Playing the finished tone on a loop.");
+});
+
+// --- YouTube ------------------------------------------------------------------------
+
+const VIDEO_ID = "dQw4w9WgXcQ";
+const OTHER_VIDEO_ID = "Lmnopqrstuv";
+const JOB_ID = "fedcba9876543210fedcba9876543210";
+const AUDIO_BYTES = [9, 8, 7, 6, 5];
+// 30 s of digital silence, 15 s loud, 15 s of silence: rule 3 would start at
+// about 30 s, and a start put anywhere in the silence stays exactly there.
+const LOUD_AT_30 = sections([30, 0], [15, 0.5], [15, 0]);
+const TITLE = "Never Gonna (Live).Remix";
+const DONE = { status: "done", title: TITLE, duration: 60, heatmap: null };
+
+const audioResponse = () => new Response(new Uint8Array(AUDIO_BYTES), { headers: { "Content-Type": "audio/mp4" } });
+
+// The fetcher behind /fetch/, answering in order from `statuses` (the last
+// one repeats), or with `firstStatus` (a promise a test holds) to the first
+// poll, and with `firstAudio` (likewise) to the first audio request; the
+// core's routes answer as server() does.
+function fetcher({ statuses = [DONE], post = null, firstStatus = null, firstAudio = null } = {}) {
+  let polls = 0;
+  let audios = 0;
+  const core = server();
+  return (url, init) => {
+    if (url === "/fetch/api/jobs") return post ?? Promise.resolve(json({ job_id: JOB_ID }, 202));
+    if (url === `/fetch/api/jobs/${JOB_ID}` && polls === 0 && firstStatus !== null) {
+      polls += 1;
+      return firstStatus;
+    }
+    if (url === `/fetch/api/jobs/${JOB_ID}`) {
+      const status = statuses[Math.min(polls, statuses.length - 1)];
+      polls += 1;
+      return Promise.resolve(json(status));
+    }
+    if (url === `/fetch/api/jobs/${JOB_ID}/audio`) {
+      audios += 1;
+      if (audios === 1 && firstAudio !== null) return firstAudio;
+      return Promise.resolve(audioResponse());
+    }
+    return core(url, init);
+  };
+}
+
+async function until(check, label, ms = 3000) {
+  const deadline = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > deadline) assert.fail("timed out waiting for " + label);
+    await sleep(5);
+  }
+}
+
+const fetchUrls = (page) => page.fetchCalls.map((call) => call.url);
+const fragment = (link) => "#yt=" + encodeURIComponent(link);
+
+test("#yt= is read once, cleared before any request, and only the ID is posted", async () => {
+  setDecoded([LOUD_AT_30]);
+  const link = `https://youtu.be/${VIDEO_ID}?si=TrackingToken123&t=10`;
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", hash: fragment(link), search: "?a=1",
+    fetch: fetcher(), navigator: SHARE_SHEET });
+  // Cleared at start-up, before the first request, keeping path and query.
+  assert.deepEqual(page.events[0], { type: "replaceState", url: "/?a=1" });
+  assert.equal(page.events.filter((event) => event.type === "replaceState").length, 1);
+  assert.equal(page.location.hash, "");
+  await until(() => !page.el("editor").hidden, "the editor");
+
+  assert.deepEqual(fetchUrls(page), ["/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}/audio`]);
+  const post = page.fetchCalls[0].init;
+  assert.equal(post.method, "POST");
+  assert.equal(post.body, `{"video_id":"${VIDEO_ID}"}`);
+  // Neither the tracking token nor the timestamp leaves the device.
+  for (const { url, init } of page.fetchCalls) {
+    const sent = url + " " + JSON.stringify(init ?? {});
+    assert.ok(!sent.includes("TrackingToken123") && !sent.includes("t=10") && !sent.includes("youtu"), sent);
+  }
+  // The fetched bytes, once, are what was decoded.
+  assert.deepEqual(page.decodedInputs().map((bytes) => [...bytes]), [AUDIO_BYTES]);
+  assert.equal(page.el("yt-link").value, link);
+  // Rule 1: the selection starts at t=10, in silence, so the snap keeps it.
+  assert.equal(page.el("selection-readout").textContent, "0:10.0 to 0:25.0, 15.0 s (the maximum)");
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE}, 1:00.0. The selection starts at the link's timestamp; drag the handles to change it.`);
+  assert.equal(page.el("yt-status").classes.has("error"), false);
+});
+
+test("a #yt= that arrives while the page is open is read the same way", async () => {
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", search: "?a=1", fetch: fetcher() });
+  await settle();
+  assert.deepEqual(page.events, []);
+  // What a browser does when a tab at the app's address is sent the same
+  // address plus a fragment: the fragment changes, and nothing reloads.
+  const link = `https://youtu.be/${VIDEO_ID}?t=10`;
+  page.location.hash = fragment(link);
+  page.fireWindow("hashchange");
+  // Cleared before the first request, as at start-up.
+  assert.deepEqual(page.events[0], { type: "replaceState", url: "/?a=1" });
+  assert.equal(page.location.hash, "");
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.deepEqual(fetchUrls(page), ["/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}/audio`]);
+  assert.equal(page.fetchCalls[0].init.body, `{"video_id":"${VIDEO_ID}"}`);
+  assert.equal(page.el("yt-link").value, link);
+  assert.equal(page.el("selection-readout").textContent, "0:10.0 to 0:25.0, 15.0 s (the maximum)");
+  // Any other fragment is left alone.
+  page.location.hash = "#other";
+  page.fireWindow("hashchange");
+  await settle();
+  assert.equal(page.events.filter((event) => event.type === "replaceState").length, 1);
+  assert.equal(page.location.hash, "#other");
+  assert.equal(page.fetchCalls.length, 3);
+});
+
+test("with fetching disabled a #yt= that arrives later is cleared and fetches nothing", async () => {
+  const page = await loadApp({ fetchEnabled: "false", fetch: fetcher() });
+  page.location.hash = fragment(`https://youtu.be/${VIDEO_ID}`);
+  page.fireWindow("hashchange");
+  await settle();
+  assert.deepEqual(page.events, [{ type: "replaceState", url: "/" }]);
+  assert.equal(page.el("file-status").textContent,
+    "YouTube fetching is not enabled on this server. Pick an audio file instead.");
+});
+
+test("the fetched audio is decoded as a File named <title>.m4a of type audio/mp4", async () => {
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher() });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  const [file] = page.files();
+  assert.equal(file.name, `${TITLE}.m4a`);
+  assert.equal(file.type, "audio/mp4");
+  assert.deepEqual([...new Uint8Array(await file.arrayBuffer())], AUDIO_BYTES);
+});
+
+test("the title becomes the name exactly, and goes only into the name header", async () => {
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher(), navigator: SHARE_SHEET });
+  page.el("yt-link").value = `https://www.youtube.com/watch?v=${VIDEO_ID}`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  // Not displayName(TITLE), which would cut ".Remix" off as an extension.
+  assert.equal(page.el("name").value, TITLE);
+  await renderNow(page);
+  const render = page.fetchCalls.find((call) => call.url.startsWith("/api/render?"));
+  assert.equal(render.init.headers["X-Tone-Name"], encodeURIComponent(TITLE));
+  for (const url of fetchUrls(page)) assert.ok(!url.includes("Never") && !url.includes("Gonna"), url);
+});
+
+test("without a title the name is left empty for the server's default", async () => {
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true",
+    fetch: fetcher({ statuses: [{ status: "done" }] }) });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.equal(page.el("name").value, "");
+  assert.match(page.el("yt-status").textContent, /^The video, 1:00\.0\. The selection starts on the loudest stretch;/);
+});
+
+test("the heatmap places the selection (rule 2), and each state is shown while polling", async () => {
+  setDecoded([LOUD_AT_30]);
+  const heatmap = Array.from({ length: 60 }, (_, i) => ({ start: i, end: i + 1, value: i >= 5 && i < 20 ? 1 : 0.1 }));
+  const statuses = [{ status: "queued" }, { status: "running" }, { ...DONE, heatmap }];
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ statuses }) });
+  page.el("yt-link").value = `  https://www.youtube.com/shorts/${VIDEO_ID}?feature=share `;
+  page.el("yt-link").dispatch("keydown", { key: "Enter" });
+  await until(() => page.fetchCalls.length === 2, "the first poll");
+  await settle();
+  assert.equal(page.el("yt-status").textContent, "Waiting in the queue…");
+  // The next poll comes 2 s later.
+  await sleep(1500);
+  assert.equal(page.fetchCalls.length, 2);
+  await until(() => page.fetchCalls.length === 3, "the second poll");
+  await settle();
+  assert.equal(page.el("yt-status").textContent, "The server is downloading it…");
+  await until(() => !page.el("editor").hidden, "the editor", 4000);
+  assert.equal(page.el("selection-readout").textContent, "0:05.0 to 0:20.0, 15.0 s (the maximum)");
+  assert.match(page.el("yt-status").textContent, /The selection is on the most replayed stretch;/);
+});
+
+test("a clip no longer than the cap is selected whole, and the status does not name t= or the heatmap", async () => {
+  // suggestSelection takes such a clip whole from 0 before any rule applies.
+  const heatmap = Array.from({ length: 10 }, (_, i) => ({ start: i, end: i + 1, value: i === 6 ? 1 : 0.1 }));
+  for (const statuses of [[{ ...DONE, duration: 10 }], [{ ...DONE, duration: 10, heatmap }]]) {
+    setDecoded([sections([10, 0.3])]);
+    const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ statuses }) });
+    page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=5`;
+    page.el("yt-fetch").dispatch("click");
+    await until(() => !page.el("editor").hidden, "the editor");
+    assert.match(page.el("selection-readout").textContent, /^0:00\.0 to 0:10\.0, 10\.0 s/);
+    assert.equal(page.el("yt-status").textContent,
+      `${TITLE}, 0:10.0. The whole clip is selected; drag the handles to change it.`);
+  }
+});
+
+test("other keys in the link field do nothing", async () => {
+  const page = await loadApp({ fetchEnabled: "true", fetch: fetcher() });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-link").dispatch("keydown", { key: "a" });
+  await settle();
+  assert.equal(page.fetchCalls.length, 0);
+});
+
+test("with fetching disabled no /fetch/ request is ever made", async () => {
+  for (const value of ["false", "", "TRUE", "yes"]) {
+    const page = await loadApp({ fetchEnabled: value, hash: fragment(`https://youtu.be/${VIDEO_ID}`), fetch: fetcher() });
+    // Still cleared: the link has no business staying in the address.
+    assert.deepEqual(page.events, [{ type: "replaceState", url: "/" }]);
+    assert.equal(page.el("file-status").textContent,
+      "YouTube fetching is not enabled on this server. Pick an audio file instead.");
+    page.el("yt-link").value = VIDEO_ID;
+    page.el("yt-fetch").dispatch("click");
+    page.el("yt-link").dispatch("keydown", { key: "Enter" });
+    await settle();
+    assert.equal(page.fetchCalls.length, 0, JSON.stringify(value));
+  }
+});
+
+test("an address without #yt= is left alone", async () => {
+  for (const hash of ["", "#", "#y=abc", "#YT=abc", "#xyt=abc"]) {
+    const page = await loadApp({ fetchEnabled: "true", hash, fetch: fetcher() });
+    await settle();
+    assert.deepEqual(page.events, [], hash);
+    assert.equal(page.location.hash, hash);
+  }
+});
+
+test("a link that is not a YouTube video is refused on the device", async () => {
+  for (const text of ["", "hello", `https://example.internal/watch?v=${VIDEO_ID}`]) {
+    const page = await loadApp({ fetchEnabled: "true", fetch: fetcher() });
+    page.el("yt-link").value = text;
+    page.el("yt-fetch").dispatch("click");
+    await settle();
+    assert.equal(page.fetchCalls.length, 0, text);
+    assert.equal(page.el("yt-status").textContent, fetchErrorMessage("bad_link"));
+    assert.equal(page.el("yt-status").classes.has("error"), true);
+  }
+  // A #yt= with broken escapes ends the same way.
+  const page = await loadApp({ fetchEnabled: "true", hash: "#yt=%E0%A4%A", fetch: fetcher() });
+  await settle();
+  assert.equal(page.fetchCalls.length, 0);
+  assert.equal(page.el("yt-status").textContent, fetchErrorMessage("bad_link"));
+});
+
+test("a failed fetch shows plain words and leaves the page usable", async () => {
+  const cases = [
+    [{ statuses: [{ status: "failed", error: "too_long" }] }, "too_long"],
+    [{ statuses: [{ status: "failed", error: "blocked" }] }, "blocked"],
+    [{ post: Promise.resolve(json({ error: "rate_limited" }, 429)) }, "rate_limited"],
+    [{ post: Promise.resolve(json({ error: "busy" }, 503)) }, "busy"],
+  ];
+  for (const [options, code] of cases) {
+    const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher(options) });
+    page.el("yt-link").value = VIDEO_ID;
+    page.el("yt-fetch").dispatch("click");
+    await until(() => page.el("yt-status").classes.has("error"), code);
+    assert.equal(page.el("yt-status").textContent, fetchErrorMessage(code));
+    assert.equal(page.el("editor").hidden, true);
+    if (code === "too_long") assert.match(page.el("yt-status").textContent, /10 minutes/);
+    // A file can still be picked.
+    await pickFile(page, "My Song.mp3", [SONG]);
+    assert.equal(page.el("editor").hidden, false);
+    assert.equal(page.el("yt-status").textContent, "");
+  }
+});
+
+test("audio the browser cannot decode leaves the page usable", async () => {
+  // decode.js refuses anything under half a second.
+  setDecoded([new Float32Array(1000)]);
+  const page = await loadApp({ fetchEnabled: "true", fetch: fetcher() });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.el("yt-status").classes.has("error"), "the decode error");
+  assert.equal(page.el("yt-status").textContent, "This file is shorter than half a second, which is too short for a ringtone.");
+  assert.equal(page.el("editor").hidden, true);
+  setDecoded([LOUD_AT_30]);
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+});
+
+test("a file picked while a fetch runs wins, and the fetch goes no further", async () => {
+  let release;
+  const post = new Promise((resolve) => { release = resolve; });
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ post }) });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await settle();
+  assert.equal(page.el("yt-status").textContent, "Fetching from YouTube…");
+  await pickFile(page, "My Song.mp3", [SONG]);
+  release(json({ job_id: JOB_ID }, 202));
+  await settle();
+  await sleep(50);
+  assert.deepEqual(fetchUrls(page), ["/fetch/api/jobs"], "no poll for a replaced fetch");
+  assert.equal(page.el("name").value, "My Song");
+  assert.equal(page.el("yt-status").textContent, "");
+  assert.match(page.el("file-status").textContent, /^My Song\.mp3, 1:00\.0\. The selection starts on the loudest stretch;/);
+});
+
+test("a fetch replaced while its status is on the way never downloads the audio", async () => {
+  let release;
+  const firstStatus = new Promise((resolve) => { release = resolve; });
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ firstStatus }) });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 2, "the first poll");
+  await pickFile(page, "My Song.mp3", [SONG]);
+  // The poll answers done after the file replaced the fetch.
+  release(json(DONE));
+  await settle();
+  await sleep(50);
+  assert.deepEqual(fetchUrls(page), ["/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`], "no audio for a replaced fetch");
+  assert.equal(page.el("name").value, "My Song");
+  assert.equal(page.el("yt-status").textContent, "");
+});
+
+test("a fetch for a different video replaces one that is still polling", async () => {
+  setDecoded([LOUD_AT_30]);
+  const statuses = [{ status: "queued" }, DONE];
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ statuses }) });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 2, "the first poll");
+  // The second fetch's first poll answers done at once.
+  page.el("yt-link").value = OTHER_VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  // The first fetch's next poll, due 2 s after its first, never happens.
+  await sleep(2300);
+  assert.deepEqual(fetchUrls(page), [
+    "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`,
+    "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}/audio`,
+  ]);
+  assert.equal(page.fetchCalls[0].init.body, `{"video_id":"${VIDEO_ID}"}`);
+  assert.equal(page.fetchCalls[2].init.body, `{"video_id":"${OTHER_VIDEO_ID}"}`);
+});
+
+test("a second tap on Fetch for the same video while it is on its way opens no second job", async () => {
+  setDecoded([LOUD_AT_30]);
+  const statuses = [{ status: "queued" }, DONE];
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ statuses }) });
+  page.el("yt-link").value = VIDEO_ID;
+  // A double tap, then an impatient one while the job is still queued.
+  page.el("yt-fetch").dispatch("click");
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 2, "the first poll");
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor", 5000);
+  assert.deepEqual(fetchUrls(page), [
+    "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}/audio`,
+  ]);
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE}, 1:00.0. The selection starts on the loudest stretch; drag the handles to change it.`);
+  // Once it is done, the same link can be fetched again. Its audio arrives
+  // too, so nothing of it is left running into the next test.
+  page.el("yt-fetch").dispatch("click");
+  await until(() => fetchUrls(page).filter((url) => url === "/fetch/api/jobs").length === 2, "the second job");
+  await until(() => fetchUrls(page).filter((url) => url.endsWith("/audio")).length === 2, "the second audio");
+  await settle();
+});
+
+test("the replaced fetch's cancel neither shows its words nor drops the newer fetch's way to be stopped", async () => {
+  // Fetch A polls queued, then fetch B replaces it and polls queued too.
+  // A's next look, 2 s on, ends in "cancelled" while B's next poll (held
+  // here) is still out, so nothing of B's overwrites what A's catch does.
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let polls = 0;
+  const core = server();
+  const fetch = (url, init) => {
+    if (url === "/fetch/api/jobs") return Promise.resolve(json({ job_id: JOB_ID }, 202));
+    if (url === `/fetch/api/jobs/${JOB_ID}`) {
+      polls += 1;
+      if (polls <= 2) return Promise.resolve(json({ status: "queued" }));
+      if (polls === 3) return held;
+      // Only a regression gets here; failing ends the polling.
+      return Promise.resolve(json({ status: "failed", error: "failed" }));
+    }
+    return core(url, init);
+  };
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 2, "fetch A's first poll");
+  page.el("yt-link").value = OTHER_VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 4, "fetch B's first poll");
+  // B's second poll comes after A's cancelled look, which was due first. At
+  // least, not exactly, 5: a regression that lets A's look through makes it
+  // 6, which the exact count at the end catches; an exact check here could
+  // miss that and wait out the deadline. The budget allows for a slow runner.
+  await until(() => page.fetchCalls.length >= 5, "fetch B's second poll", 8000);
+  await settle();
+  assert.equal(page.el("yt-status").textContent, "Waiting in the queue…");
+  assert.equal(page.el("yt-status").classes.has("error"), false);
+  // A pick must still stop B: its controller was not A's catch to drop.
+  await pickFile(page, "My Song.mp3", [SONG]);
+  release(json({ status: "queued" }));
+  await sleep(2300);
+  assert.equal(page.fetchCalls.filter((call) => call.url.startsWith("/fetch/")).length, 5, "no poll after the pick");
+  assert.equal(page.el("yt-status").textContent, "");
+  assert.equal(page.el("name").value, "My Song");
+});
+
+test("a file picked while the audio downloads wins, and the stale audio is never decoded", async () => {
+  let release;
+  const firstAudio = new Promise((resolve) => { release = resolve; });
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ firstAudio }) });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 3, "the audio request");
+  assert.equal(page.el("yt-status").textContent, "Fetching the audio…");
+  await pickFile(page, "My Song.mp3", [SONG]);
+  // The audio arrives after the file replaced the fetch.
+  release(audioResponse());
+  await settle();
+  await sleep(50);
+  assert.equal(page.decodedInputs().length, 1, "only the picked file is decoded");
+  assert.notDeepEqual([...page.decodedInputs()[0]], AUDIO_BYTES);
+  assert.equal(page.el("yt-status").textContent, "");
+  assert.equal(page.el("name").value, "My Song");
+  assert.match(page.el("file-status").textContent, /^My Song\.mp3, 1:00\.0\. The selection starts on the loudest stretch;/);
+});
+
+test("a fetch replaced while its audio downloads leaves the newer fetch alone", async () => {
+  let release;
+  const firstAudio = new Promise((resolve) => { release = resolve; });
+  // The first fetch's poll answers done, the second fetch's first poll
+  // queued. Its next one, which only a regression makes, ends the polling,
+  // so a failure here can't keep the run alive for MAX_POLLS.
+  const statuses = [DONE, { status: "queued" }, { status: "failed", error: "failed" }];
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ statuses, firstAudio }) });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 3, "the first fetch's audio request");
+  page.el("yt-link").value = OTHER_VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 5, "the second fetch's first poll");
+  await settle();
+  assert.equal(page.el("yt-status").textContent, "Waiting in the queue…");
+  // The first fetch's audio lands now: it must not touch the status line,
+  // decode anything, or take the second fetch's way to be stopped.
+  release(audioResponse());
+  await settle();
+  await sleep(50);
+  assert.equal(page.el("yt-status").textContent, "Waiting in the queue…");
+  assert.deepEqual(page.decodedInputs(), []);
+  // A pick now must still stop the second fetch's polling.
+  await pickFile(page, "My Song.mp3", [SONG]);
+  await sleep(2300);
+  assert.deepEqual(fetchUrls(page), [
+    "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}/audio`,
+    "/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`,
+  ], "no poll after the pick");
+  assert.equal(page.el("name").value, "My Song");
 });

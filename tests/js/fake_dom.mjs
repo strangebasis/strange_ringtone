@@ -231,22 +231,34 @@ let instance = 0;
 let nextDecoded = null;
 const realSetInterval = globalThis.setInterval;
 const realSetTimeout = globalThis.setTimeout;
+// The real File, kept before loadApp swaps in a recording subclass.
+const REAL_FILE = globalThis.File;
 
 class FakeOfflineAudioContext {
   constructor(count, length, sampleRate) {
     this.sampleRate = sampleRate;
   }
 
-  decodeAudioData() {
+  decodeAudioData(bytes) {
+    decodedInputs.push(new Uint8Array(bytes));
     return Promise.resolve(nextDecoded);
   }
+}
+
+// The bytes each decodeFile call handed the decoder, in order.
+let decodedInputs = [];
+
+/** The audio the next decodeFile call returns: these channels at 44100 Hz. */
+export function setDecoded(channels) {
+  nextDecoded = new FakeAudioBuffer(channels, 44100);
 }
 
 /**
  * Install fresh fakes and load a fresh copy of app.js (a new query string is
  * a new module instance, so no state leaks between tests).
  * @param {{maxClipSeconds?: string, defaultTarget?: string, fetchEnabled?: string, fetch?: Function,
- *   navigator?: object}} options
+ *   navigator?: object, hash?: string, search?: string}} options hash and search are the page
+ *   address's, such as "#yt=..." and "?x=1"
  */
 export async function loadApp(options = {}) {
   const { byId, nudges } = buildDom();
@@ -267,6 +279,7 @@ export async function loadApp(options = {}) {
     },
   };
   contexts = [];
+  decodedInputs = [];
   // The player's pump timer must not keep node running when a test that
   // started playback fails before stopping it.
   globalThis.setInterval = (callback, ms) => {
@@ -284,15 +297,49 @@ export async function loadApp(options = {}) {
     if (ms >= 60_000) timer.unref();
     return timer;
   };
-  globalThis.window = { devicePixelRatio: 2, matchMedia: () => ({ addEventListener() {} }), addEventListener() {} };
+  const windowListeners = new Map();
+  globalThis.window = {
+    devicePixelRatio: 2,
+    matchMedia: () => ({ addEventListener() {} }),
+    addEventListener(type, listener) {
+      if (!windowListeners.has(type)) windowListeners.set(type, []);
+      windowListeners.get(type).push(listener);
+    },
+  };
+  // Every File app.js makes, so a test can see the name and type it gave one.
+  const files = [];
+  globalThis.File = class extends REAL_FILE {
+    constructor(...args) {
+      super(...args);
+      files.push(this);
+    }
+  };
   globalThis.getComputedStyle = () => ({ getPropertyValue: () => "" });
   globalThis.ResizeObserver = class { observe() {} };
   globalThis.Element = FakeElement;
   globalThis.AudioContext = FakeAudioContext;
   globalThis.OfflineAudioContext = FakeOfflineAudioContext;
+  // History changes and requests in one list, so a test can see which came first.
+  const events = [];
   globalThis.fetch = (url, init) => {
     fetchCalls.push({ url, init });
+    events.push({ type: "fetch", url });
     return options.fetch(url, init);
+  };
+  // Only what app.js reads and calls. replaceState moves the address the
+  // way a browser does, so a second read sees the new one.
+  const location = { pathname: "/", search: options.search ?? "", hash: options.hash ?? "" };
+  globalThis.location = location;
+  globalThis.history = {
+    replaceState(stateObject, unused, url) {
+      events.push({ type: "replaceState", url });
+      const at = url.indexOf("#");
+      const rest = at === -1 ? url : url.slice(0, at);
+      const query = rest.indexOf("?");
+      location.pathname = query === -1 ? rest : rest.slice(0, query);
+      location.search = query === -1 ? "" : rest.slice(query);
+      location.hash = at === -1 ? "" : url.slice(at);
+    },
   };
   Object.defineProperty(globalThis, "navigator", {
     value: options.navigator ?? {},
@@ -317,15 +364,23 @@ export async function loadApp(options = {}) {
     fireDocument: (type) => (documentListeners.get(type) ?? []).map((listener) => listener({ type })),
     /** Every delay the page asked setTimeout for, in order. */
     timerDelays: () => [...timerDelays],
+    /** Fire a window event, such as hashchange. */
+    fireWindow: (type) => (windowListeners.get(type) ?? []).map((listener) => listener({ type })),
+    /** The Files app.js created so far. */
+    files: () => [...files],
     /** The AudioContexts app.js created so far. */
     contexts: () => [...contexts],
+    /** The bytes decodeFile was given, per call. */
+    decodedInputs: () => [...decodedInputs],
     fetchCalls,
+    events,
+    location,
   };
 }
 
 /** Pick a "file" whose decoded audio is these channels at 44100 Hz. */
 export async function pickFile(page, name, channels) {
-  nextDecoded = new FakeAudioBuffer(channels, 44100);
+  setDecoded(channels);
   const input = page.el("file");
   input.files = [{ name, arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) }];
   await Promise.all(input.dispatch("change"));
