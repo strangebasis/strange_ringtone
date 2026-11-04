@@ -42,6 +42,11 @@ from typing import Any
 # (fetcher/Dockerfile).
 PRLIMIT = "/usr/bin/prlimit"
 DENO = "/usr/local/bin/deno"
+# The venv the image builds for yt-dlp and yt-dlp-ejs (fetcher/Dockerfile,
+# docs/PLAN.md 6.1). Not sys.executable: the server's interpreter must never
+# hold a third-party wheel, whose .pth lines, scripts and data files would be
+# code in the server. DEFAULT_COMMAND moves to it with the image change.
+YTDLP_PYTHON = "/opt/yt-dlp/bin/python"
 # sys.executable is the interpreter running the server, which -I keeps from
 # reading PYTHON* variables, the user site or the working directory.
 DEFAULT_COMMAND: tuple[str, ...] = (sys.executable, "-I", "-m", "yt_dlp")

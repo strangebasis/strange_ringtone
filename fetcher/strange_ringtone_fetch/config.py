@@ -66,6 +66,9 @@ class Settings:
     fetch_result_ttl_seconds: int = 600
     # (name, value) pairs from PROXY_VARIABLES that the operator set.
     proxies: tuple[tuple[str, str], ...] = ()
+    # True turns the default-route start check off (docs/PLAN.md 6.1) where
+    # egress is filtered some other way. Off by default: fail closed.
+    allow_default_route: bool = False
     scratch_dir: Path = field(default_factory=_default_scratch_dir)
 
     @classmethod

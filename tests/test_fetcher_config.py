@@ -40,6 +40,8 @@ class DefaultsTest(unittest.TestCase):
         self.assertEqual(settings.rate_limit_fetches_per_minute, 5)
         self.assertEqual(settings.fetch_result_ttl_seconds, 600)
         self.assertEqual(settings.proxies, ())
+        # S2: the default-route start check is on unless the operator turns it off.
+        self.assertIs(settings.allow_default_route, False)
         self.assertEqual(settings.scratch_dir, config._default_scratch_dir())
 
     def test_direct_construction_uses_the_same_defaults(self) -> None:
@@ -49,8 +51,27 @@ class DefaultsTest(unittest.TestCase):
         names = (
             "TRUSTED_PROXIES", "FETCH_MAX_SECONDS", "FETCH_MAX_BYTES", "FETCH_TIMEOUT_SECONDS",
             "RATE_LIMIT_FETCHES_PER_MINUTE", "FETCH_RESULT_TTL_SECONDS", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
+            "FETCH_ALLOW_DEFAULT_ROUTE",
         )
         self.assertEqual(from_env(**dict.fromkeys(names, "")), Settings(public_origin=ORIGIN))
+
+    def test_allow_default_route_is_parsed_like_the_cores_booleans(self) -> None:
+        # S2: the override takes the core's boolean words and nothing else. A
+        # value the parser doesn't know refuses to start, so a typo never turns
+        # the check off, or leaves it on against what the operator wrote.
+        for value in ("true", "1", "yes", "TRUE", "Yes"):
+            with self.subTest(value=value):
+                self.assertIs(from_env(FETCH_ALLOW_DEFAULT_ROUTE=value).allow_default_route, True)
+        for value in ("false", "0", "no", "FALSE"):
+            with self.subTest(value=value):
+                self.assertIs(from_env(FETCH_ALLOW_DEFAULT_ROUTE=value).allow_default_route, False)
+        # No stripping and no Unicode digits (Arabic-Indic one), as in the
+        # core's _parse_bool.
+        for value in ("on", "2", " true", "true ", "\u0661", "y"):
+            with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "FETCH_ALLOW_DEFAULT_ROUTE"):
+                from_env(FETCH_ALLOW_DEFAULT_ROUTE=value)
+        # The lowercase spelling is not the setting.
+        self.assertIs(from_env(fetch_allow_default_route="true").allow_default_route, False)
 
     def test_scratch_dir_is_fixed_and_not_configurable(self) -> None:
         self.assertEqual(config.SCRATCH_DIR.as_posix(), "/tmp/strange_ringtone_fetch")
@@ -92,10 +113,13 @@ class SharedParsersTest(unittest.TestCase):
 
     def test_messages_never_repeat_the_value(self) -> None:
         secret = "s3cr3t-value"
-        for name in ("FETCH_MAX_BYTES", "HTTPS_PROXY", "NO_PROXY", "PUBLIC_ORIGIN"):
-            with self.subTest(name=name), self.assertRaises(ConfigError) as raised:
-                from_env(**{name: f"http://user:{secret}@example.internal x"})
-            self.assertNotIn(secret, str(raised.exception))
+        for name in ("FETCH_MAX_BYTES", "HTTPS_PROXY", "NO_PROXY", "PUBLIC_ORIGIN", "FETCH_ALLOW_DEFAULT_ROUTE"):
+            # The message check stays inside the subTest: when a name raises
+            # nothing, its subTest fails alone instead of erroring on the next line.
+            with self.subTest(name=name):
+                with self.assertRaises(ConfigError) as raised:
+                    from_env(**{name: f"http://user:{secret}@example.internal x"})
+                self.assertNotIn(secret, str(raised.exception))
 
 
 class LimitsTest(unittest.TestCase):
@@ -191,7 +215,7 @@ class ImportRestrictionTest(unittest.TestCase):
     def test_only_config_and_http_guard_come_from_the_core(self) -> None:
         found = self.imports()
         self.assertEqual(
-            sorted(found), ["__init__.py", "__main__.py", "config.py", "jobs.py", "server.py", "ytdlp.py"]
+            sorted(found), ["__init__.py", "__main__.py", "config.py", "jobs.py", "routes.py", "server.py", "ytdlp.py"]
         )
         allowed = {"strange_ringtone.config", "strange_ringtone.http_guard"}
         used: set[str] = set()
@@ -245,7 +269,11 @@ class MainTest(unittest.TestCase):
             def server_close(self) -> None:
                 pass
 
-        with mock.patch.dict(os.environ, {"PUBLIC_ORIGIN": ORIGIN}, clear=True), \
+        # The override: the host has a default route (or, on Windows, no
+        # /proc), so the start check would refuse here; S2 has its own tests
+        # in tests/test_fetcher_routes.py.
+        environ = {"PUBLIC_ORIGIN": ORIGIN, "FETCH_ALLOW_DEFAULT_ROUTE": "true"}
+        with mock.patch.dict(os.environ, environ, clear=True), \
                 mock.patch.object(entry, "FetchServer", FakeServer), \
                 mock.patch.object(entry.signal, "signal"), \
                 contextlib.redirect_stderr(io.StringIO()):

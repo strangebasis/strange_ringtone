@@ -1,21 +1,26 @@
-"""The fetcher image's contract, checked from inside the running image (docs/PLAN.md 6 and 9.2).
+"""The fetcher image's contract, checked from inside the running image (docs/PLAN.md 6, 6.1 and 9.2).
 
 The test run uses the contract's own flags (README, Development): --network
 none, --read-only, a /tmp tmpfs, --cap-drop ALL, no-new-privileges, --ipc none
 and --ulimit msgqueue=0. These tests prove the image works under them and that
 they hold: a fixed non-root user, no writable path but /tmp, exactly the
-locked yt-dlp and yt-dlp-ejs, a Deno that yt-dlp finds and that runs under the
-fetcher's resource limits, and a server that starts with the image's CMD and
-answers /fetch/healthz.
+locked yt-dlp and yt-dlp-ejs in a venv of their own while the server's
+interpreter holds no third-party distribution at all, a Deno that yt-dlp finds
+and that runs under the fetcher's resource limits, a server that starts with
+the image's CMD and answers /fetch/healthz, and the forwarder command, which
+answers refusals and loads only its own package.
 
 Nothing here talks to YouTube. The one test that starts the real yt-dlp with
 the fetcher's real argument list first proves the container has no network,
-so the run can only fail at name resolution.
+so the run can only fail at name resolution. The forwarder test sends only
+requests the forwarder refuses before any DNS lookup.
 """
 from __future__ import annotations
 
+import ast
 import http.client
-import importlib.metadata
+import json
+import operator
 import os
 import re
 import resource
@@ -27,7 +32,9 @@ import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from strange_ringtone_fetch import ytdlp
 from strange_ringtone_fetch.ytdlp import DEFAULT_COMMAND, DENO, PRLIMIT, FetchError, YtDlp, default_prlimit, ytdlp_args
@@ -37,11 +44,41 @@ PORT = 8080
 # The image's CMD (fetcher/Dockerfile). A test can't read it from inside the
 # container, so a change there must change this line too.
 CMD = ["python", "-I", "/app/fetcher"]
+# The forwarder, the image's second command (compose.example.yaml), on its
+# fixed port (strange_ringtone_forwarder.policy.PORT), written out so that a
+# change there fails here too.
+FORWARDER_CMD = ["python", "-I", "/app/fetcher/forwarder.py"]
+FORWARDER_PORT = 3128
+FORWARDER_PACKAGE = Path("/app/fetcher/strange_ringtone_forwarder")
 LOCK = Path("/app/fetcher/requirements.txt")
-SITE_PACKAGES = Path("/usr/local/lib/python3.12/site-packages")
+# yt-dlp and yt-dlp-ejs live in a venv of their own (docs/PLAN.md 6.1): a wheel
+# installed for the server's interpreter would be code in the server, since -I
+# still runs .pth lines and pip writes scripts and data into the prefix.
+VENV = Path("/opt/yt-dlp")
+VENV_PYTHON = str(VENV / "bin" / "python")
+VENV_SITE = VENV / "lib" / "python3.12" / "site-packages"
+# The server's (and the forwarder's) interpreter: CMD[0] on the image's PATH.
+BASE_SITE = Path("/usr/local/lib/python3.12/site-packages")
+BASE_PREFIX = "/usr/local"
+# What the yt-dlp and pip wheels would put into the base prefix if either were
+# installed there (seen in the image before the venv): pip's and yt-dlp's
+# console scripts and yt-dlp's data files. None of them may exist after the
+# build; the venv's own copies live under /opt/yt-dlp instead.
+BASE_WHEEL_FILES = (
+    "/usr/local/bin/pip",
+    "/usr/local/bin/pip3",
+    "/usr/local/bin/pip3.12",
+    "/usr/local/bin/yt-dlp",
+    "/usr/local/share/bash-completion/completions/yt-dlp",
+    "/usr/local/share/doc/yt_dlp",
+    "/usr/local/share/man/man1/yt-dlp.1",
+    "/usr/local/share/fish/vendor_completions.d/yt-dlp.fish",
+    "/usr/local/share/zsh/site-functions/_yt-dlp",
+)
 # The core modules the fetcher imports, and nothing else of the core
 # (fetcher/Dockerfile, fetcher/__main__.py).
 CORE_FILES = {"__init__.py", "config.py", "http_guard.py"}
+FORWARDER_MODULES = {"__init__.py", "__main__.py", "policy.py", "server.py"}
 STARTUP_SECONDS = 15.0
 RUN_SECONDS = 60
 # yt-dlp's Deno options for its challenge solver, as yt-dlp 2026.10.26 builds
@@ -54,6 +91,71 @@ DENO_RUN = [
 # A format-valid ID that the run below never gets to look up.
 OFFLINE_VIDEO_ID = "AAAAAAAAAAA"
 _LOCK_LINE_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s\\]+)", re.MULTILINE)
+
+# The forwarder's per-tunnel download cap must hold one yt-dlp range (G9, the
+# owner's decision of 2026-11-03). TLS records and the HTTP response head add
+# well under 1 MiB to a 10 MiB range, so the cap must leave at least that
+# above one range.
+RANGE_HEADROOM_BYTES = 1 << 20
+# yt-dlp 2026.10.26 sets the range size as a function-local of
+# YoutubeIE._extract_formats_and_subtitles (CHUNK_SIZE = 10 << 20), used both
+# as http_chunk_size and as the dashy fragment size, so importing the module
+# can't read it: the source line is read instead.
+CHUNK_SIZE_RE = re.compile(r"^\s*CHUNK_SIZE\s*=\s*(?P<expr>.+?)\s*(#.*)?$", re.M)
+# Run under the venv's interpreter, so the file read is the one the venv
+# imports. find_spec of a top-level package imports nothing.
+_RANGE_PROBE = """\
+import importlib.util, json, re, sys
+from pathlib import Path
+spec = importlib.util.find_spec("yt_dlp")
+path = Path(spec.submodule_search_locations[0]) / "extractor" / "youtube" / "_video.py"
+pattern = re.compile(sys.argv[1], re.M)
+text = path.read_text(encoding="utf-8")
+print(json.dumps({"path": str(path), "lines": [match.group(0) for match in pattern.finditer(text)]}))
+"""
+# What an interpreter can import and where it looks: run under the base
+# interpreter and under the venv's, in isolated mode as the image runs them.
+_INTERPRETER_PROBE = """\
+import importlib.metadata, importlib.util, json, os, site, sys
+sites = site.getsitepackages()
+print(json.dumps({
+    "prefix": sys.prefix,
+    "base_prefix": sys.base_prefix,
+    "path": sys.path,
+    "sites": sites,
+    "distributions": {str(d.metadata["Name"]).lower(): d.version for d in importlib.metadata.distributions()},
+    "pth": sorted(os.path.join(d, n) for d in sites if os.path.isdir(d) for n in os.listdir(d) if n.endswith(".pth")),
+    "importable": sorted(n for n in ("pip", "yt_dlp", "yt_dlp_ejs") if importlib.util.find_spec(n) is not None),
+}))
+"""
+# The files the venv's distributions installed outside their site-packages
+# (console scripts, data files), relative to the venv's prefix, from RECORD.
+_OUTSIDE_SITE_PROBE = """\
+import importlib.metadata, json, os, sys
+prefix = os.path.realpath(sys.prefix)
+site = os.path.realpath(os.path.join(prefix, "lib", "python3.12", "site-packages"))
+found = set()
+for dist in importlib.metadata.distributions():
+    for entry in dist.files or ():
+        path = os.path.realpath(dist.locate_file(entry))
+        if not path.startswith(site + os.sep) and path.startswith(prefix + os.sep):
+            found.add(os.path.relpath(path, prefix))
+print(json.dumps(sorted(found)))
+"""
+_VERSION_PROBE = "import importlib.metadata, sys; print(importlib.metadata.version(sys.argv[1]))"
+_EJS_PIN_PROBE = """\
+from importlib import metadata
+import json
+print(json.dumps({"ejs": metadata.version("yt-dlp-ejs"), "requires": metadata.requires("yt-dlp") or []}))
+"""
+# The strange_ringtone* modules a process starting the forwarder loads, with
+# /app/fetcher first on sys.path as the entry script's own directory is.
+_FORWARDER_MODULES_PROBE = """\
+import json, sys
+sys.path.insert(0, "/app/fetcher")
+import strange_ringtone_forwarder.__main__
+print(json.dumps(sorted(name for name in sys.modules if name.startswith("strange_ringtone"))))
+"""
 
 
 def _status_fields(pid: int | str = "self") -> dict[str, str]:
@@ -89,6 +191,71 @@ def _fetcher() -> YtDlp:
     # The server's own construction (strange_ringtone_fetch.server) with the
     # default settings: the real command, prlimit and limits.
     return YtDlp(max_seconds=600, max_bytes=40 * 1024 * 1024, timeout_seconds=120, prlimit=default_prlimit())
+
+
+def _run(argv: list[str], timeout: float = RUN_SECONDS) -> subprocess.CompletedProcess[str]:
+    """argv's result. A program that can't start (no venv in the image) comes back as exit 127 with the reason.
+
+    So a missing or broken layout fails an assertion on the exit code rather
+    than erroring out of the test.
+    """
+    try:
+        return subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    except OSError as error:
+        return subprocess.CompletedProcess(argv, 127, "", f"cannot run {argv[0]}: {error}")
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, "", f"{argv[0]} did not finish within {timeout} s")
+
+
+def _python_json(python: str, code: str, *args: str) -> tuple[Any, str]:
+    """(the JSON code printed under `python -I`, "") or (None, why it didn't)."""
+    proc = _run([python, "-I", "-c", code, *args])
+    if proc.returncode != 0:
+        return None, f"{python} -I exited {proc.returncode}: {proc.stderr}"
+    try:
+        return json.loads(proc.stdout), ""
+    except ValueError:
+        return None, f"{python} -I printed no JSON: {proc.stdout!r} {proc.stderr!r}"
+
+
+def _venv_version(name: str) -> str | None:
+    """The version of distribution name as the venv's interpreter sees it, or None."""
+    proc = _run([VENV_PYTHON, "-I", "-c", _VERSION_PROBE, name])
+    return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else None
+
+
+_INT_OPERATORS: dict[type[ast.operator], Callable[[int, int], int]] = {
+    ast.LShift: operator.lshift,
+    ast.Mult: operator.mul,
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Pow: operator.pow,
+}
+
+
+def _int_expression(text: str) -> int:
+    """The value of a plain integer expression (ints combined by <<, *, +, - and **), or ValueError.
+
+    Never eval: the text comes from a third-party file. Shift counts and
+    exponents are bounded so a hostile line can't make the test hang.
+    """
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError as error:
+        raise ValueError(f"not an integer expression: {text!r}") from error
+
+    def value(node: ast.AST) -> int:
+        # type() is int, not isinstance: True and False are ints too.
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _INT_OPERATORS:
+            left, right = value(node.left), value(node.right)
+            if isinstance(node.op, (ast.LShift, ast.Pow)) and not 0 <= right <= 64:
+                raise ValueError(f"shift or exponent out of range in {text!r}")
+            return _INT_OPERATORS[type(node.op)](left, right)
+        raise ValueError(f"not a plain integer expression: {text!r}")
+
+    return value(tree.body)
 
 
 class UserTest(unittest.TestCase):
@@ -131,9 +298,19 @@ class UserTest(unittest.TestCase):
 
 class FilesystemTest(unittest.TestCase):
     def test_nothing_outside_tmp_is_writable(self) -> None:
+        # The directories this image adds for the venv and the forwarder must
+        # exist, or the probe below would pass on them without proving
+        # anything (a missing directory refuses a file too).
+        for directory in (str(VENV), str(VENV_SITE), str(VENV_SITE / "yt_dlp"), str(FORWARDER_PACKAGE)):
+            with self.subTest(exists=directory):
+                self.assertTrue(os.path.isdir(directory), f"{directory} is not in the image")
         for directory in (
             "/", "/app", "/app/core", "/app/core/strange_ringtone", "/app/fetcher",
-            "/app/fetcher/strange_ringtone_fetch", str(SITE_PACKAGES), str(SITE_PACKAGES / "yt_dlp"),
+            "/app/fetcher/strange_ringtone_fetch", str(FORWARDER_PACKAGE),
+            str(BASE_SITE), str(BASE_SITE / "yt_dlp"),
+            # The venv is root's: neither the server, the forwarder nor yt-dlp
+            # can change the code yt-dlp runs.
+            "/opt", str(VENV), str(VENV_SITE), str(VENV_SITE / "yt_dlp"),
             "/usr/local/bin", "/usr/local/lib", "/etc", "/var/tmp", "/root", "/home", "/run", "/nonexistent",
             # Docker gives every container a writable /dev/shm tmpfs and an
             # mqueue mount whatever --read-only says; --ipc none removes the
@@ -155,10 +332,14 @@ class FilesystemTest(unittest.TestCase):
     def test_shipped_files_cannot_be_modified(self) -> None:
         for path in (
             DENO, str(LOCK), "/app/fetcher/__main__.py", "/app/fetcher/strange_ringtone_fetch/ytdlp.py",
-            "/app/core/strange_ringtone/http_guard.py", str(SITE_PACKAGES / "yt_dlp" / "__init__.py"),
+            "/app/core/strange_ringtone/http_guard.py", str(VENV_SITE / "yt_dlp" / "__init__.py"),
+            VENV_PYTHON, str(VENV / "pyvenv.cfg"), "/app/fetcher/forwarder.py", str(FORWARDER_PACKAGE / "server.py"),
         ):
-            with self.subTest(path=path), self.assertRaises(OSError):
-                open(path, "ab").close()
+            with self.subTest(path=path):
+                # It must ship, or the refused open below proves nothing.
+                self.assertTrue(os.path.isfile(path), f"{path} is not in the image")
+                with self.assertRaises(OSError):
+                    open(path, "ab").close()
 
     def test_tmp_is_the_writable_tmpfs(self) -> None:
         fd, name = tempfile.mkstemp(dir="/tmp")
@@ -185,48 +366,162 @@ class FilesystemTest(unittest.TestCase):
 
 
 class DependenciesTest(unittest.TestCase):
+    """I1: the venv holds exactly the lock and is what yt-dlp runs from; the base interpreter holds nothing."""
+
     def test_lock_holds_exactly_yt_dlp_and_yt_dlp_ejs(self) -> None:
         self.assertEqual(set(_locked()), {"yt-dlp", "yt-dlp-ejs"})
 
-    def test_installed_distributions_are_the_lock(self) -> None:
-        # --no-deps installs nothing a package's metadata asks for, so the
-        # image holds the lock and the base image's pip, nothing more.
-        installed = {dist.metadata["Name"].lower(): dist.version for dist in importlib.metadata.distributions()}
-        installed.pop("pip", None)
-        self.assertEqual(installed, _locked())
+    def test_base_interpreter_has_no_distributions_no_pth_and_no_venv_on_sys_path(self) -> None:
+        # I1. The interpreter that runs the fetcher and the forwarder (CMD[0],
+        # FORWARDER_CMD[0]) in a fresh process, as they start: no installed
+        # distribution (pip removed too), no .pth line to run at startup,
+        # nothing of the venv on sys.path, nothing third-party importable.
+        self.assertEqual(CMD[0], FORWARDER_CMD[0])
+        data, why = _python_json(CMD[0], _INTERPRETER_PROBE)
+        self.assertIsNotNone(data, why)
+        assert data is not None
+        self.assertEqual((data["prefix"], data["base_prefix"]), (BASE_PREFIX, BASE_PREFIX))
+        self.assertIn(str(BASE_SITE), data["sites"])
+        self.assertEqual(data["distributions"], {})
+        self.assertEqual(data["pth"], [])
+        self.assertEqual(data["importable"], [])
+        self.assertEqual([entry for entry in data["path"] if entry.startswith("/opt")], [])
+        self.assertNotIn(str(VENV_SITE), data["path"])
+        # Nothing in the base site-packages but the base image's README: no
+        # package, module, .pth, .dist-info or .egg-link of anyone's.
+        self.assertEqual(sorted(set(os.listdir(BASE_SITE)) - {"README.txt", "__pycache__"}), [])
+
+    def test_base_prefix_holds_no_wheel_scripts_or_data(self) -> None:
+        # I1. pip writes a wheel's console scripts and data files into the
+        # interpreter's prefix; none of the lock's (nor pip's own) may be in
+        # /usr/local, where the server's PATH would find them.
+        self.assertEqual([path for path in BASE_WHEEL_FILES if os.path.lexists(path)], [])
+        # Every file the venv's distributions put outside their site-packages
+        # (from their RECORD), which landed under /opt/yt-dlp, is absent from
+        # the base prefix at the same place.
+        outside, why = _python_json(VENV_PYTHON, _OUTSIDE_SITE_PROBE)
+        self.assertIsNotNone(outside, why)
+        assert outside is not None
+        self.assertIn("bin/yt-dlp", outside)
+        for relative in outside:
+            with self.subTest(relative=relative):
+                self.assertTrue(os.path.lexists(VENV / relative), f"{VENV / relative} is listed but missing")
+                self.assertFalse(os.path.lexists(Path(BASE_PREFIX) / relative), f"{BASE_PREFIX}/{relative} exists")
+
+    def test_venv_distributions_are_the_lock(self) -> None:
+        # I1. --no-deps installs nothing a package's metadata asks for and the
+        # venv is made --without-pip, so it holds the lock and nothing more.
+        data, why = _python_json(VENV_PYTHON, _INTERPRETER_PROBE)
+        self.assertIsNotNone(data, why)
+        assert data is not None
+        self.assertEqual(data["distributions"], _locked())
+        self.assertEqual(data["pth"], [])
+
+    def test_venv_excludes_the_base_site_packages(self) -> None:
+        # I1. The venv sees its own site-packages and the stdlib only, so
+        # nothing ever installed in the base prefix can reach yt-dlp either.
+        data, why = _python_json(VENV_PYTHON, _INTERPRETER_PROBE)
+        self.assertIsNotNone(data, why)
+        assert data is not None
+        self.assertEqual((data["prefix"], data["base_prefix"]), (str(VENV), BASE_PREFIX))
+        self.assertIn(str(VENV_SITE), data["path"])
+        self.assertNotIn(str(BASE_SITE), data["path"])
+        self.assertIn(str(VENV_SITE), data["sites"])
+        self.assertNotIn(str(BASE_SITE), data["sites"])
+        try:
+            config_text = (VENV / "pyvenv.cfg").read_text(encoding="utf-8")
+        except OSError as error:
+            self.fail(f"cannot read {VENV / 'pyvenv.cfg'}: {error}")
+        config = {}
+        for line in config_text.splitlines():
+            key, _, value = line.partition("=")
+            config[key.strip()] = value.strip()
+        self.assertEqual(config.get("include-system-site-packages"), "false")
 
     def test_yt_dlp_ejs_is_the_version_yt_dlp_pins(self) -> None:
         # The lock sets both by hand, so a Dependabot bump of one without the
-        # other would leave yt-dlp with solver scripts it doesn't expect.
-        ejs = importlib.metadata.version("yt-dlp-ejs")
+        # other would leave yt-dlp with solver scripts it doesn't expect. Read
+        # in the venv, where both are installed.
+        data, why = _python_json(VENV_PYTHON, _EJS_PIN_PROBE)
+        self.assertIsNotNone(data, why)
+        assert data is not None
         pins = []
-        for requirement in importlib.metadata.requires("yt-dlp") or []:
+        for requirement in data["requires"]:
             spec, _, marker = requirement.partition(";")
             if re.search(r"""extra\s*==\s*["']default["']""", marker) and spec.strip().startswith("yt-dlp-ejs"):
                 pins.append(spec.strip())
-        self.assertEqual(pins, [f"yt-dlp-ejs=={ejs}"])
+        self.assertEqual(pins, [f"yt-dlp-ejs=={data['ejs']}"])
 
     def test_both_import_under_isolated_mode(self) -> None:
-        proc = subprocess.run(
-            [sys.executable, "-I", "-c", "import yt_dlp, yt_dlp_ejs, yt_dlp.version as v; print(v.__version__)"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=RUN_SECONDS,
-            check=True,
-        )
+        proc = _run([VENV_PYTHON, "-I", "-c", "import yt_dlp, yt_dlp_ejs, yt_dlp.version as v; print(v.__version__)"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), _locked()["yt-dlp"])
 
     def test_yt_dlp_runs_as_a_module(self) -> None:
-        proc = subprocess.run(
-            [*DEFAULT_COMMAND, "--version"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=RUN_SECONDS,
-            check=True,
+        # The command the fetcher runs, and the venv's interpreter written out,
+        # so a DEFAULT_COMMAND that works only because the base interpreter can
+        # import yt-dlp fails the second.
+        for command in (list(DEFAULT_COMMAND), [VENV_PYTHON, "-I", "-m", "yt_dlp"]):
+            with self.subTest(command=command):
+                proc = _run([*command, "--version"])
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), _locked()["yt-dlp"])
+
+    def test_default_command_is_the_venv_interpreter(self) -> None:
+        # I1: what the server really runs (its default runner) is the venv's
+        # interpreter in isolated mode, and that interpreter is the venv's.
+        self.assertEqual(ytdlp.YTDLP_PYTHON, VENV_PYTHON)
+        self.assertEqual(DEFAULT_COMMAND, (VENV_PYTHON, "-I", "-m", "yt_dlp"))
+        self.assertEqual(_fetcher().command, DEFAULT_COMMAND)
+        proc = _run([DEFAULT_COMMAND[0], "-I", "-c", "import sys; print(sys.prefix)"])
+        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, str(VENV)), proc.stderr)
+
+    def test_one_yt_dlp_range_plus_headroom_fits_the_download_cap(self) -> None:
+        # G9, the owner's decision of 2026-11-03: the forwarder's per-tunnel
+        # download cap stays a fixed 16 MiB, and a yt-dlp bump that changes
+        # its YouTube range size must fail here, in CI, before it fails
+        # fetches. Read with the venv's interpreter, from where it imports.
+        data, why = _python_json(VENV_PYTHON, _RANGE_PROBE, CHUNK_SIZE_RE.pattern)
+        self.assertIsNotNone(data, why)
+        assert data is not None
+        path, lines = data["path"], data["lines"]
+        self.assertTrue(path.startswith(str(VENV_SITE) + "/"), f"yt_dlp was found outside the venv: {path}")
+        self.assertEqual(len(lines), 1, f"expected exactly one CHUNK_SIZE assignment in {path}, found {lines!r}")
+        match = CHUNK_SIZE_RE.search(lines[0])
+        self.assertIsNotNone(match, lines[0])
+        assert match is not None
+        try:
+            chunk = _int_expression(match["expr"])
+        except ValueError as error:
+            self.fail(f"{path}: cannot evaluate {lines[0].strip()!r}: {error}")
+        self.assertGreater(chunk, 0, f"{path}: {lines[0].strip()!r}")
+        try:
+            from strange_ringtone_forwarder.policy import DEFAULT_LIMITS
+        except ImportError as error:
+            self.fail(f"the forwarder's policy is not in the image: {error}")
+        cap = DEFAULT_LIMITS.download_bytes_per_tunnel
+        self.assertLessEqual(
+            chunk + RANGE_HEADROOM_BYTES,
+            cap,
+            f"yt-dlp's range of {chunk} bytes plus {RANGE_HEADROOM_BYTES} bytes of headroom exceeds the forwarder's "
+            f"download_bytes_per_tunnel of {cap}: raise Limits.download_bytes_per_tunnel and the README row together",
         )
-        self.assertEqual(proc.stdout.strip(), _locked()["yt-dlp"])
+
+
+class IntExpressionTest(unittest.TestCase):
+    """The range-size test's own evaluator: integers only, never eval."""
+
+    def test_evaluates_plain_integer_expressions(self) -> None:
+        for text, expected in (("10 << 20", 10485760), ("10485760", 10485760), ("10 * 1024 * 1024", 10485760),
+                               ("(1 << 23) + (1 << 21)", 10485760), ("2 ** 20 - 1", 1048575)):
+            with self.subTest(text=text):
+                self.assertEqual(_int_expression(text), expected)
+
+    def test_refuses_anything_else(self) -> None:
+        for text in ("CHUNK", "int('10')", "10.0 * 1024", "True << 20", "-1", "10 // 2", "1 << 1000", "2 ** 99",
+                     "__import__('os')", "x.y", "", "10 <<"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                _int_expression(text)
 
 
 class DenoTest(unittest.TestCase):
@@ -280,7 +575,12 @@ class DenoTest(unittest.TestCase):
         # yt-dlp's verbose header, from the fetcher's command and environment:
         # the JS runtime at the fixed path, the yt-dlp-ejs package, and only
         # the urllib request handler (no requests: http:// proxies only, as
-        # the README says). Without a URL it stops after the header.
+        # the README says). Without a URL it stops after the header. The
+        # yt-dlp-ejs version comes from the venv, the only place it is
+        # installed.
+        ejs_version = _venv_version("yt-dlp-ejs")
+        self.assertIsNotNone(ejs_version, f"{VENV_PYTHON} can't report yt-dlp-ejs's version")
+        assert ejs_version is not None
         proc = subprocess.run(
             [*DEFAULT_COMMAND, "--ignore-config", "--no-cache-dir", "--js-runtimes", f"deno:{DENO}", "-v"],
             stdin=subprocess.DEVNULL,
@@ -292,7 +592,7 @@ class DenoTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertRegex(proc.stderr, r"\[debug\] JS runtimes: deno-\d+\.\d+\.\d+\n")
-        ejs = re.escape(importlib.metadata.version("yt-dlp-ejs"))
+        ejs = re.escape(ejs_version)
         self.assertRegex(proc.stderr, rf"\[debug\] Optional libraries: .*\byt_dlp_ejs-{ejs}\b")
         self.assertIn("[debug] Request Handlers: urllib\n", proc.stderr)
         self.assertIn("[debug] Plugin directories: none\n", proc.stderr)
@@ -354,6 +654,12 @@ class NetworkTest(unittest.TestCase):
             socket.getaddrinfo("example.internal", 80)
 
 
+def _reap(proc: subprocess.Popen[bytes]) -> None:
+    if proc.poll() is None:
+        proc.kill()
+    proc.communicate(timeout=10)
+
+
 class ServerTest(unittest.TestCase):
     def test_cmd_serves_healthz_and_stops_on_sigterm(self) -> None:
         proc = subprocess.Popen(
@@ -363,7 +669,7 @@ class ServerTest(unittest.TestCase):
             stderr=subprocess.PIPE,
             env=dict(os.environ),
         )
-        self.addCleanup(self._reap, proc)
+        self.addCleanup(_reap, proc)
         status, headers, body = self._get_healthz(proc)
         self.assertEqual(status, 200)
         # Says only that the server answers.
@@ -378,6 +684,9 @@ class ServerTest(unittest.TestCase):
         proc.send_signal(signal.SIGTERM)
         _out, err = proc.communicate(timeout=10)
         self.assertEqual(proc.returncode, 0, err)
+        # S2's acceptance on a real kernel: under --network none there is no
+        # default route, so the start check passes without the override.
+        self.assertNotIn(b"refusing to start", err)
 
     def _get_healthz(self, proc: subprocess.Popen[bytes]) -> tuple[int, dict[str, str], bytes]:
         deadline = time.monotonic() + STARTUP_SECONDS
@@ -398,11 +707,110 @@ class ServerTest(unittest.TestCase):
             finally:
                 connection.close()
 
+
+class ForwarderTest(unittest.TestCase):
+    """The image's second command (docs/PLAN.md 6.1): the CONNECT gate, started as compose starts it.
+
+    Every request here is one the forwarder refuses before any DNS lookup
+    (G1, G2, G3; G4 proves the ordering in the unit tests), so nothing is
+    resolved or connected even if this ever ran with a network.
+    """
+
+    def _wait_for_port(self, proc: subprocess.Popen[bytes]) -> None:
+        # A connection closed before any byte is reported to the sink as
+        # refused:empty and never logged, so this probe leaves no log line.
+        deadline = time.monotonic() + STARTUP_SECONDS
+        while True:
+            if proc.poll() is not None:
+                _out, err = proc.communicate(timeout=10)
+                self.fail(f"forwarder exited {proc.returncode}: {err!r}")
+            try:
+                socket.create_connection(("127.0.0.1", FORWARDER_PORT), timeout=2).close()
+                return
+            except OSError:
+                if time.monotonic() > deadline:
+                    self.fail("forwarder did not start listening")
+                time.sleep(0.1)
+
     @staticmethod
-    def _reap(proc: subprocess.Popen[bytes]) -> None:
-        if proc.poll() is None:
-            proc.kill()
-        proc.communicate(timeout=10)
+    def _status_line(request: bytes) -> bytes:
+        """The first line the forwarder answers request with, on a fresh connection."""
+        with socket.create_connection(("127.0.0.1", FORWARDER_PORT), timeout=5) as client:
+            client.sendall(request)
+            response = b""
+            while b"\r\n" not in response and len(response) < 4096:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        return response.split(b"\r\n", 1)[0]
+
+    def test_forwarder_entry_serves_refusals_without_dns_and_stops_on_sigterm(self) -> None:
+        proc = subprocess.Popen(
+            [*FORWARDER_CMD, "--bind", "127.0.0.1"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(os.environ),
+        )
+        self.addCleanup(_reap, proc)
+        self._wait_for_port(proc)
+        for request, status in (
+            # G2: an IP literal, whatever the Host header says.
+            (b"CONNECT 192.0.2.1:443 HTTP/1.1\r\nHost: 192.0.2.1:443\r\n\r\n", b"HTTP/1.1 400 "),
+            # G1: anything but CONNECT, plain-HTTP proxying included.
+            (b"GET / HTTP/1.1\r\n\r\n", b"HTTP/1.1 405 "),
+            # G3: a well-formed name that is not on the allowlist.
+            (b"CONNECT example.invalid:443 HTTP/1.1\r\n\r\n", b"HTTP/1.1 403 "),
+        ):
+            with self.subTest(request=request):
+                try:
+                    line = self._status_line(request)
+                except OSError as error:
+                    self.fail(f"no answer to {request!r}: {error}")
+                self.assertTrue(line.startswith(status), line)
+        forwarder = _status_fields(proc.pid)
+        self.assertEqual(forwarder["Uid"].split(), [str(UID)] * 4)
+        self.assertEqual(forwarder["Gid"].split(), [str(GID)] * 4)
+        proc.send_signal(signal.SIGTERM)
+        _out, err = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 0, err)
+        lines = err.decode("utf-8", "replace").splitlines()
+        # G10: name and reason only; a name that never parsed is "-".
+        for expected in (
+            "forwarder refused literal 192.0.2.1",
+            "forwarder refused method -",
+            "forwarder refused unlisted example.invalid",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, lines)
+        # No header text a client sent ever reaches the log.
+        self.assertNotIn(b"Host:", err)
+
+    def test_forwarder_process_loads_only_its_own_package(self) -> None:
+        # The entry is a script beside its package, so its process loads the
+        # forwarder's own modules and the stdlib only: neither the core nor
+        # the fetcher package, though both sit in /app.
+        data, why = _python_json(FORWARDER_CMD[0], _FORWARDER_MODULES_PROBE)
+        self.assertIsNotNone(data, why)
+        self.assertEqual(data, [
+            "strange_ringtone_forwarder",
+            "strange_ringtone_forwarder.__main__",
+            "strange_ringtone_forwarder.policy",
+            "strange_ringtone_forwarder.server",
+        ])
+
+    def test_forwarder_files_ship_precompiled(self) -> None:
+        # The root filesystem is read-only at run time and -I ignores
+        # PYTHONDONTWRITEBYTECODE, so the bytecode must be in the image.
+        try:
+            modules = {path.name for path in FORWARDER_PACKAGE.glob("*.py")}
+            cached = {path.name for path in (FORWARDER_PACKAGE / "__pycache__").glob("*.pyc")}
+        except OSError as error:
+            self.fail(f"cannot list {FORWARDER_PACKAGE}: {error}")
+        self.assertEqual(modules, FORWARDER_MODULES)
+        tag = sys.implementation.cache_tag
+        self.assertLessEqual({f"{Path(name).stem}.{tag}.pyc" for name in modules}, cached)
 
 
 if __name__ == "__main__":

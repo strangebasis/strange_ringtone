@@ -30,6 +30,7 @@ from strange_ringtone_fetch.ytdlp import (
     DEFAULT_COMMAND,
     DENO,
     PRLIMIT,
+    YTDLP_PYTHON,
     FetchError,
     Limits,
     YtDlp,
@@ -165,16 +166,20 @@ class ArgumentsTest(unittest.TestCase):
     def test_fixed_program_paths(self) -> None:
         self.assertEqual(PRLIMIT, "/usr/bin/prlimit")
         self.assertEqual(DENO, "/usr/local/bin/deno")
-        self.assertEqual(DEFAULT_COMMAND, (sys.executable, "-I", "-m", "yt_dlp"))
+        # I1: yt-dlp runs from the image's venv, never from the server's own
+        # interpreter, whose site-packages must hold no third-party wheel.
+        self.assertEqual(YTDLP_PYTHON, "/opt/yt-dlp/bin/python")
+        self.assertEqual(DEFAULT_COMMAND, (YTDLP_PYTHON, "-I", "-m", "yt_dlp"))
 
 
 class CommandTest(unittest.TestCase):
     def test_full_command_with_prlimit(self) -> None:
+        # I1: the venv's interpreter, written out, after prlimit's guard.
         runner = YtDlp(600, 41943040, 120, prlimit=(PRLIMIT,))
         self.assertEqual(
             runner.full_command(["--ignore-config"]),
             ["/usr/bin/prlimit", "--cpu=120", "--fsize=42991616", "--nofile=256", "--nproc=512", "--",
-             sys.executable, "-I", "-m", "yt_dlp", "--ignore-config"],
+             "/opt/yt-dlp/bin/python", "-I", "-m", "yt_dlp", "--ignore-config"],
         )
 
     def test_no_address_space_limit(self) -> None:
@@ -640,14 +645,30 @@ class SubprocessGuardsTest(StubTestCase):
         self.assertEqual(kwargs["env"], runner.child_env(self.job))
 
     def test_the_program_is_the_fixed_path(self) -> None:
+        # I1: what Popen really gets is the venv's interpreter, alone or
+        # behind prlimit, followed by exactly DEFAULT_COMMAND's options.
         spy = mock.MagicMock(side_effect=OSError("not here"))
-        for prlimit, program in ((None, sys.executable), ((PRLIMIT,), PRLIMIT)):
+        for prlimit, program in ((None, YTDLP_PYTHON), ((PRLIMIT,), PRLIMIT)):
             with self.subTest(prlimit=prlimit), mock.patch.object(ytdlp.subprocess, "Popen", spy):
                 with self.assertRaises(FetchError):
                     YtDlp(600, MIB, 30, prlimit=prlimit).fetch(VIDEO_ID, self.job)
                 (command,), _ = spy.call_args
                 self.assertEqual(command[0], program)
-                self.assertEqual(command[command.index(sys.executable):][:4], list(DEFAULT_COMMAND))
+                # assertIn first, so a command without the venv fails here
+                # rather than erroring in index().
+                self.assertIn(YTDLP_PYTHON, command)
+                self.assertEqual(command[command.index(YTDLP_PYTHON):][:4], [YTDLP_PYTHON, "-I", "-m", "yt_dlp"])
+
+    def test_the_default_command_never_uses_the_servers_interpreter(self) -> None:
+        # I1: the server's interpreter holds no third-party wheel (pip is
+        # removed from it), so a command built on sys.executable could not
+        # import yt-dlp; and if it could, the wheel's .pth lines and scripts
+        # would be code in the server. Both the constant and the runner the
+        # server builds by default are checked, so a default computed
+        # elsewhere can't slip back to sys.executable.
+        self.assertNotIn(sys.executable, DEFAULT_COMMAND)
+        self.assertNotIn(sys.executable, YtDlp(600, MIB, 30).command)
+        self.assertNotIn(sys.executable, YtDlp(600, MIB, 30, prlimit=(PRLIMIT,)).full_command([]))
 
     def test_communicate_has_the_wall_clock_timeout(self) -> None:
         timeouts: list[float | None] = []

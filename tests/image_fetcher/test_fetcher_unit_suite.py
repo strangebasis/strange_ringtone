@@ -8,7 +8,6 @@ still use the yt-dlp stub, never the real yt-dlp, so they need no network.
 """
 from __future__ import annotations
 
-import importlib
 import unittest
 from pathlib import Path
 
@@ -26,5 +25,8 @@ def load_tests(
         raise RuntimeError(f"no fetcher unit tests under {TESTS}; mount tests/ there")
     suite = unittest.TestSuite(standard_tests)
     for name in names:
-        suite.addTests(loader.loadTestsFromModule(importlib.import_module(name)))
+        # loadTestsFromName turns a module that fails to import into one
+        # failing test of its own, so one broken module can't hide every
+        # other module's result behind a single loader error.
+        suite.addTests(loader.loadTestsFromName(name))
     return suite

@@ -29,7 +29,7 @@ from strange_ringtone_fetch import server as server_module
 from strange_ringtone_fetch.config import Settings
 from strange_ringtone_fetch.jobs import Jobs, QueueFull
 from strange_ringtone_fetch.server import FetchServer, Handler, parse_job_request, prepare_scratch
-from strange_ringtone_fetch.ytdlp import FetchError, YtDlp, default_prlimit
+from strange_ringtone_fetch.ytdlp import YTDLP_PYTHON, FetchError, YtDlp, default_prlimit
 from test_fetcher_jobs import FakeClock, FakeRunner
 from test_fetcher_ytdlp import StubYtDlp, stub_title
 
@@ -1137,7 +1137,8 @@ class ScratchTest(ServerTestCase):
         server = self.server_class(("127.0.0.1", 0), self.settings)
         try:
             runner = server.runner
-            self.assertEqual(runner.command, (sys.executable, "-I", "-m", "yt_dlp"))  # type: ignore[attr-defined]
+            # I1: the venv's interpreter, never the server's own (sys.executable).
+            self.assertEqual(runner.command, (YTDLP_PYTHON, "-I", "-m", "yt_dlp"))  # type: ignore[attr-defined]
             expected = ("/usr/bin/prlimit",) if sys.platform.startswith("linux") else None
             self.assertEqual(runner.prlimit, expected)  # type: ignore[attr-defined]
             self.assertEqual(runner.timeout_seconds, self.settings.fetch_timeout_seconds)  # type: ignore[attr-defined]

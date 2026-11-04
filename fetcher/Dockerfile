@@ -42,8 +42,12 @@ RUN python -m pip install --no-cache-dir --disable-pip-version-check \
 # path it puts first on sys.path. The rest of the core, ffmpeg and the static
 # files stay out: the fetcher serves no page.
 COPY core/strange_ringtone/__init__.py core/strange_ringtone/config.py core/strange_ringtone/http_guard.py /app/core/strange_ringtone/
-COPY fetcher/__main__.py /app/fetcher/
+COPY fetcher/__main__.py fetcher/forwarder.py /app/fetcher/
 COPY fetcher/strange_ringtone_fetch/ /app/fetcher/strange_ringtone_fetch/
+# The forwarder, the image's second command (python -I /app/fetcher/forwarder.py,
+# docs/PLAN.md 6.1): its own package beside the fetcher's, so the entry script
+# finds it and nothing else.
+COPY fetcher/strange_ringtone_forwarder/ /app/fetcher/strange_ringtone_forwarder/
 
 # Bytecode is compiled now, because the root filesystem is read-only at run
 # time and -I ignores PYTHONDONTWRITEBYTECODE (core/Dockerfile).
