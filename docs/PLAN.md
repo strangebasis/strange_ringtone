@@ -567,13 +567,35 @@ source of abuse.
 - Inside every container of the stack `net.ipv4.ip_forward` is 1 (a new
   network namespace copies it from the host's, where dockerd turns it on),
   so the forwarder, with an interface on `egress` and on `outside`, would
-  route a packet that reached it for an off-link destination. Nothing can
-  hand it one: the fetcher's only routes are its on-link subnets, it has no
+  route a packet that reached it for an off-link destination, and the
+  fetcher would route between `fetcher` and `egress`. Nothing can hand them
+  one today (the fetcher's only routes are its on-link subnets, it has no
   capability to add a route or craft a frame, and the host has no address
-  on the isolated networks. The design tolerates this dormant router;
-  `sysctls: {net.ipv4.ip_forward: "0"}` on the fetcher and the forwarder
-  would remove it without a capability, and is the owner's call (a new
-  contract flag).
+  on the isolated networks), but that is one capability or one route away
+  from a path around the gate. So the fetcher and the forwarder set
+  `sysctls: {net.ipv4.ip_forward: "0"}` (owner, 2026-11-04). Docker writes
+  the namespaced sysctl as it creates the container, so it needs no
+  capability; it works under `read_only` and `cap_drop: [ALL]`, turns
+  forwarding off on every interface, and UID 10001 can't turn it back on,
+  because `/proc/sys` is read-only inside (EROFS). IPv6 forwarding already
+  reads 0 in these containers, on the example's networks and on an internal
+  network with IPv6 turned on, so no IPv6 sysctl is set: it would stop a
+  container from starting on a kernel without IPv6 (checked on Engine 29.8
+  by the fix stage, 2026-11-04).
+- prlimit's `--nproc` for yt-dlp is `RLIMIT_NPROC`, which the kernel counts
+  per UID across every container that runs as 10001 (without user-namespace
+  remapping), so it is no per-container bound. The cgroup's pids controller
+  is: `pids_limit` caps a container's processes and threads, and a thread
+  that can't start then fails its request or connection closed. Deno, as
+  yt-dlp runs it, starts its main thread, 2 tokio threads and one V8 worker
+  per usable CPU up to 4 (7 threads with 4 CPUs or more, measured offline in
+  the image), and yt-dlp's Python 1 thread. The fetcher's `pids_limit: 200`
+  is at least twice its worst case of 87: the main thread, 16 request
+  workers (`FetchServer.MAX_WORKERS`), the job worker and the sweeper, the
+  health check, and one yt-dlp run counted as 67 (V8's workers as 63, for a
+  host that reports 64 CPUs, in case the cap of 4 doesn't hold there). It
+  also leaves the one real fetch more than four times the measured 8
+  threads of yt-dlp and Deno on top of the server's 20.
 - Python 3.12's `ipaddress` calls `64:ff9b::a9fe:a9fe` (NAT64 for
   169.254.169.254) and `::169.254.169.254` global.
 - A child with the same UID can read its parent's `/proc/<pid>/environ`, and
@@ -589,7 +611,10 @@ source of abuse.
 (`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`, so turning
 IPv6 on for them doesn't bring the host back); `outside` keeps its gateway,
 the forwarder's route out. Every service rotates its log (json-file, `max-size` and
-`max-file`), so a flood of refusals can't fill the host's disk.
+`max-file`), so a flood of refusals can't fill the host's disk. Every
+container of the fetcher image (the fetcher and the forwarder in PR A, the
+runner too from PR B) sets `net.ipv4.ip_forward: "0"`, so none of them routes
+between its networks, and a `pids_limit` of at least twice its worst case.
 
 ```
  reverse proxy
@@ -657,7 +682,24 @@ request head per connection and never parses anything after it. In order:
 Steps 1 to 3 refuse before any DNS lookup, so a refused name can't leak
 through DNS. A hard cap on open connections before the head comes on top, so
 a flood of half-open connections can't exhaust threads before step 3's
-budgets apply. The budgets are sized with headroom from one measured fetch,
+budgets apply.
+
+The forwarder's container has the contract's flags, nothing writable, a
+128 MB memory limit, IP forwarding off (it relays in user space, so its
+kernel never routes from `egress` to `outside`), and `pids_limit: 320`. That
+is at least twice its worst case of 156 threads: the main thread, one per
+open connection (`connections_max`, 64), the lookups (each in a thread that
+lives until glibc gives up, at most 10 s with the `resolv.conf` Docker
+writes for these networks, 5 s timeout and 2 attempts, measured at 10.0 s;
+each started by a tunnel in that time, so `tunnels_per_minute`, 90, bounds
+them), and the health check. Measured with `--pids-limit 320`: 64 idle
+connections make 65 threads, and the next connection is closed by the
+connection gate (`forwarder refused connections -`), not by a failed thread
+start; 16 clients hammering an allowed name against a DNS server that never
+answers peak at 29 threads. With a limit too small, a thread that can't
+start costs one `forwarder error RuntimeError` line and a closed
+connection, gives back its slots, and the forwarder serves the next
+request. The budgets are sized with headroom from one measured fetch,
 or set generously if the owner declines that fetch, and they become contract
 limits. PR A ships provisional values, named with their meaning in the
 README's "Forwarder limits" table, which a test compares with the code. The
@@ -703,6 +745,9 @@ they are.
   - the forwarder's limits, named in the README (its log budget included)
   - `gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated` on the
     internal networks, and log rotation on every service
+  - `sysctls: {net.ipv4.ip_forward: "0"}` and a `pids_limit` on the fetcher
+    (200) and the forwarder (320), neither needing a capability (owner,
+    2026-11-04)
   - Docker Engine 28.0 or newer (the first release with the isolated gateway
     modes)
 - planned for PR B:
@@ -1254,6 +1299,9 @@ docs/PLAN.md
        (`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`,
        Docker Engine 28.0 or newer), log rotation on every service, the
        forwarder's log budget and its absolute-name lookups
+     - IP forwarding off (`net.ipv4.ip_forward: "0"`) and a `pids_limit` on
+       the fetcher (200) and the forwarder (320), each at least twice its
+       worst case from its own caps (owner, 2026-11-04)
      - the **Compose topology tests** job (T1 to T3, in PR A's wording)
      - the README contract, `.env.example`, CLAUDE.md and section 6
 

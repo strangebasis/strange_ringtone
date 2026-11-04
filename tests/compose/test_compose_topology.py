@@ -72,6 +72,41 @@ INTERNAL_NETWORKS = ("core", "fetcher", "egress")
 # Every service's log rotates, so a flood of refusals can't fill the host's disk.
 LOGGING = {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}}
 PROXY_URL = f"http://fetcher-forwarder:{FORWARDER_PORT}"
+# The services that run the fetcher image, which turn IP forwarding off and
+# cap their processes and threads (compose.example.yaml).
+FETCHER_IMAGE_SERVICES = ("fetcher", "fetcher-forwarder")
+IP_FORWARD = "net.ipv4.ip_forward"
+# The parts of each service's worst-case thread count that aren't one of the
+# code's own caps. Every service: its main thread and the health check's
+# process (Docker runs one at a time). The fetcher also: the job worker and
+# the sweeper (Jobs.start), and one yt-dlp run, measured offline in the image
+# under the contract flags: yt-dlp's Python 1 thread, Deno's main thread, 2
+# tokio threads and V8's workers, at most 4 there (one per usable CPU up to
+# 4), counted as 63 for a host that reports 64 CPUs.
+SERVICE_FIXED_THREADS = 1 + 1
+JOB_THREADS = 2
+YTDLP_RUN_THREADS = 1 + 1 + 2 + 63
+
+
+def _worst_case_threads() -> dict[str, int]:
+    """Each fetcher-image service's worst-case thread count, from the code's own caps.
+
+    The forwarder: one thread per open connection (connections_max), and the
+    lookups, each in a thread that lives until glibc gives up (at most 10 s
+    with the resolv.conf Docker writes for these networks) and each started
+    by a tunnel within that time, so tunnels_per_minute bounds them. The
+    fetcher: one thread per request worker (FetchServer.MAX_WORKERS), the job
+    threads and one yt-dlp run. Imported here, not copied, so raising a cap
+    without raising the example's pids_limit fails LayoutTest.
+    """
+    import helpers  # noqa: F401  (puts core/ and fetcher/ on sys.path)
+    from strange_ringtone_fetch.server import FetchServer
+    from strange_ringtone_forwarder.policy import DEFAULT_LIMITS
+
+    return {
+        "fetcher-forwarder": SERVICE_FIXED_THREADS + DEFAULT_LIMITS.connections_max + DEFAULT_LIMITS.tunnels_per_minute,
+        "fetcher": SERVICE_FIXED_THREADS + FetchServer.MAX_WORKERS + JOB_THREADS + YTDLP_RUN_THREADS,
+    }
 
 # The flags the contract runs a container with (README, Deployment contract),
 # for the containers the tests start outside compose.
@@ -288,6 +323,35 @@ _CMDLINE_PROBE = r"""
 import json
 with open('/proc/1/cmdline', 'rb') as handle:
     print(json.dumps(handle.read().decode('ascii').split('\0')[:-1]))
+"""
+
+# Forwarding and the pids cap as the container's own kernel reports them: IPv4
+# forwarding globally and per interface, IPv6 forwarding per interface where
+# the kernel has IPv6 (None where a file is absent), and the cgroup's pids.max
+# (cgroup v2, or v1's pids controller).
+_FORWARDING_PROBE = r"""
+import json, os
+
+def read(path):
+    try:
+        with open(path) as handle:
+            return handle.read().strip()
+    except FileNotFoundError:
+        return None
+
+def per_interface(family, key='forwarding'):
+    base = '/proc/sys/net/' + family + '/conf'
+    if not os.path.isdir(base):
+        return {}
+    return {name: read(base + '/' + name + '/' + key) for name in sorted(os.listdir(base))}
+
+print(json.dumps({
+    'ip_forward': read('/proc/sys/net/ipv4/ip_forward'),
+    'ipv4': per_interface('ipv4'),
+    'ipv6': per_interface('ipv6'),
+    'ipv6_disabled': per_interface('ipv6', 'disable_ipv6'),
+    'pids_max': read('/sys/fs/cgroup/pids.max') or read('/sys/fs/cgroup/pids/pids.max'),
+}))
 """
 
 # http.client to loopback, as the service's own healthcheck does.
@@ -770,6 +834,34 @@ class LayoutTest(unittest.TestCase):
         self.assertIn("size=96m", tmpfs[0].split(":", 1)[1].split(","))
         self.assertIn("mem_limit", fetcher)
 
+    def test_the_fetcher_and_its_forwarder_turn_ip_forwarding_off(self) -> None:
+        """T2 (static): no kernel routing between the networks of a two-network container, around the CONNECT gate."""
+        for name in FETCHER_IMAGE_SERVICES:
+            with self.subTest(service=name):
+                sysctls = self._service(name).get("sysctls") or {}
+                self.assertIsInstance(sysctls, dict, sysctls)
+                # A new network namespace copies the host's 1, so leaving it
+                # out turns forwarding on.
+                self.assertEqual(str(sysctls.get(IP_FORWARD)), "0", f"{name}: {sysctls!r}")
+                # IPv6 forwarding is already 0 there (StackTest), and an IPv6
+                # sysctl would stop the container from starting on a kernel
+                # without IPv6.
+                self.assertEqual([key for key in sysctls if key.startswith("net.ipv6.")], [], sysctls)
+
+    def test_the_fetcher_and_its_forwarder_cap_processes_at_twice_their_worst_case(self) -> None:
+        """Supporting (G8): a cgroup pids_limit of at least twice each service's worst case from its own caps."""
+        for name, worst in _worst_case_threads().items():
+            with self.subTest(service=name, worst=worst):
+                limit = self._service(name).get("pids_limit")
+                # A bool is an int; -1 and 0 mean no limit to Docker.
+                self.assertIsInstance(limit, int, f"{name} sets no pids_limit")
+                self.assertNotIsInstance(limit, bool)
+                self.assertGreaterEqual(
+                    limit, 2 * worst,
+                    f"{name}: pids_limit {limit} is under twice its worst case of {worst} threads; "
+                    f"raise it with the cap, and the sizing in compose.example.yaml's comment and the README",
+                )
+
 
 class StackTest(unittest.TestCase):
     """The running layout: routes, reachability and the forwarder's gate (T1, T2, T3)."""
@@ -988,6 +1080,27 @@ class StackTest(unittest.TestCase):
                 running = self._probe_output(self._stack.exec_in(service, _CMDLINE_PROBE), f"{service} cmdline")
                 self.assertEqual(running, expected)
 
+    def test_t2_the_running_services_forward_nothing_and_have_the_examples_pids_cap(self) -> None:
+        """T2: in the running fetcher and forwarder, IPv4 and IPv6 forwarding read 0, and pids.max is the example's."""
+        config = self._stack.compose("config", "--format", "json")
+        self.assertEqual(config.returncode, 0, f"docker compose config: {config.stderr.strip()}")
+        services = json.loads(config.stdout).get("services") or {}
+        for service in FETCHER_IMAGE_SERVICES:
+            with self.subTest(service=service):
+                expected = (services.get(service) or {}).get("pids_limit")
+                self.assertIsInstance(expected, int, f"{service} sets no pids_limit")
+                state = self._probe_output(self._stack.exec_in(service, _FORWARDING_PROBE), f"{service} forwarding")
+                self.assertEqual(state["ip_forward"], "0", state)
+                # Per interface too: the global switch sets every interface,
+                # and both networks' interfaces must be among them (control).
+                interfaces = {name for name in state["ipv4"] if name not in ("all", "default", "lo")}
+                self.assertEqual(len(interfaces), 2, state)
+                self.assertEqual({value for value in state["ipv4"].values()}, {"0"}, state)
+                # IPv6 forwarding is off without a sysctl of ours, wherever the
+                # kernel has IPv6 at all.
+                self.assertTrue({value for value in state["ipv6"].values()} <= {"0", None}, state)
+                self.assertEqual(state["pids_max"], str(expected), state)
+
     # T2
 
     def test_t2_fetcher_reaches_the_forwarder_over_egress(self) -> None:
@@ -1178,6 +1291,31 @@ class Ipv6HostIsolationTest(unittest.TestCase):
         self.assertTrue(subnets, f"{isolated} has no IPv6 subnet")
         self.assertFalse(any(entry.get("Gateway") for entry in subnets),
                          f"{isolated} gives the host an IPv6 gateway: {subnets}")
+
+    def test_ipv6_forwarding_is_off_on_an_ipv6_internal_network_with_the_examples_sysctls(self) -> None:
+        """T2 on IPv6: with IPv6 on, the example's sysctls start the image and leave IPv6 forwarding at 0 unasked."""
+        config = self.stack.compose("config", "--format", "json")
+        self.assertEqual(config.returncode, 0, f"docker compose config: {config.stderr.strip()}")
+        loaded = json.loads(config.stdout)
+        options = dict(((loaded.get("networks") or {}).get("egress") or {}).get("driver_opts") or {})
+        network = self._network("v6-forwarding", options)
+        for service in FETCHER_IMAGE_SERVICES:
+            with self.subTest(service=service):
+                sysctls = ((loaded.get("services") or {}).get(service) or {}).get("sysctls") or {}
+                self.assertEqual(str(sysctls.get(IP_FORWARD)), "0", sysctls)
+                flags: list[str] = []
+                for key, value in sorted(sysctls.items()):
+                    flags += ["--sysctl", f"{key}={value}"]
+                state = self._output(
+                    self._run("--rm", "--name", self._container(f"v6-forwarding-{service}"), "--network", network,
+                              *HARDENING, *flags, IMAGE, "python", "-I", "-c", _FORWARDING_PROBE),
+                    f"{service} forwarding probe on {network}",
+                )
+                self.assertEqual(state["ip_forward"], "0", state)
+                # Control: IPv6 is really on for the container's interface,
+                # so the zeros below are read from a live IPv6 stack.
+                self.assertEqual(state["ipv6_disabled"].get("eth0"), "0", state)
+                self.assertEqual({value for value in state["ipv6"].values()}, {"0"}, state)
 
 
 class ResolverSearchDomainTest(unittest.TestCase):

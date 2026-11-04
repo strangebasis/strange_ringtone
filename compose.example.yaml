@@ -48,6 +48,10 @@
 # Logs: every service rotates its json-file log (`logging:` below). The
 # Docker daemon doesn't rotate by default, and the forwarder logs every
 # refusal, so an unrotated log could fill the host's disk.
+#
+# The fetcher and its forwarder also turn IP forwarding off in their network
+# namespaces and cap their processes and threads (`sysctls` and `pids_limit`
+# below); neither setting needs a capability.
 
 name: strange_ringtone
 
@@ -150,6 +154,28 @@ services:
     # but not its address space, because Deno reserves a huge virtual range
     # at startup. This cgroup limit is what bounds the fetcher's memory.
     mem_limit: 512m
+    # The cgroup's cap on processes and threads. prlimit's --nproc for yt-dlp
+    # is RLIMIT_NPROC, which the kernel counts per UID across every container
+    # that runs as 10001, so it bounds nothing per container; this does, and
+    # a thread that can't start fails its request closed. The worst case: the
+    # main thread, 16 request workers (FetchServer.MAX_WORKERS), the job
+    # worker and the sweeper, the health check, and one yt-dlp run, which is
+    # yt-dlp's Python (1 thread) and Deno (its main thread, 2 tokio threads
+    # and V8's workers: 4 at most as measured, counted here as 63 for a host
+    # that reports 64 CPUs), so 1 + 16 + 2 + 1 + 67 = 87. 200 is more than
+    # twice that.
+    pids_limit: 200
+    # Forwarding off. A new network namespace copies the host's
+    # net.ipv4.ip_forward, which dockerd turns on, so a container on two
+    # networks would route packets between them. The fetcher routes nothing:
+    # yt-dlp leaves through the forwarder's CONNECT gate. Docker sets this
+    # namespaced sysctl as it creates the container, so it needs no
+    # capability, and /proc/sys is read-only inside, so UID 10001 can't turn
+    # it back on. Nothing for IPv6: its forwarding is already 0 in these
+    # containers, and an IPv6 sysctl would stop the container from starting
+    # on a kernel without IPv6.
+    sysctls:
+      net.ipv4.ip_forward: "0"
     # Internal networks only, so the fetcher has no default route and its
     # DNS resolves service names but no external name; it refuses to start
     # where it finds a default route (FETCH_ALLOW_DEFAULT_ROUTE). `fetcher`
@@ -219,6 +245,23 @@ services:
     # No tmpfs: the forwarder writes nothing, so nothing in it is writable.
     # Its own limits bound each tunnel (README); this bounds the process.
     mem_limit: 128m
+    # The cgroup's cap on processes and threads, in case a change ever
+    # loosens the forwarder's own thread accounting; a thread that can't
+    # start fails its connection closed. The worst case from its limits: the
+    # main thread; one thread per open connection (connections_max, 64); the
+    # lookups, each in a thread that lives until glibc gives up, at most 10 s
+    # with the resolv.conf Docker writes for these networks (5 s timeout, 2
+    # attempts), and each started by a tunnel in that time, so
+    # tunnels_per_minute (90) bounds them; and the health check: 1 + 64 + 90
+    # + 1 = 156. 320 is more than twice that.
+    pids_limit: 320
+    # Forwarding off, as for the fetcher. The forwarder has an interface on
+    # `egress` and on `outside`, with a default route, so with forwarding on
+    # its kernel would route a packet from the fetcher out, around the
+    # CONNECT gate, the moment anything could send it one. It relays in user
+    # space and needs no kernel forwarding.
+    sysctls:
+      net.ipv4.ip_forward: "0"
     # `egress` for the fetcher to reach it; `outside` for its route out. Not
     # on `fetcher` or `core`, so a compromised forwarder reaches neither the
     # core nor the reverse proxy. Until PR B (docs/PLAN.md 6.1) it shares

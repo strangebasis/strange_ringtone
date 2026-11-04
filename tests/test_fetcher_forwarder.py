@@ -2106,6 +2106,127 @@ class ServerClassTest(ForwarderTestCase):
         self.assertNotEqual(self.port, 0)
 
 
+_REAL_THREAD_START = threading.Thread.start
+# What CPython's Thread.start raises when the kernel refuses a new thread, as
+# it does once a container reaches its pids limit (compose.example.yaml).
+NO_THREAD = "can't start new thread"
+
+
+@contextlib.contextmanager
+def failing_thread_starts(which: Callable[[threading.Thread], bool], count: int) -> Iterator[Callable[[], int]]:
+    """Thread.start raises RuntimeError(NO_THREAD) for the next `count` threads `which` picks; yields the count left."""
+    left = [count]
+    lock = threading.Lock()
+
+    def start(thread: threading.Thread) -> None:
+        with lock:
+            fail = left[0] > 0 and which(thread)
+            if fail:
+                left[0] -= 1
+        if fail:
+            raise RuntimeError(NO_THREAD)
+        _REAL_THREAD_START(thread)
+
+    def remaining() -> int:
+        with lock:
+            return left[0]
+
+    with mock.patch.object(threading.Thread, "start", start):
+        yield remaining
+
+
+def _started_by_server_for_a_connection(server: Forwarder) -> Callable[[threading.Thread], bool]:
+    # socketserver's ThreadingMixIn starts one thread per connection, whose
+    # target is the server's own process_request_thread.
+    return lambda thread: getattr(getattr(thread, "_target", None), "__self__", None) is server
+
+
+class ThreadStartFailureTest(ForwarderTestCase):
+    """G4, G8, G10 under a pids limit: a thread that can't start fails closed, frees its slots, logs its type only."""
+
+    def assert_only_error_lines(self, failures: int) -> None:
+        # The client sees the close before handle_error writes its line.
+        wait_until(lambda: sum(line.startswith("forwarder error ") for line in self.log.lines()) >= failures)
+        time.sleep(SETTLE)
+        lines = self.log.lines()
+        errors = [line for line in lines if line.startswith("forwarder error ")]
+        self.assertEqual(errors, ["forwarder error RuntimeError"] * failures, lines)
+        # The rest are the gate's own lines (a 503 while a slot comes back).
+        for line in lines:
+            if line not in errors:
+                self.assertRegex(line, r"^forwarder refused [a-z_]+ (-|[A-Za-z0-9.-]{1,253})$")
+        # Neither the kernel's message nor a traceback reaches the log or stderr.
+        for text in (self.log.getvalue(), self.stderr.getvalue()):
+            self.assertNotIn(NO_THREAD, text)
+            self.assertNotIn("Traceback", text)
+
+    def test_a_connection_thread_that_cannot_start_gives_its_slot_back(self) -> None:
+        # process_request takes a connections slot, then socketserver starts
+        # the connection's thread. If that start fails, nothing else will
+        # ever release the slot, so a pids limit that is hit a few times
+        # would otherwise leave the gate refusing every connection.
+        limits = Limits(connections_max=2)
+        server = self.start(limits, sink=None)
+        failures = limits.connections_max + 1
+        with failing_thread_starts(_started_by_server_for_a_connection(server), failures) as left:
+            for _ in range(failures):
+                sock = self.client()
+                with contextlib.suppress(OSError):
+                    sock.sendall(connect_head(ALLOWED))
+                # Closed with no response: no head was read, so no status
+                # line is owed, and nothing was decided.
+                self.assertEqual(read_to_eof(sock)[0], b"")
+            self.assertEqual(left(), 0, "not every connection met a failing thread start")
+        self.assert_only_error_lines(failures)
+        self.assertEqual(self.resolver.calls, [])
+        self.assertEqual(self.connector.calls, [])
+        # Acceptance: both connection slots are free again, and the server
+        # still serves, so connections_max clients at once are each accepted.
+        first = self.client()
+        second = self.client()
+        first.sendall(connect_head(ALLOWED))
+        second.sendall(connect_head("m.youtube.com"))
+        self.assertEqual(recv_head(first), ACCEPTED)
+        self.assertEqual(recv_head(second), ACCEPTED)
+
+    def test_a_resolver_thread_that_cannot_start_fails_closed(self) -> None:
+        # The lookup runs in its own thread (step 4), started after the
+        # tunnel slot and the minute's place are taken. If it can't start,
+        # the tunnel must end there: no lookup, no connection, the client
+        # closed, the tunnel slot given back.
+        limits = Limits(tunnels_max_concurrent=1)
+        server = self.start(limits, sink=None)
+        failures = 3
+        statuses: list[int] = []
+        with failing_thread_starts(lambda thread: not _started_by_server_for_a_connection(server)(thread),
+                                   failures) as left:
+            end = time.monotonic() + DEADLINE
+            while left() and time.monotonic() < end:
+                sock = self.client()
+                sock.sendall(connect_head(ALLOWED))
+                head = recv_head(sock)
+                statuses.append(status_of(head))
+                if head:
+                    # Only a 503 is acceptable: the slot of the tunnel that
+                    # just failed comes back a moment after its client sees
+                    # the close.
+                    time.sleep(0.02)
+            self.assertEqual(
+                left(), 0,
+                f"the resolver thread was never started: statuses {sorted(set(statuses))} in {len(statuses)} requests",
+            )
+        self.assertLessEqual(set(statuses), {0, 503}, sorted(set(statuses)))
+        self.assertEqual(statuses.count(0), failures, statuses)
+        self.assert_only_error_lines(failures)
+        self.assertEqual(self.resolver.calls, [])
+        self.assertEqual(self.connector.calls, [])
+        # Acceptance: with one tunnel slot, a leaked slot would answer 503
+        # for ever; the next tunnel is accepted and resolved exactly once.
+        self.tunnel_when_free()
+        self.assertEqual(self.resolver.calls, [(ALLOWED, socket.AF_INET)])
+        self.assertEqual(self.connector.calls, [(GLOBAL_A, 443, float(DEFAULT_LIMITS.connect_timeout_seconds))])
+
+
 class ImportsTest(unittest.TestCase):
     """The forwarder's process holds the stdlib modules it needs and its own package, nothing else (SPEC 3.2)."""
 
