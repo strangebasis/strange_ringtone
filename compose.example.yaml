@@ -15,6 +15,9 @@
 # the `core` network and forwards to core:8080. With the fetcher, the proxy
 # also joins the `fetcher` network and forwards paths under /fetch/ to
 # fetcher:8080 unchanged, on the same origin, and everything else to the core.
+# The proxy must be a container attached to those networks: they give the
+# Docker host no address (see Networks below), so a proxy running on the
+# host itself, or with `network_mode: host`, can't reach core or fetcher.
 #
 # Networks: `core`, `fetcher` and `egress` are internal, with no route out,
 # and isolated from the Docker host: `internal: true` alone still gives the
@@ -92,7 +95,9 @@ services:
     # For local development only, never on a LAN-facing host: publish the
     # port on loopback and set PUBLIC_ORIGIN=http://127.0.0.1:8080 in .env.
     # An internal network has no port publishing, so also switch `core`
-    # below to a normal network while you do.
+    # below to a normal network, and drop its `driver_opts`, while you do:
+    # Docker refuses the isolated gateway mode on a network that isn't
+    # internal.
     # ports:
     #   - "127.0.0.1:8080:8080"
 
@@ -137,7 +142,13 @@ services:
     # for the reverse proxy to reach it; `egress` for the forwarder and
     # nothing else, yt-dlp's only way out. Not on `core`: the fetcher never
     # calls the core, and a separate network means a compromised fetcher
-    # can't reach it either.
+    # can't reach it either. Until the runner split (docs/PLAN.md 6.1, PR B),
+    # yt-dlp, yt-dlp-ejs and Deno run inside this container: on `fetcher`
+    # beside the reverse proxy (they can reach every port it listens on
+    # there, and through it the app's origin and the core), as the UID that
+    # owns the fetcher's /tmp job directories and results, and able to read
+    # the server's environment. This layout alone doesn't keep third-party
+    # code off the proxy or out of the app's requests and responses.
     networks:
       - fetcher
       - egress
@@ -237,7 +248,9 @@ networks:
     # isolated: the bridge gets no address on the Docker host, so nothing on
     # this network reaches the host's own services either (internal: true
     # alone leaves the host reachable through the bridge's gateway address).
-    # Container-to-container traffic and service names work as before.
+    # Container-to-container traffic and service names work as before, but
+    # the host has no route to the containers here: the reverse proxy must
+    # be a container on this network, not a process on the host.
     driver_opts:
       com.docker.network.bridge.gateway_mode_ipv4: isolated
   fetcher:

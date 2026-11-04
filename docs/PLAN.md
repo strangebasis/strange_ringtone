@@ -342,7 +342,7 @@ the user types becomes the filename. Decision 9 keeps it readable:
 | Image | `ghcr.io/<owner>/strange_ringtone:<semver>`, consumed by digest, linux/amd64 |
 | User | UID 10001, GID 10001 (fixed, non-root) |
 | Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
-| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). |
+| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). In `compose.example.yaml` (from 6.1's PR A) that network is also isolated from the Docker host (`gateway_mode_ipv4: isolated`, Docker Engine 28.2 or newer), so the reverse proxy must be a container on it, not a process on the host, and the log rotates (json-file, `max-size: 10m`, `max-file: 3`). |
 | Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `(MAX_RESULTS + RENDER_CONCURRENCY) × MAX_CLIP_SECONDS × 33 kB + RENDER_CONCURRENCY × MAX_BODY_BYTES`: a result is 256 kbit/s AAC, at most 33 kB per second of clip with the MP4 overhead, and each running render also holds its upload. That is 63 MB with the defaults (use 64 MB) and 84 MB with `MAX_CLIP_SECONDS=40`. |
 | Health | `GET /healthz` returns 200 with an empty body |
 
@@ -554,6 +554,11 @@ source of abuse.
   169.254.169.254) and `::169.254.169.254` global.
 - A child with the same UID can read its parent's `/proc/<pid>/environ`, and
   it can ptrace the parent where Yama's `ptrace_scope` is 0.
+- glibc's resolver retries a relative name under each `search` domain of
+  `/etc/resolv.conf`, which Docker copies from the host, after an NXDOMAIN,
+  so `nosuch.youtube.com` can become `nosuch.youtube.com.<search domain>`.
+  A trailing dot makes the name absolute and stops that (checked in the
+  fetcher image with a loopback fake DNS by the refute stage, 2026-11-03).
 
 **Layout.** The fetcher image runs as three containers. Every network but
 `outside` is `internal: true` and isolated from the host
@@ -588,7 +593,10 @@ route out. Every service rotates its log (json-file, `max-size` and
   reverse proxy, never sees a browser's request and can't set a response
   header on the app's origin.
 - **fetcher-forwarder** is the only container with a route out.
-- The core doesn't change.
+- The core image doesn't change. Its example network becomes isolated from
+  the host too (`gateway_mode_ipv4: isolated`, Engine 28.2), so the reverse
+  proxy must be a container on it, not a process on the host, and its log
+  rotates.
 
 PR A's interim layout has two containers: the fetcher on `fetcher` and
 `egress`, and the forwarder on `egress` and `outside`.
@@ -604,9 +612,10 @@ request head per connection and never parses anything after it. In order:
    Suffixes cost nothing here, because every allowed name reaches the same
    front ends, and they keep churn low. Piped's proxy allowlists the same way.
 3. Check the budgets: concurrent tunnels and new tunnels per minute.
-4. Only then resolve the name, IPv4 only and within a deadline. Refuse unless
-   every address is global unicast. IPv4 only sidesteps the NAT64 and
-   IPv4-compatible forms above.
+4. Only then resolve the name, IPv4 only and within a deadline, as an
+   absolute name (a trailing dot), so no `search` domain is ever tried.
+   Refuse unless every address is global unicast. IPv4 only sidesteps the
+   NAT64 and IPv4-compatible forms above.
 5. Connect to an address that passed, without resolving again, and answer
    `200`. Then copy bytes both ways within caps: upload bytes per tunnel and
    per minute (yt-dlp sends requests, never large bodies), download bytes per
@@ -703,6 +712,16 @@ fetcher and can reach its port 8080 there, where the fetcher's Origin and
 rate checks still apply. Binding the forwarder to its `egress` address alone
 would need a fixed subnet in the example, which is the owner's call.
 
+Until PR B, yt-dlp, yt-dlp-ejs and Deno run inside the fetcher container: on
+the `fetcher` network beside the reverse proxy (they can reach every port it
+listens on there, and through it the app's origin and the core), as the UID
+that owns the fetcher's `/tmp` job directories and results, and able to read
+the server's environment. PR A alone does not meet the threat paragraph's
+reverse-proxy and request/response goals; the runner split in PR B does, and
+a release without PR B must first make the server non-dumpable (see
+**Dropped**). The isolated gateway mode also means the host has no route to
+the internal networks, so the reverse proxy must be a container on them.
+
 **Checks and their tests.** Every check gets its failing test before its code
 (section 12), and the verification panel removes each check and expects a
 test to fail.
@@ -713,7 +732,7 @@ test to fail.
 | G2 | IP literals and malformed, over-long or non-ASCII names are refused | unit | PR A |
 | G3 | The name matches the allowlist by whole labels (`youtube.com.example.net` and `notyoutube.com` are refused) | unit | PR A |
 | G4 | G1 to G3 and the budgets are decided before any DNS lookup | unit, with a resolver that records its calls | PR A |
-| G5 | IPv4 only, and every resolved address is global unicast | unit, with fake answers: private, loopback, link-local, CGNAT, multicast, mixed | PR A |
+| G5 | IPv4 only, the name looked up as an absolute name, and every resolved address is global unicast | unit, with fake answers: private, loopback, link-local, CGNAT, multicast, mixed; a getaddrinfo spy for the trailing dot; compose tests: a loopback fake DNS in the image proves no `search` domain is asked | PR A |
 | G6 | The connection goes to an address that passed, without a second lookup | unit | PR A |
 | G7 | The request head has a size cap and a read deadline | unit | PR A |
 | G8 | Concurrent tunnels and new tunnels per minute are capped | unit | PR A |
