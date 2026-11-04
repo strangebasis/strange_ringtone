@@ -27,6 +27,7 @@ import resource
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -340,6 +341,43 @@ class FilesystemTest(unittest.TestCase):
                 self.assertTrue(os.path.isfile(path), f"{path} is not in the image")
                 with self.assertRaises(OSError):
                     open(path, "ab").close()
+
+    def test_root_owns_the_code_and_nobody_else_can_write_it(self) -> None:
+        # The read-only root filesystem refuses every write whoever owns a
+        # file, so the probes above would pass even if the build handed /app
+        # or the venv to the server's UID. Ownership is the second defence
+        # (the Dockerfile's "root owns everything"): checked here on every
+        # entry, so a chown or a group- or world-writable mode fails.
+        problems: list[str] = []
+        checked = 0
+
+        def check(path: str) -> None:
+            nonlocal checked
+            info = os.lstat(path)
+            checked += 1
+            if (info.st_uid, info.st_gid) != (0, 0):
+                problems.append(f"{path} is owned by {info.st_uid}:{info.st_gid}")
+            # A symlink's own mode is always rwxrwxrwx and means nothing; its
+            # target is checked where it lives.
+            if not stat.S_ISLNK(info.st_mode) and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                problems.append(f"{path} has mode {stat.filemode(info.st_mode)}")
+
+        def refuse(error: OSError) -> None:
+            # A directory the walk can't read hides what is in it.
+            raise error
+
+        for root in ("/app", str(VENV)):
+            with self.subTest(root=root):
+                self.assertTrue(os.path.isdir(root), f"{root} is not in the image")
+            check(root)
+            for directory, names, files in os.walk(root, onerror=refuse):
+                for name in names + files:
+                    check(os.path.join(directory, name))
+        for path in (DENO, "/opt"):
+            check(path)
+        # The walk saw the venv's packages and the forwarder, not an empty tree.
+        self.assertGreater(checked, 500)
+        self.assertEqual(problems, [])
 
     def test_tmp_is_the_writable_tmpfs(self) -> None:
         fd, name = tempfile.mkstemp(dir="/tmp")
