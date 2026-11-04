@@ -140,3 +140,41 @@ jobs:
             -v "$GITHUB_WORKSPACE/tests:/tests:ro" \
             strange_ringtone-fetcher:ci \
             python -I -m unittest discover -s /tests/image_fetcher -t /tests -v
+
+  compose:
+    name: Compose topology tests
+    # The only test of the layout (docs/PLAN.md 6.1, T1 to T3): the fetcher
+    # image brought up with compose.example.yaml itself, the fetcher on
+    # internal networks and the forwarder the only way out, with no YouTube
+    # traffic. The engine must be 26.0 or newer, as the contract says.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the fetcher image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: fetcher/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: strange_ringtone-fetcher:ci
+          # Read the fetcher job's cache; only that job writes it, so the two
+          # never race on one scope.
+          cache-from: type=gha,scope=fetcher
+
+      - name: Run the compose topology tests
+        # The tests bring the stack up under a unique project name with a
+        # temporary env file, publish no port and tear everything down.
+        env:
+          STRANGE_RINGTONE_COMPOSE_TESTS: "1"
+          STRANGE_RINGTONE_COMPOSE_IMAGE: strange_ringtone-fetcher:ci
+        run: python -I -m unittest discover --start-directory tests/compose --top-level-directory tests --verbose
