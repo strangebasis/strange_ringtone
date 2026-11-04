@@ -522,6 +522,8 @@ class HeadParsingTest(ForwarderTestCase):
         for host in ("192.0.2.1", "3221225985", "[::1]"):
             with self.subTest(host=host):
                 self.assert_refused(connect_head(host), 400)
+        self.assertEqual(self.resolver.calls, [])
+        self.assertEqual(self.connector.calls, [])
 
     def test_hex_ip_literals_are_refused_400(self) -> None:
         # G2 (RC2-5): inet_aton also reads hex parts with a 0x prefix, so a
@@ -538,7 +540,6 @@ class HeadParsingTest(ForwarderTestCase):
         self.assertEqual(policy.parse_connect(connect_head("www.x0c")), "www.x0c")
         self.start()
         self.assert_refused(connect_head("0xc0.0x0.0x2.0x1"), 400)
-        self.assertEqual(self.resolver.calls, [])
         self.assertEqual(self.resolver.calls, [])
         self.assertEqual(self.connector.calls, [])
 
