@@ -67,15 +67,25 @@ Sink = Callable[[Outcome], None]
 
 
 def resolve_ipv4(name: str, family: int = socket.AF_INET) -> list[str]:
-    """Distinct sockaddr[0] strings, in order, of getaddrinfo(name, 443, family, SOCK_STREAM, IPPROTO_TCP).
+    """Distinct sockaddr[0] strings, in order, of getaddrinfo(name + ".", 443, family, SOCK_STREAM, IPPROTO_TCP).
 
     family is passed through so a spy can prove AF_INET; the server always
     passes socket.AF_INET, because IPv6 answers would need a second address
     policy and the deployment's networks route IPv4 only (G5).
+
+    The name is looked up as an absolute name (a trailing dot). A relative
+    name lets glibc's resolver retry it with every `search` domain of
+    /etc/resolv.conf, which Docker copies from the host, after an NXDOMAIN
+    the client can force by choosing the first label: `x.youtube.com` would
+    become `x.youtube.com.<search domain>`, and a wildcard record there would
+    hand the forwarder an address the allowlist never named. The dot only
+    changes the lookup: the client's TLS, SNI included, is relayed as sent.
+    parse_connect refuses a name with a trailing dot, so the name never has
+    one already.
     """
     addresses: list[str] = []
     for _family, _type, _proto, _canonname, sockaddr in socket.getaddrinfo(
-        name, ALLOWED_PORT, family, socket.SOCK_STREAM, socket.IPPROTO_TCP
+        name + ".", ALLOWED_PORT, family, socket.SOCK_STREAM, socket.IPPROTO_TCP
     ):
         address = sockaddr[0]
         if address not in addresses:

@@ -12,8 +12,10 @@ are refused before the forwarder resolves anything; T1's external-name probe
 runs only where no default route exists, on internal networks whose embedded
 DNS answers without forwarding (EngineTest fails where an older engine would
 forward); T2's reachability probes connect to container addresses, never to a
-name on the `outside` network. Every `docker run` passes `--pull never`, so a
-missing image is an error rather than a registry request.
+name on the `outside` network. The resolver test runs under `--network none`
+against a fake DNS server on the container's own loopback. Every `docker run`
+passes `--pull never`, so a missing image is an error rather than a registry
+request.
 
 Static checks (LayoutTest) read `docker compose config` and so still report
 the layout when the stack can't start; a missing service or network is a
@@ -211,6 +213,88 @@ connection = http.client.HTTPConnection('127.0.0.1', PORT, timeout=TIMEOUT)
 connection.request('GET', '/fetch/healthz')
 response = connection.getresponse()
 print(response.status, response.read().decode('ascii', 'replace'))
+"""
+
+# Run under --network none with resolv.conf `nameserver 127.0.0.1` and
+# `search example.internal`: a loopback DNS server that records every
+# question, answers A records for the names in ANSWERS and NXDOMAIN for the
+# rest. The search-suffixed name has a "wildcard" answer, as a catch-all zone
+# would. Three lookups: the relative name through glibc (the control, which
+# must show the suffixed question, or the setup proves nothing), the
+# forwarder's resolver for a name with no record of its own, and the whole
+# Forwarder, with its default resolver and connector, for the same name.
+_SEARCH_DOMAIN_PROBE = r"""
+import json, socket, struct, sys, threading, time
+sys.path.insert(0, '/app/fetcher')
+from strange_ringtone_forwarder.server import Forwarder, resolve_ipv4
+ANSWERS = {NAME + '.' + SEARCH + '.': '11.0.0.1', ALLOWED + '.': '11.0.0.2'}
+questions = []
+lock = threading.Lock()
+
+def question_name(packet):
+    labels, index = [], 12
+    while packet[index]:
+        size = packet[index]
+        labels.append(packet[index + 1:index + 1 + size].decode('ascii'))
+        index += 1 + size
+    return '.'.join(labels) + '.', index + 1
+
+def serve(sock):
+    while True:
+        packet, peer = sock.recvfrom(4096)
+        name, end = question_name(packet)
+        qtype = struct.unpack('!H', packet[end:end + 2])[0]
+        with lock:
+            questions.append([name, qtype])
+        flags, records = 0x8183, b''
+        if name in ANSWERS:
+            flags = 0x8180
+            if qtype == 1:
+                records = b'\xc0\x0c' + struct.pack('!HHIH', 1, 1, 60, 4) + socket.inet_aton(ANSWERS[name])
+        count = 1 if records else 0
+        sock.sendto(packet[:2] + struct.pack('!HHHHH', flags, 1, count, 0, 0) + packet[12:end + 4] + records, peer)
+
+dns = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+dns.bind(('127.0.0.1', 53))
+threading.Thread(target=serve, args=(dns,), daemon=True).start()
+
+def run(call):
+    with lock:
+        questions.clear()
+    try:
+        result = {'answer': call()}
+    except OSError as error:
+        result = {'error': type(error).__name__}
+    with lock:
+        result['questions'] = list(questions)
+    return result
+
+def through_the_forwarder():
+    outcomes = []
+    server = Forwarder(('127.0.0.1', 0), sink=outcomes.append)
+    threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True).start()
+    try:
+        with socket.create_connection(('127.0.0.1', server.server_address[1]), timeout=TIMEOUT) as client:
+            client.sendall(('CONNECT ' + NAME + ':443 HTTP/1.1\r\n\r\n').encode('ascii'))
+            status = client.recv(64).split(b' ')[1].decode('ascii')
+        end = time.monotonic() + TIMEOUT
+        while not outcomes and time.monotonic() < end:
+            time.sleep(0.02)
+        return [status, outcomes[0].reason if outcomes else None]
+    finally:
+        server.shutdown()
+        server.server_close()
+
+def relative():
+    infos = socket.getaddrinfo(NAME, 443, socket.AF_INET, socket.SOCK_STREAM)
+    return sorted({info[4][0] for info in infos})
+
+print(json.dumps({
+    'relative': run(relative),
+    'resolve_ipv4': run(lambda: resolve_ipv4(NAME)),
+    'resolve_ipv4_answered': run(lambda: resolve_ipv4(ALLOWED)),
+    'forwarder': run(through_the_forwarder),
+}))
 """
 
 
@@ -837,6 +921,53 @@ class StackTest(unittest.TestCase):
                 self.assertNotIn(marker, line, f"request text reached the log: {line!r}")
             if line.startswith("forwarder "):
                 self.assertRegex(line, FORWARDER_LOG_RE)
+
+
+class ResolverSearchDomainTest(unittest.TestCase):
+    """G5/G6 against the image's glibc: the forwarder looks up the absolute name, never one with a search domain."""
+
+    # An allowed name with no record of its own: the client picks the first
+    # label freely, so it can always force the NXDOMAIN that makes glibc try
+    # the search domains. SEARCH is a placeholder zone, never a deployment's.
+    NAME = "nosuch.youtube.com"
+    ALLOWED = "www.youtube.com"
+    SEARCH = "example.internal"
+
+    def test_the_forwarder_never_appends_a_search_domain(self) -> None:
+        """No network at all (--network none): the DNS server is a loopback fake inside the container."""
+        name = f"strange-ringtone-compose-{os.getpid()}-{secrets.token_hex(3)}-dns"
+        self.addCleanup(_docker, "rm", "-f", name, timeout=60)
+        code = (
+            f"NAME = {self.NAME!r}\nALLOWED = {self.ALLOWED!r}\nSEARCH = {self.SEARCH!r}\n"
+            f"TIMEOUT = {PROBE_TIMEOUT!r}\n" + _SEARCH_DOMAIN_PROBE
+        )
+        result = _docker(
+            "run", "--pull", "never", "--rm", "--name", name,
+            "--network", "none", "--dns", "127.0.0.1", "--dns-search", self.SEARCH,
+            # The fake DNS listens on port 53 as UID 10001 with no capability;
+            # this namespaced sysctl only affects the container's own netns.
+            "--sysctl", "net.ipv4.ip_unprivileged_port_start=53",
+            *HARDENING, IMAGE, "python", "-I", "-c", code,
+            timeout=PROBE_RUN_TIMEOUT,
+        )
+        self.assertEqual(result.returncode, 0, f"the probe failed: {result.stderr.strip()}")
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines, f"the probe printed nothing: {result.stderr.strip()}")
+        out = json.loads(lines[-1])
+        absolute = [self.NAME + ".", 1]
+        suffixed = [f"{self.NAME}.{self.SEARCH}.", 1]
+        # Control: a relative lookup does reach the search domain and takes
+        # its wildcard answer, so the setup can show the attack.
+        self.assertEqual(out["relative"], {"answer": ["11.0.0.1"], "questions": [absolute, suffixed]}, out)
+        # The forwarder's resolver asks for the absolute name only and fails.
+        self.assertEqual(out["resolve_ipv4"], {"error": "gaierror", "questions": [absolute]}, out)
+        # Acceptance: an allowed name with a record of its own resolves.
+        self.assertEqual(
+            out["resolve_ipv4_answered"], {"answer": ["11.0.0.2"], "questions": [[self.ALLOWED + ".", 1]]}, out,
+        )
+        # The whole Forwarder: one absolute question, then 502 resolve_failed
+        # (with a relative name it would take 11.0.0.1 and try to connect).
+        self.assertEqual(out["forwarder"], {"answer": ["502", "refused:resolve_failed"], "questions": [absolute]}, out)
 
 
 if __name__ == "__main__":

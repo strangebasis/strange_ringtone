@@ -752,6 +752,23 @@ class OrderingTest(ForwarderTestCase):
         self.assertEqual(self.request(connect_head("m.youtube.com"))[0], 429)
         self.assertEqual(self.resolver.calls, [(ALLOWED, socket.AF_INET)])
 
+    def test_the_connections_cap_is_decided_before_dns(self) -> None:
+        # G4, G8: a connection over connections_max is closed before any
+        # head is read, so nothing is looked up or connected for it either.
+        self.start(Limits(connections_max=1, head_deadline_seconds=8))
+        held = self.client()
+        over = self.client()
+        self.assertEqual(read_to_eof(over)[0], b"")
+        self.assertEqual(self.sink.wait(1)[0].reason, "refused:connections")
+        time.sleep(SETTLE)
+        self.assertEqual(self.resolver.calls, [])
+        self.assertEqual(self.connector.calls, [])
+        # Acceptance: the held connection is served, with exactly one lookup.
+        held.sendall(connect_head(ALLOWED))
+        self.assertEqual(recv_head(held), ACCEPTED)
+        self.assertEqual(self.resolver.calls, [(ALLOWED, socket.AF_INET)])
+        self.assertEqual(len(self.connector.calls), 1)
+
 
 class AddressPolicyTest(ForwarderTestCase):
     """G5: IPv4 only, every answer global unicast, or 403 and no connection."""
@@ -873,7 +890,8 @@ class AddressPolicyTest(ForwarderTestCase):
         asked: list[tuple[Any, ...]] = []
 
         def fake(host: Any, port: Any, family: int = 0, type: int = 0, proto: int = 0, flags: int = 0) -> Any:
-            if host != ALLOWED:
+            # Both spellings are caught, so neither ever reaches a real resolver.
+            if host not in (ALLOWED, ALLOWED + "."):
                 return real(host, port, family, type, proto, flags)
             asked.append((host, port, family, type, proto))
             return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, 443))
@@ -884,7 +902,7 @@ class AddressPolicyTest(ForwarderTestCase):
             self.assertEqual(len(asked), 1)
             host, port, family, kind, proto = asked[0]
             self.assertEqual((host, str(port), family, kind, proto),
-                             (ALLOWED, "443", socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP))
+                             (ALLOWED + ".", "443", socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP))
             self.start(omit=("resolver",))
             self.tunnel()
         self.assertEqual(len(asked), 2)
@@ -898,7 +916,8 @@ class AddressPolicyTest(ForwarderTestCase):
         release = threading.Event()
 
         def hanging(host: Any, port: Any, family: int = 0, type: int = 0, proto: int = 0, flags: int = 0) -> Any:
-            if host != ALLOWED:
+            # Both spellings are caught, so neither ever reaches a real resolver.
+            if host not in (ALLOWED, ALLOWED + "."):
                 return real(host, port, family, type, proto, flags)
             release.wait(DEADLINE)
             raise OSError("released")
@@ -915,6 +934,35 @@ class AddressPolicyTest(ForwarderTestCase):
         self.assertEqual(self.connector.calls, [])
         outcome = self.sink.wait(1)[0]
         self.assertEqual((outcome.name, outcome.reason), (ALLOWED, "refused:resolve_timeout"))
+
+    def test_the_real_resolver_asks_for_the_absolute_name(self) -> None:
+        # G5/G6: the lookup is for name + "." and nothing else. A relative
+        # name lets glibc retry it under each resolv.conf `search` domain
+        # after an NXDOMAIN the client can force (any first label), so a
+        # wildcard record in the owner's own zone could answer for a name the
+        # allowlist never named. This spy never calls the real resolver.
+        asked: list[Any] = []
+        lock = threading.Lock()
+
+        def spy(host: Any, port: Any, family: int = 0, type: int = 0, proto: int = 0, flags: int = 0) -> Any:
+            with lock:
+                asked.append(host)
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (GLOBAL_A, 443))]
+
+        names = (ALLOWED, "youtube.com", "r1---sn-abc.googlevideo.com", "nosuch.youtube.com")
+        with mock.patch.object(server_module.socket, "getaddrinfo", side_effect=spy):
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertEqual(server_module.resolve_ipv4(name), [GLOBAL_A])
+                    self.assertEqual(asked[-1], name + ".")
+            # Acceptance through the server's default resolver: the tunnel is
+            # made, to the checked address, after one absolute lookup.
+            self.start(omit=("resolver",))
+            self.tunnel("m.youtube.com")
+        self.assertEqual(asked, [name + "." for name in names] + ["m.youtube.com."])
+        for host in asked:
+            self.assertTrue(host.endswith(".") and not host.endswith(".."), host)
+        self.assertEqual([call[0] for call in self.connector.calls], [GLOBAL_A])
 
 
 class ConnectTest(ForwarderTestCase):
@@ -1454,6 +1502,78 @@ class RelayCapsTest(ForwarderTestCase):
         # give about 2.0 s.
         self.assertGreaterEqual(outcomes[0].seconds, lifetime * 0.8)
         self.assertLess(outcomes[0].seconds, lifetime + delay / 2)
+
+    def test_lifetime_cuts_a_quiet_tunnel_on_time(self) -> None:
+        # G9: a tunnel that moves no byte after the accept, with a lifetime
+        # shorter than the idle timeout, ends at its lifetime and says so
+        # (not later, as "idle").
+        lifetime = 0.5
+        self.start(Limits(idle_timeout_seconds=5, lifetime_seconds=lifetime))
+        client, upstream = self.tunnel()
+        data, _reset = read_to_eof(client)
+        self.assertEqual(data, b"")
+        self.assertEqual(read_to_eof(upstream)[0], b"")
+        outcome = self.sink.wait(1)[0]
+        self.assertEqual((outcome.name, outcome.reason), (ALLOWED, "cut:lifetime"))
+        self.assertGreaterEqual(outcome.seconds, lifetime * 0.8)
+        self.assertLess(outcome.seconds, 1.5)
+        # Acceptance: a tunnel with a lifetime to spare is not cut while it
+        # stays within the idle timeout.
+        self.fresh()
+        self.start(Limits(idle_timeout_seconds=5, lifetime_seconds=30))
+        client, upstream = self.tunnel()
+        time.sleep(lifetime * 2)
+        client.sendall(b"still here")
+        self.assertEqual(recv_exact(upstream, 10), b"still here")
+        self.assertEqual(self.sink.snapshot(), [])
+
+    def test_idle_timeout_cuts_a_peer_that_stops_reading(self) -> None:
+        # G9: a send to a peer that reads nothing is bounded by the idle
+        # timeout too, not only by the lifetime, so a stalled peer can't pin
+        # a tunnel slot for the whole lifetime. The client here never reads
+        # and has a small receive buffer; the upstream keeps sending, so the
+        # forwarder ends up blocked in its send to the client.
+        idle = 0.5
+        self.start(Limits(idle_timeout_seconds=idle, lifetime_seconds=30))
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        client.settimeout(DEADLINE)
+        client.connect(("127.0.0.1", self.port))
+        client.sendall(connect_head(ALLOWED))
+        self.assertEqual(recv_head(client), ACCEPTED)
+        upstream = self.connector.upstreams[-1]
+        self.addCleanup(upstream.close)
+        # Well under download_bytes_per_tunnel (16 MiB), far more than the
+        # socket buffers on either side hold.
+        total = 8 << 20
+        writer: dict[str, Any] = {}
+
+        def write() -> None:
+            sent = 0
+            piece = b"d" * 65536
+            try:
+                while sent < total:
+                    sent += upstream.send(piece)
+                    writer["last"] = time.monotonic()
+                writer["result"] = "complete"
+            except OSError as error:
+                writer["result"] = type(error).__name__
+
+        thread = threading.Thread(target=write, daemon=True)
+        started = time.monotonic()
+        thread.start()
+        outcomes = self.sink.wait(1)
+        thread.join(DEADLINE)
+        self.assertTrue(outcomes, "a peer that stopped reading kept the tunnel open past the idle timeout")
+        outcome = outcomes[0]
+        self.assertEqual((outcome.name, outcome.reason), (ALLOWED, "cut:idle"))
+        self.assertLess(time.monotonic() - started, DEADLINE / 2)
+        # The forwarder stopped reading the upstream because its send to the
+        # client was stuck, so the writer never got its 8 MiB through: the
+        # cut came from the send, not from a quiet receive side.
+        self.assertNotEqual(writer.get("result"), "complete", "the forwarder never blocked on the client")
+        self.assertLess(outcome.download_bytes, total)
 
     def test_a_reset_ends_the_tunnel_ok_and_logs_nothing(self) -> None:
         # G9/G10: a peer that resets (or a send that fails) has gone, which
