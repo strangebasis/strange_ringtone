@@ -12,10 +12,8 @@ are refused before the forwarder resolves anything; T1's external-name probe
 runs only where no default route exists, on internal networks whose embedded
 DNS answers without forwarding (EngineTest fails where an older engine would
 forward); T2's reachability probes connect to container addresses, never to a
-name on the `outside` network. The resolver test runs under `--network none`
-against a fake DNS server on the container's own loopback. Every `docker run`
-passes `--pull never`, so a missing image is an error rather than a registry
-request.
+name on the `outside` network. Every `docker run` passes `--pull never`, so a
+missing image is an error rather than a registry request.
 
 Static checks (LayoutTest) read `docker compose config` and so still report
 the layout when the stack can't start; a missing service or network is a
@@ -925,6 +923,10 @@ class StackTest(unittest.TestCase):
 
 class ResolverSearchDomainTest(unittest.TestCase):
     """G5/G6 against the image's glibc: the forwarder looks up the absolute name, never one with a search domain."""
+
+    # Like every probe here, this sends nothing to an external host: it runs
+    # under `--network none` against a fake DNS server on the container's own
+    # loopback.
 
     # An allowed name with no record of its own: the client picks the first
     # label freely, so it can always force the NXDOMAIN that makes glibc try
