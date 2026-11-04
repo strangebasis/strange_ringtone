@@ -1811,6 +1811,143 @@ class RelayCapsTest(ForwarderTestCase):
         client.sendall(b"ok")
         self.assertEqual(recv_exact(upstream, 2), b"ok")
 
+    def test_a_lookup_that_outlives_the_lifetime_connects_nowhere(self) -> None:
+        # G8/G9 (RS3b-3, R4-F1, R4-F6): the connect step's end of life is the
+        # lifetime counted from accept, so time spent on the head and the
+        # lookup comes out of it. A slow lookup within resolve_deadline_seconds
+        # that answers after the lifetime has passed gets 504 connect_timeout
+        # with no attempt at all: counting from the connect step's start would
+        # attempt a connection and hold the slot past the lifetime, and an
+        # out-of-lifetime stop must answer as a timeout, not as 502.
+        lifetime = 1.0
+        late = 1.5
+        self.fresh({"slow.youtube.com": [GLOBAL_A, GLOBAL_B], ALLOWED: [GLOBAL_A]})
+        fake = self.resolver
+
+        def resolver(name: str, family: int) -> Sequence[str]:
+            answer = fake(name, family)
+            if name == "slow.youtube.com":
+                time.sleep(late)
+            return answer
+
+        self.start(
+            Limits(lifetime_seconds=lifetime, resolve_deadline_seconds=4 * late, tunnels_max_concurrent=1),
+            resolver=resolver,
+        )
+        sock = self.client()
+        sock.sendall(connect_head("slow.youtube.com"))
+        head = recv_head(sock)
+        self.assertEqual(head, refusal_head(504))
+        outcome = self.sink.wait(1)[0]
+        self.assertEqual(
+            (outcome.name, outcome.reason, outcome.upload_bytes, outcome.download_bytes),
+            ("slow.youtube.com", "refused:connect_timeout", 0, 0),
+        )
+        self.assertGreaterEqual(outcome.seconds, late - 0.05)
+        self.assertLess(outcome.seconds, late + DEADLINE / 2)
+        self.assertEqual(self.connector.calls, [], "no attempt once the lifetime from accept has passed")
+        self.assertEqual(fake.calls, [("slow.youtube.com", socket.AF_INET)])
+        # Acceptance: the outcome is reported after the slot is given back, so
+        # the only slot takes the next tunnel at once (no 503), and a prompt
+        # answer connects, with what is left of the lifetime as its timeout.
+        client, upstream = self.tunnel()
+        self.assertEqual([call[:2] for call in self.connector.calls], [(GLOBAL_A, 443)])
+        self.assertLessEqual(self.connector.calls[0][2], lifetime)
+        client.sendall(b"ok")
+        self.assertEqual(recv_exact(upstream, 2), b"ok")
+
+    def test_a_refusal_that_outlives_the_lifetime_answers_as_a_timeout(self) -> None:
+        # G8/G9 (RS3b-3, R4-F6): when the lifetime runs out between attempts,
+        # the answer is 504 connect_timeout even if the last attempt failed
+        # some other way: the tunnel ran out of time, it wasn't refused by
+        # every address. Here the first address is refused only after the
+        # attempt used up the rest of the lifetime, and the second is never
+        # tried.
+        lifetime = 1.0
+        self.fresh({"slow.youtube.com": [GLOBAL_A, GLOBAL_B], "quick.youtube.com": [GLOBAL_A, GLOBAL_B]})
+        attempts: list[tuple[str, float]] = []
+        lock = threading.Lock()
+        slow = threading.Event()
+
+        def connector(address: str, port: int, timeout: float) -> socket.socket:
+            with lock:
+                attempts.append((address, timeout))
+            if address == GLOBAL_A:
+                if slow.is_set():
+                    # The attempt's timeout is what is left of the lifetime,
+                    # so sleeping past it leaves none for the next address.
+                    time.sleep(timeout + 0.25)
+                raise ConnectionRefusedError("refused")
+            return self.connector(address, port, timeout)
+
+        self.start(Limits(lifetime_seconds=lifetime, tunnels_max_concurrent=1), connector=connector)
+        slow.set()
+        started = time.monotonic()
+        sock = self.client()
+        sock.sendall(connect_head("slow.youtube.com"))
+        head = recv_head(sock)
+        elapsed = time.monotonic() - started
+        self.assertEqual(head, refusal_head(504))
+        outcome = self.sink.wait(1)[0]
+        self.assertEqual(
+            (outcome.name, outcome.reason, outcome.upload_bytes, outcome.download_bytes),
+            ("slow.youtube.com", "refused:connect_timeout", 0, 0),
+        )
+        self.assertLess(outcome.seconds, lifetime + 0.9)
+        self.assertLess(elapsed, lifetime + 0.9)
+        with lock:
+            made = list(attempts)
+        self.assertEqual([address for address, _timeout in made], [GLOBAL_A], "the second address is never tried")
+        self.assertLessEqual(made[0][1], lifetime)
+        self.assertEqual(self.connector.calls, [])
+        # Acceptance: the same refusal within the lifetime falls through to
+        # the next address, so the 504 above comes from the lifetime alone.
+        slow.clear()
+        client, upstream = self.tunnel("quick.youtube.com")
+        with lock:
+            self.assertEqual([address for address, _timeout in attempts[1:]], [GLOBAL_A, GLOBAL_B])
+        client.sendall(b"ok")
+        self.assertEqual(recv_exact(upstream, 2), b"ok")
+
+    def test_the_forwarders_upload_window_lets_an_amount_go_within_a_second_of_the_minute(self) -> None:
+        # G9 (RS3-3, R4-F8): Window documents that an amount leaves at most
+        # `granularity` seconds late, and the Forwarder's upload window uses
+        # one second. So an amount relayed at t still counts until t + 60 (never
+        # early) and has left by t + 61 whatever was relayed after it; a
+        # coarser bucket would keep the budget shut for longer. Driven through
+        # the relay's own upload path, on the injected clock.
+        limit = 1500
+        end_of_life = time.monotonic() + 60 * DEADLINE
+
+        def upload(server: Forwarder, near: socket.socket, far: socket.socket, at: float, amount: int) -> bool:
+            # One chunk on a fresh tunnel's counts, so only the shared minute
+            # can refuse it; True when it was relayed.
+            self.clock.now = at
+            try:
+                server._upload(near, b"x" * amount, end_of_life, [0, 0])
+            except server_module._Cut as cut:
+                self.assertEqual(cut.token, "upload_rate")
+                return False
+            self.assertEqual(recv_exact(far, amount), b"x" * amount)
+            return True
+
+        for offset in (1.0 - 1 / 64, 1.0 + 1 / 64):
+            with self.subTest(second_add_after=offset):
+                self.fresh()
+                server = self.start(self.caps(upload_bytes_per_tunnel=limit, upload_bytes_per_minute=limit),
+                                    clock=self.clock)
+                near, far = socket.socketpair()
+                self.addCleanup(near.close)
+                self.addCleanup(far.close)
+                far.settimeout(DEADLINE)
+                start = 1000.0
+                self.assertIs(upload(server, near, far, start, limit - 1), True)
+                self.assertIs(upload(server, near, far, start + offset, 1), True)
+                # Full until the first amount's minute is over: never early.
+                self.assertIs(upload(server, near, far, start + 60 - 1 / 64, 1), False)
+                # By t + 60 + 1 the first amount has left, whatever came after.
+                self.assertIs(upload(server, near, far, start + 61, limit - 1), True)
+
 
 class LoggingTest(ForwarderTestCase):
     """G10: `forwarder refused|cut <reason> <name>` only, never payload or header text."""
