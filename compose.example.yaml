@@ -1,15 +1,15 @@
 # A hardened example of running the core (docs/PLAN.md 5.7) and, optionally,
 # the fetcher with its forwarder (section 6). Copy it into your own
 # infrastructure repository and adapt it there; this repository stays generic,
-# so it names no host, domain or proxy.
+# so it names no deployment's host, domain or reverse proxy.
 #
 #   cp .env.example .env    # then set PUBLIC_ORIGIN
 #   docker compose -f compose.example.yaml up -d core
 #   docker compose -f compose.example.yaml up -d    # with the fetcher too
 #
-# `docker compose up -d fetcher` also starts `fetcher-forwarder`, which the
-# fetcher depends on: a second command of the fetcher image, and the only
-# service with a route out.
+# `docker compose -f compose.example.yaml up -d fetcher` also starts
+# `fetcher-forwarder`, which the fetcher depends on: a second command of the
+# fetcher image, and the only service with a route out.
 #
 # The services publish no ports. A reverse proxy that terminates TLS joins
 # the `core` network and forwards to core:8080. With the fetcher, the proxy
@@ -26,10 +26,11 @@
 # `gateway_mode_ipv4: isolated`, which leaves the bridge without one. `egress`
 # is now the internal link between the fetcher and its forwarder (it used to
 # be the fetcher's way out); `outside` is the one network with a route out,
-# and only the forwarder joins it. This needs Docker Engine 28.2 or newer:
+# and only the forwarder joins it. This needs Docker Engine 28.0 or newer:
 # older engines forward DNS queries from internal networks to the host's
 # resolvers (CVE-2024-29018, fixed in 26.0), so the fetcher could resolve
-# external names, and the `isolated` gateway mode arrived in 28.2.
+# external names, and 28.0 is the release whose bridge driver accepts the
+# `isolated` gateway mode on an internal network (moby/moby#49262).
 #
 # Logs: every service rotates its json-file log (`logging:` below). The
 # Docker daemon doesn't rotate by default, and the forwarder logs every
@@ -262,7 +263,7 @@ networks:
   egress:
     # Between the fetcher and the forwarder only: no route out, no external
     # DNS (Engine 26.0 and newer) and no address on the host (the isolated
-    # gateway mode, Engine 28.2 and newer), so the forwarder is the fetcher's
+    # gateway mode, Engine 28.0 and newer), so the forwarder is the fetcher's
     # one way out.
     internal: true
     driver_opts:

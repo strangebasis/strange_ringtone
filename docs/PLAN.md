@@ -73,7 +73,7 @@ you care about, for example in Files.
 | 7 | Licence | **AGPL-3.0-or-later.** The full text, with the "how to apply" lines naming this project. | Section 13 of the licence: the UI must offer users the source (section 7.5). |
 | 8 | Releases | **release-please** opens release PRs from conventional commits | The release-please job needs `contents` and `pull-requests` write, and commit prefixes are mandatory (section 9.3). |
 | 9 | Tone names (2026-10-25) | **Readable Unicode.** iOS shows the download's filename as the tone name (section 5.6). | A bigger sanitiser and test set. Look-alike characters are possible, which is harmless for names on your own phone. |
-| 10 | Fetcher egress (2026-11-03) | **The fetcher image confines itself.** yt-dlp runs in a runner container on internal networks only, and its one way out is the image's own CONNECT forwarder, which allows YouTube's hosts on port 443 within budgets (section 6.1). No TLS interception. | Two more containers from the fetcher image. The gate confines the fetcher to Google's front ends, not to YouTube alone. Docker Engine 28.2 or newer. |
+| 10 | Fetcher egress (2026-11-03) | **The fetcher image confines itself.** yt-dlp runs in a runner container on internal networks only, and its one way out is the image's own CONNECT forwarder, which allows YouTube's hosts on port 443 within budgets (section 6.1). No TLS interception. | Two more containers from the fetcher image. The gate confines the fetcher to Google's front ends, not to YouTube alone. Docker Engine 28.0 or newer, the first with the isolated gateway mode that keeps the host off internal networks. |
 
 Phase 0 confirmed decision 2: the share sheet accepts `.m4a`, `.m4r` and
 `.mp3` up to 30.0 s. A `MAX_CLIP_SECONDS` above 30 only helps people who
@@ -342,7 +342,7 @@ the user types becomes the filename. Decision 9 keeps it readable:
 | Image | `ghcr.io/<owner>/strange_ringtone:<semver>`, consumed by digest, linux/amd64 |
 | User | UID 10001, GID 10001 (fixed, non-root) |
 | Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
-| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). In `compose.example.yaml` (from 6.1's PR A) that network is also isolated from the Docker host (`gateway_mode_ipv4: isolated`, Docker Engine 28.2 or newer), so the reverse proxy must be a container on it, not a process on the host, and the log rotates (json-file, `max-size: 10m`, `max-file: 3`). |
+| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). In `compose.example.yaml` (from 6.1's PR A) that network is also isolated from the Docker host (`gateway_mode_ipv4: isolated`, which needs Docker Engine 28.0 or newer, the release that added that mode), so the reverse proxy must be a container on it, not a process on the host, and the log rotates (json-file, `max-size: 10m`, `max-file: 3`). |
 | Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `(MAX_RESULTS + RENDER_CONCURRENCY) × MAX_CLIP_SECONDS × 33 kB + RENDER_CONCURRENCY × MAX_BODY_BYTES`: a result is 256 kbit/s AAC, at most 33 kB per second of clip with the MP4 overhead, and each running render also holds its upload. That is 63 MB with the defaults (use 64 MB) and 84 MB with `MAX_CLIP_SECONDS=40`. |
 | Health | `GET /healthz` returns 200 with an empty body |
 
@@ -484,10 +484,11 @@ forwarder. PR B will move yt-dlp into the runner and update them again.
   `http://fetcher-forwarder:3128`, and it refuses to start (exit 3) when its
   container has a default route, IPv4 or IPv6, or its route table can't be
   read, unless `FETCH_ALLOW_DEFAULT_ROUTE=true` says egress is filtered
-  another way. Docker Engine 28.2 or newer: engines before 26.0 forward DNS
+  another way. Docker Engine 28.0 or newer: engines before 26.0 forward DNS
   from internal networks, and the internal networks' `isolated` gateway mode,
-  which keeps the Docker host off them, arrived in 28.2. Settings: `PUBLIC_ORIGIN` (required),
-  `TRUSTED_PROXIES`, `FETCH_MAX_SECONDS` (600, at most 600: `decode.js`
+  which keeps the Docker host off them, arrived in 28.0 (moby/moby#49262).
+  Settings: `PUBLIC_ORIGIN` (required), `TRUSTED_PROXIES`,
+  `FETCH_MAX_SECONDS` (600, at most 600: `decode.js`
   refuses input over 10 minutes, so a longer video would be downloaded only
   for the phone to refuse it), `FETCH_MAX_BYTES` (40 MiB; 10 minutes of
   YouTube's AAC is about 10 MB), `FETCH_TIMEOUT_SECONDS` (120),
@@ -546,10 +547,11 @@ source of abuse.
 - `internal: true` alone does not keep the host out: the bridge still has a
   host address, and a container on it reaches every service the host listens
   on at that address or on all addresses (SSH, a TCP Docker API, admin
-  ports). The bridge driver's `gateway_mode_ipv4: isolated` (Engine 28.2)
-  leaves the bridge without one; connections to the host then fail, while
-  container-to-container traffic and the embedded DNS keep working (checked
-  on Engine 29.8 by the refute stage, 2026-11-03).
+  ports). The bridge driver's `gateway_mode_ipv4: isolated` leaves the
+  bridge without one. Engine 28.0.0 added that mode, accepted only on an
+  internal network (its release notes, moby/moby#49262). Connections to the
+  host then fail, while container-to-container traffic and the embedded DNS
+  keep working (checked on Engine 29.8 by the refute stage, 2026-11-03).
 - Python 3.12's `ipaddress` calls `64:ff9b::a9fe:a9fe` (NAT64 for
   169.254.169.254) and `::169.254.169.254` global.
 - A child with the same UID can read its parent's `/proc/<pid>/environ`, and
@@ -594,7 +596,7 @@ route out. Every service rotates its log (json-file, `max-size` and
   header on the app's origin.
 - **fetcher-forwarder** is the only container with a route out.
 - The core image doesn't change. Its example network becomes isolated from
-  the host too (`gateway_mode_ipv4: isolated`, Engine 28.2), so the reverse
+  the host too (`gateway_mode_ipv4: isolated`, Engine 28.0), so the reverse
   proxy must be a container on it, not a process on the host, and its log
   rotates.
 
@@ -638,8 +640,12 @@ test fails when the pinned yt-dlp's range no longer fits it.
 
 **Fail closed.** The fetcher (from PR A) and the runner (from PR B) refuse to
 start when their container has a default route, IPv4 or IPv6, or when the
-route tables can't be read, because something other than the forwarder could
-then carry traffic out. `FETCH_ALLOW_DEFAULT_ROUTE=true` turns the check off
+route tables can't be read or parsed (a missing `ipv6_route` alone means a
+kernel without IPv6), because something other than the forwarder could then
+carry traffic out. `/proc/net/route` lists the IPv4 main table only, so a
+default route in a table that an `ip rule` selects passes unseen; Docker's
+bridge driver sets up no such rule, and `cap_drop: [ALL]` keeps the container
+from adding one. `FETCH_ALLOW_DEFAULT_ROUTE=true` turns the check off
 where egress is filtered some other way (a Kubernetes NetworkPolicy, for
 example). The offline dev stack starts the fetcher without its entry point's
 check, so it needs nothing. The check replaces requiring `HTTPS_PROXY`, which
@@ -666,7 +672,8 @@ they are.
   - the forwarder's limits, named in the README (its log budget included)
   - `gateway_mode_ipv4: isolated` on the internal networks, and log rotation
     on every service
-  - Docker Engine 28.2 or newer
+  - Docker Engine 28.0 or newer (the first release with the isolated gateway
+    mode)
 - planned for PR B:
   - the runner command and the `jobs` network (`egress` moves from the
     fetcher to the runner)
@@ -697,19 +704,19 @@ they are.
   critical header-parsing bug and no address check after DNS; warnings about
   confused-deputy attacks from untrusted clients; and a large dependency tree.
 - **An environment variable that extends the allowlist.** A new YouTube host
-  means a release. This is a default the owner can overrule before PR A.
+  means a release. PR A ships this default; the owner can still overrule it.
 
 **Accepted risks.** A compromised runner can still reach other Google
 services through the shared front ends, within the forwarder's budgets.
 YouTube stays a command channel. Docker Engine before 26.0 leaks DNS from
-internal networks, and before 28.2 has no way to keep the host off them,
-which is why the contract requires 28.2. The forwarder is our own code at the
-boundary, so it stays small. It listens on all its interfaces, `outside`
-included, where the Docker host can reach port 3128 (Engine 28 and newer drop
-direct routing to unpublished ports from elsewhere); nothing else may join
-`outside`. Until PR B, a compromised forwarder shares `egress` with the
-fetcher and can reach its port 8080 there, where the fetcher's Origin and
-rate checks still apply. Binding the forwarder to its `egress` address alone
+internal networks, and before 28.0 has no way to keep the host off them
+(28.0 added the isolated gateway mode), which is why the contract requires
+28.0. The forwarder is our own code at the boundary, so it stays small. It
+listens on all its interfaces, `outside` included, where the Docker host can
+reach port 3128 (Engine 28 and newer drop direct routing to unpublished
+ports from elsewhere); nothing else may join `outside`. Until PR B, a
+compromised forwarder shares `egress` with the fetcher and can reach its port
+8080 there, where the fetcher's Origin and rate checks still apply. Binding the forwarder to its `egress` address alone
 would need a fixed subnet in the example, which is the owner's call.
 
 Until PR B, yt-dlp, yt-dlp-ejs and Deno run inside the fetcher container: on
@@ -1284,6 +1291,7 @@ docs/PLAN.md
 - [Tailscale Serve (identity headers)](https://tailscale.com/kb/1312/serve)
 - [SSD Nodes: Tailscale free plan limits](https://www.ssdnodes.com/learn/tailscale-pricing-explained)
 - [Docker Engine 26.0 release notes (CVE-2024-29018, DNS from internal networks)](https://docs.docker.com/engine/release-notes/26.0/)
+- [Docker Engine 28 release notes (28.0.0: the `isolated` gateway mode for internal bridge networks, moby/moby#49262)](https://docs.docker.com/engine/release-notes/28/)
 - [OSV MAL-2026-4770: a PyPI package that runs code through a `.pth` file](https://osv.dev/vulnerability/MAL-2026-4770)
 - [Smokescreen, Stripe's egress proxy](https://github.com/stripe/smokescreen)
 - [Zulip: outgoing proxies with Docker Compose](https://zulip.readthedocs.io/projects/docker/en/latest/how-to/compose-outgoing-proxy.html)

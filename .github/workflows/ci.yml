@@ -146,7 +146,7 @@ jobs:
     # The only test of the layout (docs/PLAN.md 6.1, T1 to T3): the fetcher
     # image brought up with compose.example.yaml itself, the fetcher on
     # internal networks and the forwarder the only way out, with no YouTube
-    # traffic. The engine must be 28.2 or newer, as the contract says.
+    # traffic. The engine must be 28.0 or newer, as the contract says.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

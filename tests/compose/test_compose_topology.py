@@ -57,9 +57,10 @@ FORWARDER_COMMAND = ["python", "-I", "/app/fetcher/forwarder.py"]
 # venv's interpreter, which holds yt-dlp (docs/PLAN.md 6.1, I1).
 FETCHER_COMMAND = ["python", "-I", "/app/fetcher"]
 # The engine release that added the bridge driver's `isolated` gateway mode,
-# which the internal networks use so the Docker host has no address on them
-# (it also has the CVE-2024-29018 DNS fix of 26.0).
-ENGINE_FLOOR = (28, 2)
+# which the internal networks use so the Docker host has no address on them:
+# Docker Engine 28.0.0 (release notes, moby/moby#49262), which accepts it on
+# an internal network only. It also has the CVE-2024-29018 DNS fix of 26.0.
+ENGINE_FLOOR = (28, 0)
 GATEWAY_MODE = "com.docker.network.bridge.gateway_mode_ipv4"
 INTERNAL_NETWORKS = ("core", "fetcher", "egress")
 # Every service's log rotates, so a flood of refusals can't fill the host's disk.
@@ -511,7 +512,7 @@ class EngineTest(unittest.TestCase):
 
 
     def test_docker_engine_supports_the_isolated_gateway_mode(self) -> None:
-        """Engine 28.2+ (supporting T1): the internal networks' `isolated` gateway mode; a failure, not a skip."""
+        """Engine 28.0+ (supporting T1): the internal networks' `isolated` gateway mode; a failure, not a skip."""
         try:
             result = _docker("version", "--format", "{{.Server.Version}}", timeout=60)
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -525,8 +526,9 @@ class EngineTest(unittest.TestCase):
         self.assertGreaterEqual(
             found,
             ENGINE_FLOOR,
-            f"Docker Engine {ENGINE_FLOOR[0]}.{ENGINE_FLOOR[1]} or newer is required (the bridge driver's "
-            f"isolated gateway mode, which keeps the Docker host off the internal networks); found {version}",
+            f"Docker Engine {ENGINE_FLOOR[0]}.{ENGINE_FLOOR[1]} or newer is required (the release that added "
+            f"the bridge driver's isolated gateway mode, which keeps the Docker host off the internal "
+            f"networks); found {version}",
         )
 
 

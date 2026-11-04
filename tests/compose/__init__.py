@@ -2,7 +2,7 @@
 
 They start real containers on real Docker networks (the fetcher on internal
 networks only, the forwarder the only way out), so they need Docker Engine
-26.0 or newer and the fetcher image already built; they publish no port and
+28.0 or newer and the fetcher image already built; they publish no port and
 send nothing to YouTube or any other external host. Without
 STRANGE_RINGTONE_COMPOSE_TESTS=1, raising SkipTest here makes the host's
 `unittest discover -s tests` report this package as skipped instead of
