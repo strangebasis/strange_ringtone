@@ -28,6 +28,7 @@ import os
 import re
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -97,6 +98,7 @@ LIMIT_FIELDS = [
     "lifetime_seconds",
     "resolve_deadline_seconds",
     "connect_timeout_seconds",
+    "log_lines_per_minute",
 ]
 
 # The whole forwarder package may import exactly these (SPEC 3.2): no os, io,
@@ -814,6 +816,46 @@ class AddressPolicyTest(ForwarderTestCase):
                     policy.check_addresses([GLOBAL_A, text], ALLOWED)
                 self.assertEqual(raised.exception.status, 403)
 
+    def test_non_text_answers_are_refused_403(self) -> None:
+        # G5: an answer must be text. IPv4Address also takes an int or packed
+        # bytes; those and None fail the canonical-text check as well, but an
+        # object that prints as a global address and compares equal to that
+        # text passes every check but the type check, so it pins that one.
+        class TextLookalike:
+            def __str__(self) -> str:
+                return GLOBAL_A
+
+            def __eq__(self, other: object) -> bool:
+                return other == GLOBAL_A
+
+            def __ne__(self, other: object) -> bool:
+                return other != GLOBAL_A
+
+            __hash__ = object.__hash__
+
+        cases: dict[str, list[Any]] = {
+            "int": [int(ipaddress.IPv4Address(GLOBAL_A))],
+            "packed": [ipaddress.IPv4Address(GLOBAL_A).packed],
+            "none": [None],
+            "text_lookalike": [TextLookalike()],
+            "lookalike_after_text": [GLOBAL_B, TextLookalike()],
+        }
+        for label, answer in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(Refusal) as raised:
+                    policy.check_addresses(answer, ALLOWED)
+                self.assertEqual((raised.exception.status, raised.exception.reason, raised.exception.name),
+                                 (403, "not_global", ALLOWED))
+                self.fresh({ALLOWED: answer})
+                self.start()
+                self.assert_refused(connect_head(ALLOWED), 403)
+                self.assertEqual(self.connector.calls, [])
+        # Acceptance: the same address as text connects.
+        self.fresh({ALLOWED: [GLOBAL_A]})
+        self.start()
+        self.tunnel()
+        self.assertEqual([call[0] for call in self.connector.calls], [GLOBAL_A])
+
     def test_all_global_answers_are_accepted(self) -> None:
         # G5 (acceptance): order kept, duplicates dropped.
         self.assertEqual(policy.check_addresses([GLOBAL_A, GLOBAL_B, GLOBAL_A], ALLOWED),
@@ -1198,6 +1240,23 @@ class BudgetsTest(ForwarderTestCase):
         # The window is real: a third tunnel in the same minute is refused.
         self.assert_refused(connect_head(ALLOWED), 429)
 
+    def test_a_busy_refusal_takes_no_place_in_the_minute(self) -> None:
+        # G8: the slot is taken before the minute, so a 503 records nothing
+        # in the per-minute window (a client hammering a full forwarder must
+        # not use up the minute for the tunnels that follow).
+        self.start(Limits(tunnels_max_concurrent=1, tunnels_per_minute=3), clock=self.clock)
+        held = self.tunnel()
+        for _ in range(2):
+            self.assert_refused(connect_head("m.youtube.com"), 503)
+        self.assertEqual([o.reason for o in self.sink.wait(2)], ["refused:busy", "refused:busy"])
+        self.close_tunnel(*held, expected=3)
+        # Two more in the same minute: 1 + 2 = 3, the window's limit.
+        for _ in range(2):
+            client, upstream = self.tunnel_when_free()
+            self.close_tunnel(client, upstream, len(self.sink.snapshot()) + 1)
+        # The window is real: a fourth tunnel in the same minute is refused.
+        self.assert_refused(connect_head(ALLOWED), 429)
+
 
 class WindowTest(unittest.TestCase):
     """G8, G9: the sliding 60-second budget behind tunnels_per_minute and upload_bytes_per_minute."""
@@ -1282,6 +1341,35 @@ class RelayCapsTest(ForwarderTestCase):
         self.assertEqual(recv_exact(upstream, 900), b"c" * 900)
         self.close_tunnel(client, upstream, 3)
 
+    def test_a_chunk_cut_by_the_tunnel_cap_takes_nothing_from_the_minute(self) -> None:
+        # G9: the per-tunnel cap is checked before the shared minute, so the
+        # chunk that cuts a tunnel is neither relayed nor charged: the minute
+        # still holds exactly what was relayed, and the rest of its budget
+        # passes through later tunnels.
+        self.start(self.caps(), clock=self.clock)
+        client, upstream = self.tunnel()
+        client.sendall(b"x" * 1001)
+        relayed, _reset = read_to_eof(upstream)
+        first = self.sink.wait(1)[0]
+        self.assertEqual(first.reason, "cut:upload_cap")
+        self.assertEqual(len(relayed), first.upload_bytes)
+        left = 1500 - first.upload_bytes
+        sent = 0
+        count = 1
+        while sent < left:
+            size = min(1000, left - sent)
+            client, upstream = self.tunnel()
+            client.sendall(b"y" * size)
+            self.assertEqual(recv_exact(upstream, size), b"y" * size, "the cut chunk was charged to the minute")
+            count += 1
+            self.close_tunnel(client, upstream, count)
+            sent += size
+        # And the minute is then really spent.
+        client, upstream = self.tunnel()
+        client.sendall(b"z")
+        self.assertEqual(read_to_eof(upstream)[0], b"")
+        self.assertEqual(self.sink.wait(count + 1)[count].reason, "cut:upload_rate")
+
     def test_download_bytes_per_tunnel_cut(self) -> None:
         # G9: exactly the cap passes; the chunk that would pass it cuts.
         self.start(self.caps(), clock=self.clock)
@@ -1340,6 +1428,57 @@ class RelayCapsTest(ForwarderTestCase):
         self.assertEqual((outcomes[0].name, outcomes[0].reason), (ALLOWED, "cut:lifetime"))
         self.assertGreaterEqual(outcomes[0].seconds, lifetime * 0.8)
         self.assertLess(time.monotonic() - started, 4)
+
+    def test_lifetime_runs_from_accept_not_from_the_head(self) -> None:
+        # G9: the time a client takes over its head counts against the
+        # lifetime, so a slow head can't extend a tunnel past it.
+        lifetime = 1.2
+        delay = 0.8
+        self.start(Limits(idle_timeout_seconds=5, lifetime_seconds=lifetime, head_deadline_seconds=5))
+        client = self.client()
+        connected = time.monotonic()
+        time.sleep(delay)
+        client.sendall(connect_head(ALLOWED))
+        self.assertEqual(recv_head(client), ACCEPTED)
+        self.addCleanup(self.connector.upstreams[-1].close)
+        while time.monotonic() - connected < 5 and not self.sink.snapshot():
+            try:
+                client.sendall(b"t")
+            except OSError:
+                break
+            time.sleep(0.1)
+        outcomes = self.sink.wait(1, timeout=1)
+        self.assertTrue(outcomes, "a busy tunnel outlived its lifetime")
+        self.assertEqual((outcomes[0].name, outcomes[0].reason), (ALLOWED, "cut:lifetime"))
+        # About 1.2 s from accept; a lifetime counted from the head would
+        # give about 2.0 s.
+        self.assertGreaterEqual(outcomes[0].seconds, lifetime * 0.8)
+        self.assertLess(outcomes[0].seconds, lifetime + delay / 2)
+
+    def test_a_reset_ends_the_tunnel_ok_and_logs_nothing(self) -> None:
+        # G9/G10: a peer that resets (or a send that fails) has gone, which
+        # ends the tunnel as EOF would: reason "ok", no log line, no error.
+        recorded = OutcomeSink()
+
+        def sink(outcome: Outcome) -> None:
+            server_module.log_outcome(outcome, self.log)
+            recorded(outcome)
+
+        self.start(sink=sink)
+        client, upstream = self.tunnel()
+        client.sendall(b"c" * 10)
+        self.assertEqual(recv_exact(upstream, 10), b"c" * 10)
+        # SO_LINGER on with a zero timeout: close() sends a RST, not a FIN.
+        # struct linger is two ints on Linux and two u_shorts on Windows.
+        linger = struct.pack("HH" if sys.platform == "win32" else "ii", 1, 0)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+        client.close()
+        self.assertEqual(read_to_eof(upstream)[0], b"")
+        outcome = recorded.wait(1)[0]
+        self.assertEqual((outcome.name, outcome.reason, outcome.upload_bytes), (ALLOWED, "ok", 10))
+        time.sleep(SETTLE)
+        self.assertEqual(self.log.getvalue(), "")
+        self.assertEqual(self.stderr.getvalue(), "")
 
     def test_eof_on_either_side_ends_the_tunnel_ok(self) -> None:
         # G9: TLS clients don't half-close, so one side's EOF ends both.
@@ -1553,6 +1692,114 @@ class LoggingTest(ForwarderTestCase):
             self.request(b"GET / HTTP/1.1\r\n\r\n")
             self.assertEqual(self.wait_lines(later, 1), ["forwarder refused method -"])
         self.assertEqual(self.stderr.getvalue(), "")
+
+    def test_the_log_checks_every_name_again(self) -> None:
+        # G10: whatever builds an Outcome, a name outside the hostname grammar
+        # is printed as '-', both by log_outcome and by the server's default
+        # sink; and a 405's name is the host part only when it is valid.
+        for name in ("a\nforged", "a b", "ev;il", "x\x1b[2J"):
+            with self.subTest(name=name):
+                buffer = io.StringIO()
+                server_module.log_outcome(Outcome(name, "refused:unlisted", 0, 0, 0.0), buffer)
+                self.assertEqual(buffer.getvalue(), "forwarder refused unlisted -\n")
+        self.assert_refusal_raised(b"POST ev;il:443 HTTP/1.1\r\n\r\n", 405, "method", None)
+        self.assert_refusal_raised(b"POST a\x1b[2J:443 HTTP/1.1\r\n\r\n", 400, "malformed", None)
+        # Acceptance: a valid host part is kept.
+        self.assert_refusal_raised(b"POST www.example.invalid:443 HTTP/1.1\r\n\r\n", 405, "method",
+                                   "www.example.invalid")
+        server = self.start(sink=None)
+        server.sink(Outcome("a\nforged", "cut:idle", 0, 0, 0.0))
+        self.request(b"POST ev;il:443 HTTP/1.1\r\n\r\n")
+        self.request(b"POST www.example.invalid:443 HTTP/1.1\r\n\r\n")
+        lines = self.wait_lines(self.log, 3)
+        time.sleep(SETTLE)
+        self.assertEqual(self.log.lines(), ["forwarder cut idle -", "forwarder refused method -",
+                                            "forwarder refused method www.example.invalid"], lines)
+        self.assertNotIn("forged", self.log.getvalue())
+        self.assertNotIn("ev;il", self.log.getvalue())
+
+    def test_every_line_is_flushed(self) -> None:
+        # G10: a line still in a block-buffered stream when the container is
+        # stopped is lost, so each one is flushed as it is written.
+        class FlushRecorder(io.TextIOBase):
+            def __init__(self) -> None:
+                super().__init__()
+                self._lock = threading.Lock()
+                self.pending = ""
+                self.flushed = ""
+
+            def write(self, text: str) -> int:
+                with self._lock:
+                    self.pending += text
+                return len(text)
+
+            def flush(self) -> None:
+                with self._lock:
+                    self.flushed += self.pending
+                    self.pending = ""
+
+        stream = FlushRecorder()
+        server_module.log_outcome(Outcome(ALLOWED, "refused:busy", 0, 0, 0.0), stream)
+        self.assertEqual((stream.pending, stream.flushed), ("", "forwarder refused busy www.youtube.com\n"))
+        stream = FlushRecorder()
+        self.start(sink=None, log=stream)
+        self.request(b"GET / HTTP/1.1\r\n\r\n")
+        self.assertTrue(wait_until(lambda: "forwarder refused method -\n" in stream.flushed),
+                        f"the line was not flushed: pending {stream.pending!r}")
+        self.assertEqual(stream.pending, "")
+
+    def test_an_unexpected_error_logs_its_type_only(self) -> None:
+        # G10: a bug escaping as an exception is reported as one line naming
+        # its type: no traceback and no message, either of which could quote
+        # bytes a client sent.
+        def broken_sink(outcome: Outcome) -> None:
+            raise RuntimeError("secret-token from the client")
+
+        self.start(sink=broken_sink, omit=("log",))
+        status, _head = self.request(b"GET / HTTP/1.1\r\nCookie: secret-token\r\n\r\n")
+        self.assertEqual(status, 405)
+        self.assertTrue(wait_until(lambda: self.stderr.getvalue().endswith("\n")), "nothing was reported")
+        time.sleep(SETTLE)
+        self.assertEqual(self.stderr.getvalue(), "forwarder error RuntimeError\n")
+        # With a log injected, the line goes there and stderr stays quiet.
+        self.fresh()
+        before = self.stderr.getvalue()
+        self.start(sink=broken_sink)
+        self.request(b"GET / HTTP/1.1\r\n\r\n")
+        self.assertEqual(self.wait_lines(self.log, 1), ["forwarder error RuntimeError"])
+        time.sleep(SETTLE)
+        self.assertEqual(self.stderr.getvalue(), before)
+
+    def test_log_lines_are_rate_limited(self) -> None:
+        # G10/G8: refusals cost no tunnel budget, so the log has its own: at
+        # most log_lines_per_minute lines per sliding minute, the rest
+        # dropped and counted, and the count printed once there is room.
+        server = self.start(Limits(log_lines_per_minute=5), clock=self.clock, sink=None)
+        # Outcomes that log nothing take no budget.
+        for _ in range(10):
+            server.sink(Outcome(ALLOWED, "ok", 1, 1, 0.1))
+            server.sink(Outcome(None, "refused:empty", 0, 0, 0.0))
+        for _ in range(50):
+            server.sink(Outcome("example.invalid", "refused:unlisted", 0, 0, 0.0))
+        self.assertEqual(self.log.lines(), ["forwarder refused unlisted example.invalid"] * 5)
+        # Still the same minute: dropped and counted.
+        self.clock.now += 59
+        server.sink(Outcome(None, "refused:method", 0, 0, 0.0))
+        self.assertEqual(len(self.log.lines()), 5)
+        # A minute after the five: the count, then the line.
+        self.clock.now += 2
+        server.sink(Outcome(None, "refused:method", 0, 0, 0.0))
+        self.assertEqual(self.log.lines()[5:], ["forwarder log suppressed 46", "forwarder refused method -"])
+        server.sink(Outcome(None, "refused:method", 0, 0, 0.0))
+        self.assertEqual(self.log.lines()[7:], ["forwarder refused method -"])
+        # The live server's own refusals go through the same budget.
+        self.fresh()
+        self.start(Limits(log_lines_per_minute=3), clock=self.clock, sink=None)
+        for _ in range(10):
+            self.assert_refused(b"GET / HTTP/1.1\r\n\r\n", 405)
+        self.wait_lines(self.log, 3)
+        time.sleep(SETTLE)
+        self.assertEqual(self.log.lines(), ["forwarder refused method -"] * 3)
 
 
 class ServerClassTest(ForwarderTestCase):

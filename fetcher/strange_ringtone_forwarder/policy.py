@@ -67,6 +67,11 @@ class Limits:
     lifetime_seconds: int = 300
     resolve_deadline_seconds: int = 5
     connect_timeout_seconds: int = 10
+    # Lines the default log writes per sliding minute. Refusals cost a client
+    # no tunnel budget, so without this a compromised fetcher could write log
+    # lines as fast as the forwarder answers and fill the Docker host's disk.
+    # 600 keeps an operator's view of a real incident; the rest are counted.
+    log_lines_per_minute: int = 600
 
 
 DEFAULT_LIMITS = Limits()

@@ -364,6 +364,7 @@ compares this table with the code.
 | `lifetime_seconds` | 300 | Seconds from accepting a connection after which its tunnel is cut, however busy |
 | `resolve_deadline_seconds` | 5 | Seconds the IPv4 lookup may take; a slower one gets 504 |
 | `connect_timeout_seconds` | 10 | Seconds for each connection attempt to a checked address; when every address fails, the answer is 504 if the last attempt timed out and 502 otherwise |
+| `log_lines_per_minute` | 600 | Log lines in any 60-second window; more are dropped and counted, and one `forwarder log suppressed <n>` line reports them once the window has room again |
 
 How these relate to `FETCH_MAX_BYTES`: the pinned yt-dlp downloads
 googlevideo audio in ranges of at most 10 MiB (`http_chunk_size`), one

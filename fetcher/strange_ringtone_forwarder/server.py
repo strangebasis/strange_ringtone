@@ -92,21 +92,34 @@ def connect(address: str, port: int, timeout: float) -> socket.socket:
     return socket.create_connection((address, port), timeout)
 
 
-def log_outcome(outcome: Outcome, log: TextIO) -> None:
-    """The default sink: one line for refusals (except "refused:empty") and cuts, nothing for "ok".
+def outcome_line(outcome: Outcome) -> str | None:
+    """The log line for an outcome, or None when it logs nothing ("ok", "refused:empty").
 
     Format: f"forwarder {kind} {token} {outcome.name or '-'}\\n" where kind is
-    "refused" or "cut" and token the part after the colon. Accepted tunnels
-    and empty connections (health checks) log nothing, so the log holds only
-    what an operator must look at, and never payload or header text (G10).
+    "refused" or "cut" and token the part after the colon.
     """
     kind, _, token = outcome.reason.partition(":")
     if kind not in ("refused", "cut") or outcome.reason == "refused:empty":
-        return
+        return None
     # The name is checked again here, not only where it was parsed: whatever
     # builds an Outcome, nothing outside the hostname grammar is printed.
     name = loggable_name(outcome.name) if outcome.name is not None else None
-    log.write(f"forwarder {kind} {token} {name or '-'}\n")
+    return f"forwarder {kind} {token} {name or '-'}\n"
+
+
+def log_outcome(outcome: Outcome, log: TextIO) -> None:
+    """One line for refusals (except "refused:empty") and cuts, nothing for "ok" (outcome_line).
+
+    Accepted tunnels and empty connections (health checks) log nothing, so
+    the log holds only what an operator must look at, and never payload or
+    header text (G10). Flushed per line, so a block-buffered stream loses no
+    refusal when the container stops. The Forwarder's default sink writes
+    through this function under its log_lines_per_minute budget.
+    """
+    line = outcome_line(outcome)
+    if line is None:
+        return
+    log.write(line)
     log.flush()
 
 
@@ -201,13 +214,43 @@ class Forwarder(socketserver.ThreadingTCPServer):
         # tunnels can't add up to more than one minute's budget.
         self._tunnel_window = Window(limits.tunnels_per_minute, clock)
         self._upload_window = Window(limits.upload_bytes_per_minute, clock)
+        # The log's own budget: refusals cost no tunnel budget, so this is
+        # what stops a client from filling the host's disk with log lines.
+        # Lines over it are dropped and counted, and the count is printed
+        # once the window has room again. The lock keeps that count and the
+        # line order consistent across tunnel threads.
+        self._log_window = Window(limits.log_lines_per_minute, clock)
+        self._log_lock = threading.Lock()
+        self._log_suppressed = 0
         if ":" in address[0]:
             self.address_family = socket.AF_INET6
         super().__init__(address, TunnelHandler)
 
     def _log_outcome(self, outcome: Outcome) -> None:
-        # Looked up per line, so a stderr redirected after start is honoured.
-        log_outcome(outcome, self.log if self.log is not None else sys.stderr)
+        # The default sink. Outcomes that log nothing take no log budget.
+        line = outcome_line(outcome)
+        if line is not None:
+            self._write_log(line)
+
+    def _write_log(self, line: str) -> None:
+        """Write one line to the log within log_lines_per_minute, or count it as suppressed.
+
+        At most log_lines_per_minute lines per sliding minute, plus one
+        `forwarder log suppressed <n>` line when the window has room again
+        after dropping n lines, so a flood costs the host a bounded amount of
+        disk and the operator still sees that it happened.
+        """
+        with self._log_lock:
+            if not self._log_window.add(1):
+                self._log_suppressed += 1
+                return
+            # Looked up per line, so a stderr redirected after start is honoured.
+            log = self.log if self.log is not None else sys.stderr
+            if self._log_suppressed:
+                log.write(f"forwarder log suppressed {self._log_suppressed}\n")
+                self._log_suppressed = 0
+            log.write(line)
+            log.flush()
 
     def server_bind(self) -> None:
         """TCPServer.server_bind only: no socket.getfqdn(), a reverse DNS lookup nobody needs (as FetchServer)."""
@@ -238,9 +281,10 @@ class Forwarder(socketserver.ThreadingTCPServer):
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         # One line with the exception's type and no traceback: a traceback or
-        # a message could quote bytes a client sent (G10).
+        # a message could quote bytes a client sent (G10). It goes to the
+        # same log, under the same budget, as every other line.
         error = sys.exc_info()[1]
-        sys.stderr.write(f"forwarder error {type(error).__name__}\n")
+        self._write_log(f"forwarder error {type(error).__name__}\n")
 
     def handle_tunnel(self, client: socket.socket) -> None:
         """Steps 1 to 6 for one accepted connection; always closes client; always calls the sink exactly once.
