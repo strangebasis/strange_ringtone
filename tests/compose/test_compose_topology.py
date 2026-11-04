@@ -86,6 +86,14 @@ IP_FORWARD = "net.ipv4.ip_forward"
 SERVICE_FIXED_THREADS = 1 + 1
 JOB_THREADS = 2
 YTDLP_RUN_THREADS = 1 + 1 + 2 + 63
+# ICMP redirects (compose.example.yaml). With forwarding off the kernel takes a
+# redirect when `all` or the receiving interface says 1, and turning forwarding
+# off sets `all` to 1, so the fetcher-image services set all, default and lo
+# through `sysctls`, and each interface Docker attaches through the endpoint
+# sysctl of its network attachment (IFNAME is that interface).
+ACCEPT_REDIRECTS_SYSCTLS = tuple(f"net.ipv4.conf.{name}.accept_redirects" for name in ("all", "default", "lo"))
+ENDPOINT_SYSCTLS = "com.docker.network.endpoint.sysctls"
+IFNAME_ACCEPT_REDIRECTS = "net.ipv4.conf.IFNAME.accept_redirects"
 
 
 def _worst_case_threads() -> dict[str, int]:
@@ -352,6 +360,18 @@ print(json.dumps({
     'ipv6_disabled': per_interface('ipv6', 'disable_ipv6'),
     'pids_max': read('/sys/fs/cgroup/pids.max') or read('/sys/fs/cgroup/pids/pids.max'),
 }))
+"""
+
+# Every IPv4 accept_redirects value the container's kernel holds: all, default
+# and one per interface, lo included.
+_REDIRECTS_PROBE = r"""
+import json, os
+base = '/proc/sys/net/ipv4/conf'
+values = {}
+for name in sorted(os.listdir(base)):
+    with open(base + '/' + name + '/accept_redirects') as handle:
+        values[name] = handle.read().strip()
+print(json.dumps(values))
 """
 
 # http.client to loopback, as the service's own healthcheck does.
@@ -862,6 +882,29 @@ class LayoutTest(unittest.TestCase):
                     f"raise it with the cap, and the sizing in compose.example.yaml's comment and the README",
                 )
 
+    def test_the_fetcher_and_its_forwarder_refuse_icmp_redirects(self) -> None:
+        """T2 (static): accept_redirects 0 for all, default and lo, and on the interface of every network attachment."""
+        for name in FETCHER_IMAGE_SERVICES:
+            with self.subTest(service=name):
+                service = self._service(name)
+                sysctls = service.get("sysctls") or {}
+                self.assertIsInstance(sysctls, dict, sysctls)
+                # Forwarding off sets `all` to 1, and with forwarding off any
+                # one value of 1 on the path lets a redirect in.
+                for key in ACCEPT_REDIRECTS_SYSCTLS:
+                    self.assertEqual(str(sysctls.get(key)), "0", f"{name}: {key} in {sysctls!r}")
+                networks = service.get("networks") or {}
+                self.assertIsInstance(networks, dict, networks)
+                self.assertTrue(networks, f"{name} joins no network")
+                for network, attachment in networks.items():
+                    options = (attachment or {}).get("driver_opts") or {}
+                    entries = [entry.strip() for entry in str(options.get(ENDPOINT_SYSCTLS, "")).split(",")]
+                    values = [entry.partition("=")[2] for entry in entries
+                              if entry.partition("=")[0] == IFNAME_ACCEPT_REDIRECTS]
+                    # Exactly one setting, 0: interface names follow the attach
+                    # order, so each attachment sets its own interface.
+                    self.assertEqual(values, ["0"], f"{name} on {network}: {options!r}")
+
 
 class StackTest(unittest.TestCase):
     """The running layout: routes, reachability and the forwarder's gate (T1, T2, T3)."""
@@ -1100,6 +1143,20 @@ class StackTest(unittest.TestCase):
                 # kernel has IPv6 at all.
                 self.assertTrue({value for value in state["ipv6"].values()} <= {"0", None}, state)
                 self.assertEqual(state["pids_max"], str(expected), state)
+
+    def test_t2_the_running_services_refuse_icmp_redirects(self) -> None:
+        """T2: in the running fetcher and forwarder, every accept_redirects value reads 0 (all, default, lo, eth)."""
+        for service in FETCHER_IMAGE_SERVICES:
+            with self.subTest(service=service):
+                values = self._probe_output(self._stack.exec_in(service, _REDIRECTS_PROBE), f"{service} redirects")
+                # Control: all, default, lo and one interface per network the
+                # container is on, so the zeros are read from every interface.
+                networks = self._addresses(service)
+                interfaces = sorted(name for name in values if name not in ("all", "default", "lo"))
+                self.assertLessEqual({"all", "default", "lo"}, set(values), values)
+                self.assertEqual(len(interfaces), len(networks), f"{values} for {sorted(networks)}")
+                self.assertEqual(len(interfaces), 2, values)
+                self.assertEqual({name: value for name, value in values.items() if value != "0"}, {}, values)
 
     # T2
 
