@@ -44,9 +44,13 @@ is authoritative.
   its subdomains and the subdomains of `googlevideo.com`, decides everything
   before DNS, resolves IPv4 only and connects only to global unicast addresses
   it checked, within fixed byte, time and tunnel budgets. The fetcher itself
-  runs on internal networks only, reaches YouTube through `HTTPS_PROXY`
-  pointing at the forwarder, and refuses to start with a default route unless
-  `FETCH_ALLOW_DEFAULT_ROUTE=true` (docs/PLAN.md 6.1).
+  runs on internal networks only, which Docker's isolated gateway modes (IPv4
+  and IPv6) keep off the host, reaches YouTube through `HTTPS_PROXY` pointing
+  at the forwarder, and refuses to start with a default route unless
+  `FETCH_ALLOW_DEFAULT_ROUTE=true`. Both containers turn forwarding off on
+  every interface and refuse ICMP redirects (never by writing
+  `net.ipv4.ip_forward`, which resets the redirect setting), and each has a
+  `pids_limit` of at least twice its worst case (docs/PLAN.md 6.1).
 - **Container contract:** a fixed non-root UID/GID, `read_only`, `cap_drop: [ALL]`,
   `no-new-privileges`, and one plain-HTTP port per container (8080 for the
   servers, 3128 for the forwarder command). **Stateless:** it writes only to
@@ -90,7 +94,7 @@ is authoritative.
 python -I -m unittest discover -s tests        # all tests, stdlib only
 ruff check .                                   # ruff from .github/lint/requirements.txt (--require-hashes)
 python -I tools/spike/phase0.py                # regenerate the iOS test tones into spike-out/ (needs local ffmpeg)
-STRANGE_RINGTONE_COMPOSE_TESTS=1 python -I -m unittest discover -s tests/compose -t tests -v   # compose topology tests (built fetcher image, Docker Engine 28.0+)
+STRANGE_RINGTONE_COMPOSE_TESTS=1 python -I -m unittest discover -s tests/compose -t tests -v   # compose topology tests (built fetcher image, Docker Engine 28.0+, Docker Compose 2.27.1+)
 ```
 
 To recompile ruff's lock, edit `.github/lint/requirements.in`, then run the
@@ -155,5 +159,7 @@ starts enforcing once `.release-please-manifest.json` records a release.
 Development happens on Windows with Git Bash and Docker Desktop. A throwaway
 `docker run --rm --network none` with a unique name and no published ports is
 fine, and so is the compose topology tests' stack (a unique project name, no
-published ports, removed when they finish). Don't publish ports on the LAN from
-this machine.
+published ports, removed when they finish), including its throwaway networks,
+a `--network host` probe that reads the host's interfaces or listens on one
+test bridge's private address, and a root helper with only `NET_ADMIN` on
+throwaway bridges. Don't publish ports on the LAN from this machine.
