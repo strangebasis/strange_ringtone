@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from strange_ringtone.config import (
     ConfigError,
     _optional,
+    _parse_bool,
     _parse_int,
     _parse_public_origin,
     _parse_trusted_proxies,
@@ -87,6 +88,10 @@ class Settings:
             rate_limit_fetches_per_minute=_parse_int(environ, "RATE_LIMIT_FETCHES_PER_MINUTE", 5, 1),
             fetch_result_ttl_seconds=_parse_int(environ, "FETCH_RESULT_TTL_SECONDS", 600, 1),
             proxies=_parse_proxies(environ),
+            # The core's boolean words only, unstripped: a value the parser
+            # doesn't know is a configuration error, so a typo never turns
+            # the start check off (docs/PLAN.md 6.1, S2).
+            allow_default_route=_parse_bool(environ, "FETCH_ALLOW_DEFAULT_ROUTE", False),
         )
 
 
