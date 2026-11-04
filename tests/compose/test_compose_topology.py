@@ -62,6 +62,12 @@ FETCHER_COMMAND = ["python", "-I", "/app/fetcher"]
 # an internal network only. It also has the CVE-2024-29018 DNS fix of 26.0.
 ENGINE_FLOOR = (28, 0)
 GATEWAY_MODE = "com.docker.network.bridge.gateway_mode_ipv4"
+# The IPv4 mode covers IPv4 only: with IPv6 turned on for a network, the host
+# gets an IPv6 address on its bridge again unless this mode is set as well.
+GATEWAY_MODE_V6 = "com.docker.network.bridge.gateway_mode_ipv6"
+# A port for the IPv6 control's listener in the host's network namespace,
+# bound only to the control bridge's own address.
+V6_CONTROL_PORT = 18081
 INTERNAL_NETWORKS = ("core", "fetcher", "egress")
 # Every service's log rotates, so a flood of refusals can't fill the host's disk.
 LOGGING = {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}}
@@ -198,6 +204,85 @@ for name in BRIDGES:
 print(json.dumps(out))
 """
 
+# Run in the host's network namespace: whether each named interface exists
+# there (/proc/net/dev, which shows the reader's own netns) and its IPv6
+# addresses (/proc/net/if_inet6), canonical text. A bridge without IPv6 is
+# absent from if_inet6; the existence check makes "no address" mean something.
+_BRIDGE_V6_PROBE = r"""
+import ipaddress, json
+with open('/proc/net/dev', encoding='ascii') as handle:
+    present = {line.split(':', 1)[0].strip() for line in handle.read().splitlines()[2:] if ':' in line}
+found = {}
+try:
+    with open('/proc/net/if_inet6', encoding='ascii') as handle:
+        lines = handle.read().splitlines()
+except FileNotFoundError:
+    lines = []
+for line in lines:
+    fields = line.split()
+    if len(fields) != 6:
+        raise SystemExit('unexpected /proc/net/if_inet6 line')
+    found.setdefault(fields[5], []).append(str(ipaddress.IPv6Address(int(fields[0], 16))))
+print(json.dumps({name: {'present': name in present, 'ipv6': sorted(found.get(name, []))} for name in BRIDGES}))
+"""
+
+# Inside a container: each interface's disable_ipv6 and IPv6 addresses. An
+# interface with IPv6 disabled, or with no IPv6 address, can't reach the host
+# over IPv6 whatever the bridge holds.
+_IFACE_V6_PROBE = r"""
+import ipaddress, json
+found = {}
+try:
+    with open('/proc/net/if_inet6', encoding='ascii') as handle:
+        lines = handle.read().splitlines()
+except FileNotFoundError:
+    lines = []
+for line in lines:
+    fields = line.split()
+    if len(fields) != 6:
+        raise SystemExit('unexpected /proc/net/if_inet6 line')
+    found.setdefault(fields[5], []).append(str(ipaddress.IPv6Address(int(fields[0], 16))))
+with open('/proc/net/dev', encoding='ascii') as handle:
+    names = sorted(line.split(':', 1)[0].strip() for line in handle.read().splitlines()[2:] if ':' in line)
+out = {}
+for name in names:
+    try:
+        with open(f'/proc/sys/net/ipv6/conf/{name}/disable_ipv6', encoding='ascii') as handle:
+            disabled = handle.read().strip()
+    except FileNotFoundError:
+        disabled = 'absent'
+    out[name] = {'disable_ipv6': disabled, 'ipv6': sorted(found.get(name, []))}
+print(json.dumps(out))
+"""
+
+# Connect to each IPv6 target on PORT and read what the listener says; the
+# outcome is 'connected:<banner>' or the exception's class name.
+_V6_CONNECT_PROBE = r"""
+import json, socket
+out = {}
+for target in TARGETS:
+    try:
+        with socket.create_connection((target, PORT), timeout=TIMEOUT) as connection:
+            out[target] = 'connected:' + connection.recv(64).decode('ascii', 'replace')
+    except OSError as error:
+        out[target] = type(error).__name__
+print(json.dumps(out))
+"""
+
+# A listener in the host's network namespace, bound to one address only (the
+# IPv6 control's bridge address, never all interfaces): it answers each
+# connection with a fixed banner, so the probe can tell it reached the host.
+_HOST_LISTENER = r"""
+import socket
+with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as server:
+    server.bind((ADDRESS, PORT))
+    server.listen(8)
+    while True:
+        connection, _peer = server.accept()
+        with connection:
+            connection.sendall(b'host-reached')
+"""
+
 # PID 1 of a service container is its command; the arguments are NUL-separated.
 _CMDLINE_PROBE = r"""
 import json
@@ -311,6 +396,14 @@ def _request_probe(host: str, port: int, requests: list[bytes]) -> str:
 
 def _bridge_probe(bridges: list[str]) -> str:
     return f"BRIDGES = {bridges!r}\n" + _BRIDGE_PROBE
+
+
+def _bridge_v6_probe(bridges: list[str]) -> str:
+    return f"BRIDGES = {bridges!r}\n" + _BRIDGE_V6_PROBE
+
+
+def _v6_connect_probe(targets: list[str], port: int) -> str:
+    return f"TARGETS = {targets!r}\nPORT = {port!r}\nTIMEOUT = {PROBE_TIMEOUT!r}\n" + _V6_CONNECT_PROBE
 
 
 def _health_probe() -> str:
@@ -612,6 +705,20 @@ class LayoutTest(unittest.TestCase):
         outside = (networks["outside"].get("driver_opts") or {}).get(GATEWAY_MODE)
         self.assertNotEqual(outside, "isolated", "outside needs its gateway: it is the forwarder's route out")
 
+    def test_internal_networks_give_the_host_no_ipv6_address_either(self) -> None:
+        """T1/T2 (static): every internal network also sets the IPv6 isolated mode; `outside` doesn't."""
+        networks = self._config().get("networks") or {}
+        for name in INTERNAL_NETWORKS:
+            with self.subTest(network=name):
+                self.assertIn(name, networks, f"compose.example.yaml has no {name!r} network")
+                options = networks[name].get("driver_opts") or {}
+                # The IPv4 mode alone gives the host an IPv6 address on the
+                # bridge again once IPv6 is turned on for the network.
+                self.assertEqual(options.get(GATEWAY_MODE_V6), "isolated", f"{name} gives the host an IPv6 address")
+        self.assertIn("outside", networks)
+        outside = (networks["outside"].get("driver_opts") or {}).get(GATEWAY_MODE_V6)
+        self.assertNotEqual(outside, "isolated", "outside needs its gateway: it is the forwarder's route out")
+
     def test_every_service_rotates_its_log(self) -> None:
         """Supporting (G10): a json-file log with max-size and max-file on every service, so no log fills the disk."""
         for name, service in self._services().items():
@@ -832,6 +939,45 @@ class StackTest(unittest.TestCase):
             self.assertEqual(addresses.get(bridges[network]), "EADDRNOTAVAIL",
                              f"the host has an address on {network}: {addresses}")
 
+    def test_t1_the_host_has_no_ipv6_address_the_fetcher_can_reach(self) -> None:
+        """T1: the `fetcher` and `egress` bridges hold no IPv6 host address but link-local; the fetcher has no IPv6."""
+        bridges: dict[str, str] = {}
+        for name in ("fetcher", "egress", "outside"):
+            network = self._stack.network(name)
+            result = _docker("network", "inspect", "--format", "{{json .}}", network, timeout=PROBE_RUN_TIMEOUT)
+            self.assertEqual(result.returncode, 0, f"docker network inspect {network}: {result.stderr.strip()}")
+            info = json.loads(result.stdout)
+            bridges[name] = "br-" + info["Id"][:12]
+            if name != "outside":
+                self.assertEqual((info.get("Options") or {}).get(GATEWAY_MODE_V6), "isolated", network)
+        name = self._stack.container_name("host-v6-probe")
+        seen = self._probe_output(
+            self._stack.docker_run(
+                "--rm", "--name", name, "--network", "host", *HARDENING, IMAGE,
+                "python", "-I", "-c", _bridge_v6_probe(sorted(bridges.values())),
+            ),
+            "host IPv6 bridge probe",
+        )
+        # Control: the probe runs in the host's netns and finds all three
+        # bridges, so an empty address list is a fact, not a wrong namespace.
+        for network, bridge in bridges.items():
+            self.assertIs((seen.get(bridge) or {}).get("present"), True, f"{network} bridge not found: {seen}")
+        for network in ("fetcher", "egress"):
+            # A bridge may keep an fe80:: link-local address; nothing else.
+            routable = [address for address in seen[bridges[network]]["ipv6"]
+                        if not ipaddress.IPv6Address(address).is_link_local]
+            self.assertEqual(routable, [], f"the host has an IPv6 address on {network}: {seen}")
+        # And the running fetcher has IPv6 off (or no address) on every
+        # interface but loopback, so even a link-local host address is out
+        # of its reach.
+        interfaces = self._probe_output(self._stack.exec_in("fetcher", _IFACE_V6_PROBE), "fetcher IPv6 probe")
+        others = {name: state for name, state in interfaces.items() if name != "lo"}
+        # Control: the fetcher is on two networks, so two interfaces.
+        self.assertEqual(len(others), 2, interfaces)
+        for interface, state in others.items():
+            self.assertTrue(state["disable_ipv6"] == "1" or not state["ipv6"],
+                            f"the fetcher has IPv6 on {interface}: {interfaces}")
+
     def test_the_image_and_the_services_run_the_base_interpreter_isolated(self) -> None:
         """I1: the image's CMD and both running services use the base interpreter with -I, never the venv's."""
         result = _docker("image", "inspect", "--format", "{{json .Config.Cmd}}", IMAGE, timeout=PROBE_RUN_TIMEOUT)
@@ -921,6 +1067,117 @@ class StackTest(unittest.TestCase):
                 self.assertNotIn(marker, line, f"request text reached the log: {line!r}")
             if line.startswith("forwarder "):
                 self.assertRegex(line, FORWARDER_LOG_RE)
+
+
+class Ipv6HostIsolationTest(unittest.TestCase):
+    """T1 on IPv6: an internal network with IPv6 turned on and the example's options gives the host no address.
+
+    The example's networks have no IPv6, but an operator can turn it on
+    (`enable_ipv6: true`, or the daemon's `default-network-opts`) without
+    touching the fetcher. The test creates two throwaway internal networks
+    with IPv6, both named after a unique project: one with the `driver_opts`
+    that compose.example.yaml gives `egress`, and a control with the IPv4
+    isolated mode alone, where the host keeps an IPv6 address and a hardened
+    container reaches a listener the test binds to it. Nothing is published
+    and nothing leaves the host: the listener is bound to the control
+    bridge's own address.
+    """
+
+    def setUp(self) -> None:
+        self.stack = Stack()
+        self.addCleanup(self.stack.close)
+
+    def _network(self, suffix: str, options: dict[str, str]) -> str:
+        name = self.stack.network(suffix)
+        argv = ["network", "create", "--internal", "--ipv6"]
+        for key, value in sorted(options.items()):
+            argv += ["-o", f"{key}={value}"]
+        result = _docker(*argv, name, timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, f"docker network create {name}: {result.stderr.strip()}")
+        # Cleanups run last in, first out: the containers on it go first.
+        self.addCleanup(_docker, "network", "rm", name, timeout=60)
+        return name
+
+    def _container(self, suffix: str) -> str:
+        name = f"{self.stack.project}-{suffix}"
+        self.addCleanup(_docker, "rm", "-f", name, timeout=60)
+        return name
+
+    def _inspect(self, network: str) -> dict[str, Any]:
+        result = _docker("network", "inspect", "--format", "{{json .}}", network, timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, f"docker network inspect {network}: {result.stderr.strip()}")
+        return json.loads(result.stdout)
+
+    def _output(self, result: subprocess.CompletedProcess[str], what: str) -> Any:
+        self.assertEqual(result.returncode, 0, f"{what} failed: {result.stderr.strip()}")
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines, f"{what} printed nothing: {result.stderr.strip()}")
+        return json.loads(lines[-1])
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        # --pull never: a missing image must fail here, not fetch from a registry.
+        return _docker("run", "--pull", "never", *args, timeout=PROBE_RUN_TIMEOUT)
+
+    def test_an_ipv6_internal_network_with_the_examples_options_gives_the_host_no_address(self) -> None:
+        """Both isolated modes: no IPv6 on the host's bridge; the IPv4 mode alone: the host is reachable (control)."""
+        config = self.stack.compose("config", "--format", "json")
+        self.assertEqual(config.returncode, 0, f"docker compose config: {config.stderr.strip()}")
+        egress = (json.loads(config.stdout).get("networks") or {}).get("egress") or {}
+        options = dict(egress.get("driver_opts") or {})
+        self.assertEqual(options.get(GATEWAY_MODE), "isolated", options)
+        isolated = self._network("v6-isolated", options)
+        control = self._network("v6-control", {GATEWAY_MODE: "isolated"})
+        bridges = {name: "br-" + self._inspect(name)["Id"][:12] for name in (isolated, control)}
+        # A bridge comes up, and gets its addresses, once a container is on it.
+        for network, suffix in ((isolated, "v6-sleeper-isolated"), (control, "v6-sleeper-control")):
+            started = self._run(
+                "-d", "--rm", "--name", self._container(suffix), "--network", network, *HARDENING, IMAGE,
+                "python", "-I", "-c", "import time; time.sleep(300)",
+            )
+            self.assertEqual(started.returncode, 0, started.stderr.strip())
+        seen = self._output(
+            self._run("--rm", "--name", self._container("v6-host-probe"), "--network", "host", *HARDENING, IMAGE,
+                      "python", "-I", "-c", _bridge_v6_probe(sorted(bridges.values()))),
+            "host IPv6 bridge probe",
+        )
+        for network, bridge in bridges.items():
+            self.assertIs((seen.get(bridge) or {}).get("present"), True, f"{network} bridge not found: {seen}")
+        # Control: with the IPv4 mode alone the host holds a routable IPv6
+        # address on the bridge, and a hardened container reaches a host
+        # listener on it. Without this the assertion below proves nothing.
+        routable = [address for address in seen[bridges[control]]["ipv6"]
+                    if not ipaddress.IPv6Address(address).is_link_local]
+        self.assertTrue(routable, f"control: the host has no IPv6 address on {control}: {seen}")
+        listener = self._run(
+            "-d", "--rm", "--name", self._container("v6-listener"), "--network", "host", *HARDENING, IMAGE,
+            "python", "-I", "-c", f"ADDRESS = {routable[0]!r}\nPORT = {V6_CONTROL_PORT!r}\n" + _HOST_LISTENER,
+        )
+        self.assertEqual(listener.returncode, 0, listener.stderr.strip())
+        deadline = time.monotonic() + OVERRIDE_HEALTH_SECONDS
+        attempt = 0
+        while True:
+            attempt += 1
+            reached = self._output(
+                self._run("--rm", "--name", self._container(f"v6-control-probe-{attempt}"),
+                          "--network", control, *HARDENING, IMAGE,
+                          "python", "-I", "-c", _v6_connect_probe([routable[0]], V6_CONTROL_PORT)),
+                "control reachability probe",
+            )
+            if reached.get(routable[0]) == "connected:host-reached" or time.monotonic() > deadline:
+                break
+            time.sleep(0.5)
+        self.assertEqual(reached.get(routable[0]), "connected:host-reached",
+                         f"control: the host listener was not reachable over IPv6: {reached}")
+        # The example's options: the host's bridge has no IPv6 address at
+        # all, link-local included, so a container there has nothing of the
+        # host's to connect to.
+        self.assertEqual(seen[bridges[isolated]]["ipv6"], [],
+                         f"the host has an IPv6 address on {isolated}: {seen}")
+        subnets = [entry for entry in (self._inspect(isolated).get("IPAM") or {}).get("Config") or []
+                   if ":" in (entry.get("Subnet") or "")]
+        self.assertTrue(subnets, f"{isolated} has no IPv6 subnet")
+        self.assertFalse(any(entry.get("Gateway") for entry in subnets),
+                         f"{isolated} gives the host an IPv6 gateway: {subnets}")
 
 
 class ResolverSearchDomainTest(unittest.TestCase):

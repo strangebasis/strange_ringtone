@@ -19,18 +19,31 @@
 # Docker host no address (see Networks below), so a proxy running on the
 # host itself, or with `network_mode: host`, can't reach core or fetcher.
 #
+# A proxy kept in another Compose project (the usual case) declares these
+# networks `external: true` under their real names, the project name plus the
+# network name: `strange_ringtone_core` and `strange_ringtone_fetcher`, which
+# exist once this file is up. It reaches the fetcher as fetcher:8080, which
+# resolves to the fetcher's address on `fetcher`. The fetcher is on `egress`
+# too, where the proxy can't reach it, so a proxy that discovers backends
+# from container labels must be told to use the `fetcher` network.
+#
 # Networks: `core`, `fetcher` and `egress` are internal, with no route out,
 # and isolated from the Docker host: `internal: true` alone still gives the
 # host an address on each bridge, through which a container reaches every
 # service the host listens on (SSH, admin ports), so these networks also set
-# `gateway_mode_ipv4: isolated`, which leaves the bridge without one. `egress`
-# is now the internal link between the fetcher and its forwarder (it used to
-# be the fetcher's way out); `outside` is the one network with a route out,
-# and only the forwarder joins it. This needs Docker Engine 28.0 or newer:
-# older engines forward DNS queries from internal networks to the host's
-# resolvers (CVE-2024-29018, fixed in 26.0), so the fetcher could resolve
-# external names, and 28.0 is the release whose bridge driver accepts the
-# `isolated` gateway mode on an internal network (moby/moby#49262).
+# `gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`, which
+# leave the bridge without one. Both, because the IPv4 mode alone covers IPv4
+# only: where IPv6 is turned on for these networks (`enable_ipv6: true`, or
+# the daemon's `default-network-opts`), the host gets an IPv6 address on the
+# bridge again unless the IPv6 mode is set too. The IPv6 option is accepted,
+# and harmless, on a network without IPv6. `egress` is now the internal link
+# between the fetcher and its forwarder (it used to be the fetcher's way out);
+# `outside` is the one network with a route out, and only the forwarder joins
+# it. This needs Docker Engine 28.0 or newer: older engines forward DNS
+# queries from internal networks to the host's resolvers (CVE-2024-29018,
+# fixed in 26.0), so the fetcher could resolve external names, and 28.0 is
+# the release whose bridge driver accepts the `isolated` gateway modes on an
+# internal network (moby/moby#49262).
 #
 # Logs: every service rotates its json-file log (`logging:` below). The
 # Docker daemon doesn't rotate by default, and the forwarder logs every
@@ -97,7 +110,7 @@ services:
     # port on loopback and set PUBLIC_ORIGIN=http://127.0.0.1:8080 in .env.
     # An internal network has no port publishing, so also switch `core`
     # below to a normal network, and drop its `driver_opts`, while you do:
-    # Docker refuses the isolated gateway mode on a network that isn't
+    # Docker refuses the isolated gateway modes on a network that isn't
     # internal.
     # ports:
     #   - "127.0.0.1:8080:8080"
@@ -249,25 +262,31 @@ networks:
     # isolated: the bridge gets no address on the Docker host, so nothing on
     # this network reaches the host's own services either (internal: true
     # alone leaves the host reachable through the bridge's gateway address).
+    # One mode per address family: the IPv4 mode alone leaves the host an
+    # IPv6 address on the bridge as soon as IPv6 is turned on for the
+    # network, so both are set, whether or not it has IPv6 today.
     # Container-to-container traffic and service names work as before, but
     # the host has no route to the containers here: the reverse proxy must
     # be a container on this network, not a process on the host.
     driver_opts:
       com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
   fetcher:
     # Between the proxy and the fetcher only, with no route out of its own,
-    # and isolated from the host as `core` is.
+    # and isolated from the host as `core` is, on IPv4 and IPv6.
     internal: true
     driver_opts:
       com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
   egress:
     # Between the fetcher and the forwarder only: no route out, no external
-    # DNS (Engine 26.0 and newer) and no address on the host (the isolated
-    # gateway mode, Engine 28.0 and newer), so the forwarder is the fetcher's
-    # one way out.
+    # DNS (Engine 26.0 and newer) and no host address on IPv4 or IPv6 (the
+    # isolated gateway modes, Engine 28.0 and newer), so the forwarder is
+    # the fetcher's one way out.
     internal: true
     driver_opts:
       com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
   outside:
     # The one network with a route out, for the forwarder only, so it keeps
     # its gateway (the route out goes through it). The core and the fetcher

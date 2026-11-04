@@ -342,7 +342,7 @@ the user types becomes the filename. Decision 9 keeps it readable:
 | Image | `ghcr.io/<owner>/strange_ringtone:<semver>`, consumed by digest, linux/amd64 |
 | User | UID 10001, GID 10001 (fixed, non-root) |
 | Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
-| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). In `compose.example.yaml` (from 6.1's PR A) that network is also isolated from the Docker host (`gateway_mode_ipv4: isolated`, which needs Docker Engine 28.0 or newer, the release that added that mode), so the reverse proxy must be a container on it, not a process on the host, and the log rotates (json-file, `max-size: 10m`, `max-file: 3`). |
+| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). In `compose.example.yaml` (from 6.1's PR A) that network is also isolated from the Docker host (`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`, both, so the host stays off it if IPv6 is ever turned on for it; they need Docker Engine 28.0 or newer, the release that added those modes), so the reverse proxy must be a container on it, not a process on the host, and the log rotates (json-file, `max-size: 10m`, `max-file: 3`). |
 | Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `(MAX_RESULTS + RENDER_CONCURRENCY) × MAX_CLIP_SECONDS × 33 kB + RENDER_CONCURRENCY × MAX_BODY_BYTES`: a result is 256 kbit/s AAC, at most 33 kB per second of clip with the MP4 overhead, and each running render also holds its upload. That is 63 MB with the defaults (use 64 MB) and 84 MB with `MAX_CLIP_SECONDS=40`. |
 | Health | `GET /healthz` returns 200 with an empty body |
 
@@ -365,8 +365,9 @@ The core has no secrets in v0.1.0, so `.env.example` holds only
 `PUBLIC_ORIGIN=` and commented optional settings. Any later secret arrives as
 `*_FILE`, with no usable default. The same file carries the optional fetcher's
 settings in a block of their own, all commented out; `compose.example.yaml`
-gives both services that one `.env`, and each server reads only its own
-variables (`PUBLIC_ORIGIN` and `TRUSTED_PROXIES` are shared).
+gives the core and the fetcher that one `.env` (the forwarder reads none),
+and each server reads only its own variables (`PUBLIC_ORIGIN` and
+`TRUSTED_PROXIES` are shared).
 
 The fetcher image is a second, separate contract with its own table in the
 README (section 6, "Fetcher contract"). Nothing in it changes the core's: the
@@ -482,11 +483,12 @@ forwarder. PR B will move yt-dlp into the runner and update them again.
   it gets them **only through the forwarder** (6.1): it sits on internal
   networks only, `compose.example.yaml` sets its `HTTPS_PROXY` to
   `http://fetcher-forwarder:3128`, and it refuses to start (exit 3) when its
-  container has a default route, IPv4 or IPv6, or its route table can't be
-  read, unless `FETCH_ALLOW_DEFAULT_ROUTE=true` says egress is filtered
+  container has a default route, IPv4 or IPv6, or when it can't read or
+  parse its route tables, unless `FETCH_ALLOW_DEFAULT_ROUTE=true` says egress is filtered
   another way. Docker Engine 28.0 or newer: engines before 26.0 forward DNS
-  from internal networks, and the internal networks' `isolated` gateway mode,
-  which keeps the Docker host off them, arrived in 28.0 (moby/moby#49262).
+  from internal networks, and the internal networks' `isolated` gateway
+  modes, which keep the Docker host off them, arrived in 28.0
+  (moby/moby#49262).
   Settings: `PUBLIC_ORIGIN` (required), `TRUSTED_PROXIES`,
   `FETCH_MAX_SECONDS` (600, at most 600: `decode.js`
   refuses input over 10 minutes, so a longer video would be downloaded only
@@ -548,10 +550,30 @@ source of abuse.
   host address, and a container on it reaches every service the host listens
   on at that address or on all addresses (SSH, a TCP Docker API, admin
   ports). The bridge driver's `gateway_mode_ipv4: isolated` leaves the
-  bridge without one. Engine 28.0.0 added that mode, accepted only on an
-  internal network (its release notes, moby/moby#49262). Connections to the
-  host then fail, while container-to-container traffic and the embedded DNS
-  keep working (checked on Engine 29.8 by the refute stage, 2026-11-03).
+  bridge without an IPv4 address, and `gateway_mode_ipv6: isolated` without
+  an IPv6 one. Engine 28.0.0 added both modes, accepted only on an internal
+  network (its release notes, moby/moby#49262). Connections to the host
+  then fail, while container-to-container traffic and the embedded DNS keep
+  working (checked on Engine 29.8 by the refute stage, 2026-11-03).
+- The modes are per address family. On an internal network with IPv6
+  turned on (`enable_ipv6: true`, or a daemon `default-network-opts` that
+  turns it on for every new network) and the IPv4 mode alone, the host
+  gets an IPv6 address on the bridge again, and a container there reaches
+  the host's services on `::`. With both modes the bridge holds no IPv6
+  address at all. The IPv6 mode is accepted on a network without IPv6, where
+  the bridge keeps at most a link-local `fe80::` address and Docker turns
+  IPv6 off on the containers' interfaces (checked on Engine 29.8 by the
+  refute stage, 2026-11-04).
+- Inside every container of the stack `net.ipv4.ip_forward` is 1 (a new
+  network namespace copies it from the host's, where dockerd turns it on),
+  so the forwarder, with an interface on `egress` and on `outside`, would
+  route a packet that reached it for an off-link destination. Nothing can
+  hand it one: the fetcher's only routes are its on-link subnets, it has no
+  capability to add a route or craft a frame, and the host has no address
+  on the isolated networks. The design tolerates this dormant router;
+  `sysctls: {net.ipv4.ip_forward: "0"}` on the fetcher and the forwarder
+  would remove it without a capability, and is the owner's call (a new
+  contract flag).
 - Python 3.12's `ipaddress` calls `64:ff9b::a9fe:a9fe` (NAT64 for
   169.254.169.254) and `::169.254.169.254` global.
 - A child with the same UID can read its parent's `/proc/<pid>/environ`, and
@@ -564,8 +586,9 @@ source of abuse.
 
 **Layout.** The fetcher image runs as three containers. Every network but
 `outside` is `internal: true` and isolated from the host
-(`gateway_mode_ipv4: isolated`); `outside` keeps its gateway, the forwarder's
-route out. Every service rotates its log (json-file, `max-size` and
+(`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`, so turning
+IPv6 on for them doesn't bring the host back); `outside` keeps its gateway,
+the forwarder's route out. Every service rotates its log (json-file, `max-size` and
 `max-file`), so a flood of refusals can't fill the host's disk.
 
 ```
@@ -596,9 +619,12 @@ route out. Every service rotates its log (json-file, `max-size` and
   header on the app's origin.
 - **fetcher-forwarder** is the only container with a route out.
 - The core image doesn't change. Its example network becomes isolated from
-  the host too (`gateway_mode_ipv4: isolated`, Engine 28.0), so the reverse
+  the host too (both isolated gateway modes, Engine 28.0), so the reverse
   proxy must be a container on it, not a process on the host, and its log
-  rotates.
+  rotates. A proxy kept in another Compose project joins the networks as
+  external ones under their project-scoped names (`strange_ringtone_core`,
+  `strange_ringtone_fetcher`) and is told to use the fetcher's address on
+  `fetcher`, not on `egress`.
 
 PR A's interim layout has two containers: the fetcher on `fetcher` and
 `egress`, and the forwarder on `egress` and `outside`.
@@ -619,7 +645,8 @@ request head per connection and never parses anything after it. In order:
    Refuse unless every address is global unicast. IPv4 only sidesteps the
    NAT64 and IPv4-compatible forms above.
 5. Connect to an address that passed, without resolving again, and answer
-   `200`. Then copy bytes both ways within caps: upload bytes per tunnel and
+   `200`. The attempts stop at the tunnel's lifetime, since the tunnel's
+   slot is already held. Then copy bytes both ways within caps: upload bytes per tunnel and
    per minute (yt-dlp sends requests, never large bodies), download bytes per
    tunnel, an idle timeout and a lifetime.
 6. Log refusals and cut tunnels with the name and the reason only, never
@@ -645,7 +672,11 @@ kernel without IPv6), because something other than the forwarder could then
 carry traffic out. `/proc/net/route` lists the IPv4 main table only, so a
 default route in a table that an `ip rule` selects passes unseen; Docker's
 bridge driver sets up no such rule, and `cap_drop: [ALL]` keeps the container
-from adding one. `FETCH_ALLOW_DEFAULT_ROUTE=true` turns the check off
+from adding one. The check looks for a `/0` route only: routes that together
+cover every address without one (a VPN client's `0.0.0.0/1` and
+`128.0.0.0/1`) pass it, and an IPv4 `unreachable default` counts as a
+default route while IPv6 skips reject routes. Neither is reachable by the
+attacker in scope, who can't add routes and runs only after the check. `FETCH_ALLOW_DEFAULT_ROUTE=true` turns the check off
 where egress is filtered some other way (a Kubernetes NetworkPolicy, for
 example). The offline dev stack starts the fetcher without its entry point's
 check, so it needs nothing. The check replaces requiring `HTTPS_PROXY`, which
@@ -670,10 +701,10 @@ they are.
   - `HTTPS_PROXY` pointing at the forwarder (set on the fetcher service by
     `compose.example.yaml`)
   - the forwarder's limits, named in the README (its log budget included)
-  - `gateway_mode_ipv4: isolated` on the internal networks, and log rotation
-    on every service
+  - `gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated` on the
+    internal networks, and log rotation on every service
   - Docker Engine 28.0 or newer (the first release with the isolated gateway
-    mode)
+    modes)
 - planned for PR B:
   - the runner command and the `jobs` network (`egress` moves from the
     fetcher to the runner)
@@ -749,9 +780,9 @@ test to fail.
 | R2 | The runner builds yt-dlp's environment from scratch, with the proxy settings | unit (today's tests move) | PR B |
 | R3 | The runner deletes its job directory in `finally`, and the audio once collected or after a deadline | unit | PR B |
 | S1 | The fetcher caps, times out and re-validates everything the runner returns | unit, with a fake runner | PR B |
-| S2 | The fetcher (PR A) and the runner (PR B) refuse to start with a default route, or an unreadable route table, unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`), in-image and Compose topology tests | PR A (the fetcher), PR B (the runner) |
+| S2 | The fetcher (PR A) and the runner (PR B) refuse to start with a default route, or an unreadable or unparsable route table, unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`), in-image and Compose topology tests | PR A (the fetcher), PR B (the runner) |
 | I1 | The base interpreter's site-packages hold no third-party distribution and no `.pth` file, and its `sys.path` leaves out the venv | in-image | PR A |
-| T1 | In the compose layout, the fetcher (PR A) and the runner (PR B) have no default route and resolve no external name, and the host has no address on their internal networks; the forwarder has the only default route, and the fetcher image refuses to start on `outside` unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | Compose topology tests | PR A, extended in PR B |
+| T1 | In the compose layout, the fetcher (PR A) and the runner (PR B) have no default route and resolve no external name, and the host has no IPv4 or IPv6 address on their internal networks (also with IPv6 turned on for such a network); the forwarder has the only default route, and the fetcher image refuses to start on `outside` unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | Compose topology tests | PR A, extended in PR B |
 | T2 | PR A: the fetcher reaches the forwarder over `egress`, the forwarder reaches nothing on the `fetcher` network and nothing there reaches it. PR B: the runner reaches the forwarder and nothing on the `fetcher` network, and the fetcher can't reach the forwarder | Compose topology tests | PR A, reworded in PR B |
 | T3 | The running forwarder refuses an unlisted name, an IP literal, port 80 and other methods before DNS, and logs the name and the reason only | Compose topology tests | PR A |
 
@@ -1219,6 +1250,10 @@ docs/PLAN.md
      - `compose.example.yaml` with the fetcher on internal networks only
        (`fetcher`, `egress`), `HTTPS_PROXY` pointing at the forwarder, and
        the forwarder alone on `outside`
+     - the internal networks isolated from the Docker host
+       (`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`,
+       Docker Engine 28.0 or newer), log rotation on every service, the
+       forwarder's log budget and its absolute-name lookups
      - the **Compose topology tests** job (T1 to T3, in PR A's wording)
      - the README contract, `.env.example`, CLAUDE.md and section 6
 
