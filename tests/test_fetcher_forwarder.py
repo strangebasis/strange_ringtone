@@ -1725,6 +1725,92 @@ class RelayCapsTest(ForwarderTestCase):
         self.assertEqual((refused.upload_bytes, refused.download_bytes), (0, 0))
         self.assertGreaterEqual(refused.seconds, 0.0)
 
+    def test_the_forwarders_upload_window_is_bucketed(self) -> None:
+        # G9 (RS3-3, M3-1): WindowTest pins Window's own default; this pins
+        # that the Forwarder's real upload window uses buckets too. One entry
+        # per add there would let a client relaying one byte per send grow it
+        # past the forwarder's memory limit.
+        server = self.start(clock=self.clock)
+        window = server._upload_window
+        self.assertEqual(window.limit, DEFAULT_LIMITS.upload_bytes_per_minute)
+        near, far = socket.socketpair()
+        self.addCleanup(near.close)
+        self.addCleanup(far.close)
+        far.settimeout(DEADLINE)
+        counts = [0, 0]
+        end_of_life = time.monotonic() + 60 * DEADLINE
+        # 4096 one-byte chunks through the relay's own upload path, all
+        # within half a second of the window's clock. Read as they go: on
+        # Linux each one-byte send holds a whole buffer of the socketpair's
+        # send budget until it is read.
+        received = b""
+        for step in range(4096):
+            self.clock.now = 1000.0 + step / 8192
+            server._upload(near, b"x", end_of_life, counts)
+            if step % 64 == 63:
+                received += recv_exact(far, 64)
+        self.assertEqual(counts[0], 4096)
+        self.assertEqual(received, b"x" * 4096)
+        self.assertEqual(window.buckets, 1)
+        # A steady trickle, 64 one-byte adds a second for 130 seconds, stays
+        # at about one bucket per second of the window.
+        most = 0
+        for step in range(64 * 130):
+            self.clock.now = 1001.0 + step / 64
+            self.assertIs(window.add(1), True, step)
+            most = max(most, window.buckets)
+        self.assertLessEqual(most, 62)
+
+    def test_connection_attempts_stop_at_the_lifetime(self) -> None:
+        # G8/G9 (RS3b-3): the tunnel slot is held from step 3, so attempts to
+        # an answer full of unresponsive addresses stop at the lifetime from
+        # accept, not after connect_timeout_seconds per address.
+        slow = [f"11.0.9.{n}" for n in range(1, 7)]
+        self.fresh({"slow.youtube.com": slow, ALLOWED: [GLOBAL_A]})
+        attempts: list[tuple[str, float]] = []
+        lock = threading.Lock()
+
+        def connector(address: str, port: int, timeout: float) -> socket.socket:
+            with lock:
+                attempts.append((address, timeout))
+            if address in slow:
+                time.sleep(timeout)
+                raise TimeoutError("timed out")
+            return self.connector(address, port, timeout)
+
+        # A lifetime that isn't a multiple of the connect timeout, so the last
+        # attempt must be shortened to what is left: 2 s, then 1 s.
+        connect_timeout = 2
+        lifetime = 3
+        self.start(
+            Limits(connect_timeout_seconds=connect_timeout, lifetime_seconds=lifetime, tunnels_max_concurrent=1),
+            connector=connector,
+        )
+        started = time.monotonic()
+        sock = self.client()
+        sock.sendall(connect_head("slow.youtube.com"))
+        head = recv_head(sock)
+        elapsed = time.monotonic() - started
+        self.assertEqual(head, refusal_head(504))
+        outcome = self.sink.wait(1)[0]
+        self.assertEqual((outcome.name, outcome.reason), ("slow.youtube.com", "refused:connect_timeout"))
+        # Six addresses at two seconds each would take twelve seconds, and
+        # two full attempts four; the attempts end with the lifetime.
+        self.assertLess(outcome.seconds, lifetime + 0.9)
+        self.assertLess(elapsed, lifetime + 0.9)
+        with lock:
+            made = list(attempts)
+        self.assertLess(len(made), len(slow), made)
+        self.assertLessEqual(sum(timeout for _address, timeout in made), lifetime + 0.1, made)
+        for _address, timeout in made:
+            self.assertLessEqual(timeout, connect_timeout)
+        # Acceptance: the slot is free again within the lifetime's bound, and
+        # a responsive answer connects with the full connect timeout.
+        client, upstream = self.tunnel_when_free()
+        self.assertEqual(self.connector.calls[-1], (GLOBAL_A, 443, float(connect_timeout)))
+        client.sendall(b"ok")
+        self.assertEqual(recv_exact(upstream, 2), b"ok")
+
 
 class LoggingTest(ForwarderTestCase):
     """G10: `forwarder refused|cut <reason> <name>` only, never payload or header text."""
@@ -2238,6 +2324,41 @@ class EntryTest(unittest.TestCase):
             "strange_ringtone_forwarder.policy",
             "strange_ringtone_forwarder.server",
         ])
+
+    def test_entry_directory_fallbacks_never_give_the_empty_string(self) -> None:
+        # I1 (M3-2): the script puts its own directory first on sys.path, and
+        # "" there would mean the current directory wherever the script
+        # lives. Each __file__ shape gets its own directory: a root keeps its
+        # separator ("C:" alone is drive C's current directory), and a bare
+        # file name is ".", where such a script is.
+        code = compile(FORWARDER_SCRIPT.read_text(encoding="utf-8"), str(FORWARDER_SCRIPT), "exec")
+        cases = {
+            "/app/fetcher/forwarder.py": "/app/fetcher",
+            "/a/b/forwarder.py": "/a/b",
+            "/forwarder.py": "/",
+            "forwarder.py": ".",
+            "C:\\forwarder.py": "C:\\",
+            "C:/forwarder.py": "C:/",
+            "C:\\a\\b\\forwarder.py": "C:\\a\\b",
+            "D:\\a/b\\forwarder.py": "D:\\a/b",
+        }
+        for file, expected in cases.items():
+            with self.subTest(file=file):
+                saved = list(sys.path)
+                try:
+                    with mock.patch.object(forwarder_main, "main", return_value=0) as main:
+                        with self.assertRaises(SystemExit) as raised:
+                            exec(code, {"__file__": file, "__name__": "__main__"})
+                    inserted = sys.path[0]
+                    rest = sys.path[1:]
+                finally:
+                    sys.path[:] = saved
+                self.assertEqual(inserted, expected)
+                self.assertNotEqual(inserted, "")
+                self.assertEqual(rest, saved, "only one entry, inserted first")
+                # The script then runs the package's main() and exits with it.
+                main.assert_called_once_with()
+                self.assertEqual(raised.exception.code, 0)
 
 
 if __name__ == "__main__":

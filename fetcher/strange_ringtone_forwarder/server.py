@@ -353,7 +353,7 @@ class Forwarder(socketserver.ThreadingTCPServer):
                 if not self._tunnel_window.add(1):
                     raise Refusal(429, "rate", name)
                 addresses = check_addresses(self._resolve(name), name)
-                upstream = self._connect(addresses, name)
+                upstream = self._connect(addresses, name, accepted + self.limits.lifetime_seconds)
             except Refusal as refusal:
                 name = refusal.name
                 reason = f"refused:{refusal.reason}"
@@ -436,14 +436,27 @@ class Forwarder(socketserver.ThreadingTCPServer):
             raise Refusal(502, "resolve_failed", name)
         return result[0]
 
-    def _connect(self, addresses: Sequence[Any], name: str) -> socket.socket:
-        """Step 5 (G6): the first checked address that connects on 443, or a Refusal; never a second lookup."""
+    def _connect(self, addresses: Sequence[Any], name: str, end_of_life: float) -> socket.socket:
+        """Step 5 (G6): the first checked address that connects on 443, or a Refusal; never a second lookup.
+
+        Attempts stop at end_of_life, the tunnel's lifetime from accept: the
+        tunnel slot is held from step 3, so an answer full of unresponsive
+        addresses would otherwise keep it for connect_timeout_seconds per
+        address, past the lifetime that bounds every slot.
+        """
         timed_out = False
         for address in addresses:
+            life_left = end_of_life - time.monotonic()
+            if life_left <= 0:
+                # Out of lifetime before this attempt: the same answer as an
+                # attempt that timed out.
+                timed_out = True
+                break
             try:
                 # str(address) of a checked IPv4Address: the connector never
                 # sees the name, so it can't resolve it again.
-                return self.connector(str(address), ALLOWED_PORT, float(self.limits.connect_timeout_seconds))
+                timeout = min(float(self.limits.connect_timeout_seconds), life_left)
+                return self.connector(str(address), ALLOWED_PORT, timeout)
             except TimeoutError:
                 timed_out = True
             except OSError:

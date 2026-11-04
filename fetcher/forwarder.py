@@ -14,12 +14,18 @@ from __future__ import annotations
 import sys
 
 # __file__ is absolute for a script since Python 3.9; both separators, so the
-# checkout runs on Windows too. The fallbacks are edge cases: a script in
-# the root directory gets "/", and a bare file name (which 3.9+ never gives)
-# the current directory, where that script is. Never "", which sys.path reads
-# as the current directory wherever the script lives.
+# checkout runs on Windows too. The fallbacks are edge cases: a script in a
+# root directory keeps the separator ("/" or "C:\\"; "C:" alone would mean
+# drive C's current directory), and a bare file name (which 3.9+ never gives)
+# gets ".", the current directory, where that script is. Never "", which
+# sys.path reads as the current directory wherever the script lives.
 _SEP = max(__file__.rfind("/"), __file__.rfind("\\"))
-_HERE = __file__[:_SEP] if _SEP > 0 else (__file__[:1] if _SEP == 0 else ".")
+if _SEP < 0:
+    _HERE = "."
+elif _SEP == 0 or __file__[_SEP - 1] == ":":
+    _HERE = __file__[:_SEP + 1]
+else:
+    _HERE = __file__[:_SEP]
 sys.path.insert(0, _HERE)
 
 from strange_ringtone_forwarder.__main__ import main  # noqa: E402  (after the sys.path edit above)
