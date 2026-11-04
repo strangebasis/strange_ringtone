@@ -107,6 +107,50 @@ class Ipv4ParseTest(unittest.TestCase):
             "eth1", "00000000", "0101A8C0", "0003", "00000000")
         self.assertEqual(parse_ipv4_routes(text), (DefaultRoute("IPv4", "eth0"), DefaultRoute("IPv4", "eth1")))
 
+    def test_a_zero_mask_is_default_whatever_its_gateway_and_destination(self) -> None:
+        # S2 refusal: a /0 matches every destination. An on-link default (no
+        # gateway) still reaches everything on its link, and a /0 whose
+        # destination column isn't zero is still a /0: neither is skipped.
+        cases = {
+            "on_link": ipv4_line("eth0", "00000000", "00000000", "0001", "00000000"),
+            "odd_destination": ipv4_line("eth0", "0100A8C0", "0100A8C0", "0003", "00000000"),
+        }
+        for case, line in cases.items():
+            with self.subTest(case=case):
+                self.assertEqual(parse_ipv4_routes(IPV4_HEADER + IPV4_SUBNET_ETH0 + line),
+                                 (DefaultRoute("IPv4", "eth0"),))
+
+    def test_hex_columns_are_ascii_hex_digits_only(self) -> None:
+        # S2: int(text, 16) alone also reads Unicode digits, underscores and a
+        # 0x prefix, so a zero mask spelled that way would parse; the kernel
+        # never writes such a line, so it refuses rather than being read.
+        arabic_zero = "٠"
+        cases = {
+            "underscore_mask": ipv4_line("secretdev0", "00000000", "0100A8C0", "0003", "0000_000"),
+            "arabic_indic_mask": ipv4_line("secretdev0", "00000000", "0100A8C0", "0003", arabic_zero * 8),
+            "0x_mask": ipv4_line("secretdev0", "00000000", "0100A8C0", "0003", "0x000000"),
+            "underscore_destination": ipv4_line("secretdev0", "0000_000", "0100A8C0", "0003", "00FFFFFF"),
+            "arabic_indic_destination": ipv4_line("secretdev0", arabic_zero * 8, "0100A8C0", "0003", "00FFFFFF"),
+            "0x_destination": ipv4_line("secretdev0", "0x00000A", "0100A8C0", "0003", "00FFFFFF"),
+            "underscore_flags": ipv4_line("secretdev0", "0000A8C0", "00000000", "0_01", "00FFFFFF"),
+            "arabic_indic_flags": ipv4_line("secretdev0", "0000A8C0", "00000000", arabic_zero * 3 + "1", "00FFFFFF"),
+            "0x_flags": ipv4_line("secretdev0", "0000A8C0", "00000000", "0x01", "00FFFFFF"),
+        }
+        for case, line in cases.items():
+            with self.subTest(case=case):
+                with self.assertRaises(RouteError) as raised:
+                    parse_ipv4_routes(IPV4_HEADER + line)
+                self.assertNotIn("secretdev0", str(raised.exception))
+
+    def test_only_tabs_and_spaces_separate_fields(self) -> None:
+        # S2: an interface name may hold characters such as \x1c that
+        # str.split() also splits on; they must not shift the columns, or the
+        # parser would read the wrong one and miss a default route.
+        for device in ("et\x1ch0", "et\x1fh0"):
+            with self.subTest(device=device):
+                text = IPV4_HEADER + ipv4_line(device, "00000000", "0100A8C0", "0003", "00000000")
+                self.assertEqual(parse_ipv4_routes(text), (DefaultRoute("IPv4", device),))
+
     def test_other_routes_are_not_default(self) -> None:
         # S2 acceptance: an internal network still has its subnet route, and
         # host routes exist; neither carries traffic beyond the subnet.
@@ -191,6 +235,30 @@ class Ipv6ParseTest(unittest.TestCase):
                     parse_ipv6_routes(text)
                 self.assertNotIn("secretdev0", str(raised.exception))
 
+    def test_hex_columns_are_ascii_hex_digits_only(self) -> None:
+        # S2: as for IPv4, a prefix or flags column that only int(text, 16)
+        # would read (Unicode digits, '_', 0x) refuses.
+        arabic_zero = "٠"
+        cases = {
+            "arabic_indic_prefix": ipv6_line(ZERO_V6, arabic_zero * 2, "00000400", "00000003", "secretdev0"),
+            "underscore_flags": ipv6_line(ZERO_V6, "00", "00000400", "0020_200", "secretdev0"),
+            "0x_flags": ipv6_line(ZERO_V6, "00", "00000400", "0x200200", "secretdev0"),
+            "arabic_indic_destination": ipv6_line(arabic_zero * 32, "00", "00000400", "00000003", "secretdev0"),
+        }
+        for case, text in cases.items():
+            with self.subTest(case=case):
+                with self.assertRaises(RouteError) as raised:
+                    parse_ipv6_routes(text)
+                self.assertNotIn("secretdev0", str(raised.exception))
+
+    def test_only_tabs_and_spaces_separate_fields(self) -> None:
+        # S2: the device is read by position, so a \x1c in its name must not
+        # split it into two fields.
+        for device in ("et\x1ch0", "et\x1fh0"):
+            with self.subTest(device=device):
+                self.assertEqual(parse_ipv6_routes(ipv6_line(ZERO_V6, "00", "00000400", "00450003", device)),
+                                 (DefaultRoute("IPv6", device),))
+
 
 class ProcTreeTest(unittest.TestCase):
     """S2: default_routes reads route and ipv6_route under proc_net and fails closed."""
@@ -261,6 +329,28 @@ class ProcTreeTest(unittest.TestCase):
             with self.subTest(route=route, ipv6_route=ipv6_route), self.proc_net(route, ipv6_route) as root, \
                     self.assertRaises(RouteError):
                 default_routes(proc_net=root)
+
+    def test_a_non_ascii_byte_refuses(self) -> None:
+        # S2: the kernel prints these tables in ASCII. A byte outside it
+        # can't be told apart from a corrupt table, so the read refuses
+        # rather than replacing it and parsing on.
+        route = (IPV4_HEADER + ipv4_line("ethé", "0000A8C0", "00000000", "0001", "00FFFFFF")).encode("latin-1")
+        ipv6_route = ipv6_line("fe800000000000000000000000000000", "40", "00000100", "00000001",
+                               "ethé").encode("latin-1")
+        for name, files in (("route", {"route": route}),
+                            ("ipv6_route", {"route": IPV4_HEADER.encode("ascii"), "ipv6_route": ipv6_route})):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                for file_name, data in files.items():
+                    with open(root / file_name, "wb") as handle:
+                        handle.write(data)
+                with self.assertRaises(RouteError) as raised:
+                    default_routes(proc_net=root)
+                self.assertIn(name, str(raised.exception))
+        # Acceptance: the same tables in ASCII parse, with no default route.
+        with self.proc_net(IPV4_HEADER + IPV4_SUBNET_ETH0,
+                           ipv6_line("fe800000000000000000000000000000", "40", "00000100", "00000001", "eth0")) as root:
+            self.assertEqual(default_routes(proc_net=root), ())
 
     def test_default_path_is_proc_net(self) -> None:
         # S2: the default is the real /proc/net, and no platform is special:
