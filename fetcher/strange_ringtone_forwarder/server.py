@@ -136,30 +136,51 @@ def log_outcome(outcome: Outcome, log: TextIO) -> None:
 class Window:
     """A sliding 60-second budget: add(amount) records it and returns True, or returns False and records nothing.
 
-    Used for new tunnels per minute and upload bytes per minute (G8, G9); a
-    refused add records nothing, so a client hammering the limit doesn't push
-    its own recovery further away.
+    Used for new tunnels per minute, upload bytes per minute and log lines per
+    minute (G8, G9, G10); a refused add records nothing, so a client hammering
+    the limit doesn't push its own recovery further away.
+
+    Adds that start within `granularity` seconds of each other share one
+    bucket, so the window holds at most about seconds / granularity + 2
+    buckets however many adds it takes: a client relaying one byte per send
+    can't grow it past the forwarder's memory limit (RS3-3). The sum stays
+    exact; only the moment a bucket leaves moves, to `seconds` after its
+    latest add, so an amount leaves at most `granularity` seconds late and
+    never early, and the budget is never exceeded.
     """
 
-    def __init__(self, limit: int, clock: Clock, seconds: float = 60.0) -> None:
+    def __init__(self, limit: int, clock: Clock, seconds: float = 60.0, granularity: float = 1.0) -> None:
         self.limit = limit
         self.clock = clock
         self.seconds = seconds
-        # (time, amount) in time order, and their sum, so an add costs the
-        # entries that expired since the last one and nothing more.
-        self._entries: deque[tuple[float, int]] = deque()
+        self.granularity = granularity
+        # (first add, latest add, amount) in time order, and the amounts' sum,
+        # so an add costs the buckets that expired since the last one and
+        # nothing more. A bucket's latest add is no later than the next
+        # bucket's first, so expiry only ever looks at the oldest.
+        self._buckets: deque[tuple[float, float, int]] = deque()
         self._total = 0
         # Every tunnel thread shares the window.
         self._lock = threading.Lock()
 
+    @property
+    def buckets(self) -> int:
+        """How many buckets the window holds now: what its memory grows with."""
+        with self._lock:
+            return len(self._buckets)
+
     def add(self, amount: int = 1) -> bool:
         with self._lock:
             now = self.clock()
-            while self._entries and now - self._entries[0][0] >= self.seconds:
-                self._total -= self._entries.popleft()[1]
+            while self._buckets and now - self._buckets[0][1] >= self.seconds:
+                self._total -= self._buckets.popleft()[2]
             if self._total + amount > self.limit:
                 return False
-            self._entries.append((now, amount))
+            if self._buckets and now - self._buckets[-1][0] < self.granularity:
+                first, latest, held = self._buckets.pop()
+                self._buckets.append((first, max(latest, now), held + amount))
+            else:
+                self._buckets.append((now, now, amount))
             self._total += amount
             return True
 
@@ -204,9 +225,12 @@ class Forwarder(socketserver.ThreadingTCPServer):
     ) -> None:
         """Bind address and keep the injected parts.
 
-        sink defaults to functools.partial(log_outcome, log=log); log defaults
-        to sys.stderr, resolved at call time when None so a redirected stderr
-        is honoured.
+        sink defaults to self._log_outcome, which writes outcome_line through
+        _write_log: at most limits.log_lines_per_minute lines per sliding
+        minute, the rest counted and reported in one `forwarder log
+        suppressed <n>` line. An injected sink is not limited (the product
+        check records every outcome). log defaults to sys.stderr, resolved at
+        call time when None so a redirected stderr is honoured.
         """
         self.limits = limits
         self.resolver = resolver

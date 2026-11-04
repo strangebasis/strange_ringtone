@@ -117,6 +117,10 @@ _TOKEN = re.compile(rb"[\x21-\x7e]+")
 _LOGGABLE = re.compile(r"[A-Za-z0-9.-]{1,253}")
 # One label after ASCII lowering: letters, digits and '-', not at either end.
 _LABEL = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
+# A last label inet_aton reads as a number: decimal or octal digits, or hex
+# with a 0x prefix (0xc0000201, 192.0.2.0x1). No top-level domain starts
+# with a digit, so neither form is ever a real name's last label.
+_NUMERIC_LABEL = re.compile(r"[0-9]+|0[xX][0-9A-Fa-f]*")
 # Python calls the deprecated 6to4 relay anycast block global; it reaches
 # whichever relay is nearest, not YouTube.
 _SIXTO4_ANYCAST = ipaddress.IPv4Network("192.88.99.0/24")
@@ -176,8 +180,11 @@ def _is_literal(host: str) -> bool:
 
     ipaddress reads only the canonical forms, so the last-label rule also
     catches what inet_aton would read as an address: a bare integer
-    (3221225985), a short dotted form (192.0.2, 1.1) and octal-looking parts
-    (0177.0.0.1). No top-level domain is all digits, so no real name is lost.
+    (3221225985), a short dotted form (192.0.2, 1.1), octal-looking parts
+    (0177.0.0.1) and hex parts (0xc0000201, 0xc0.0.2.0x1). inet_aton reads a
+    string as an address only when its last part is a number, so testing the
+    last label is enough. No top-level domain starts with a digit, so no real
+    name is lost.
     """
     try:
         ipaddress.ip_address(host)
@@ -186,7 +193,9 @@ def _is_literal(host: str) -> bool:
     else:
         return True
     last = host.rsplit(".", 1)[-1]
-    return last.isascii() and last.isdigit()
+    # An explicit ASCII class: str.isdigit and \d would also take Unicode
+    # digits, which later fail the name grammar anyway.
+    return _NUMERIC_LABEL.fullmatch(last) is not None
 
 
 def parse_connect(head: bytes) -> str:
@@ -200,7 +209,8 @@ def parse_connect(head: bytes) -> str:
         literal form), userinfo, path, empty host     -> Refusal(400, "malformed")
       port text != "443" exactly                      -> Refusal(403, "port", name)
       host parses as ipaddress.ip_address (brackets stripped), or its last
-        label is all digits, or it is a bare integer  -> Refusal(400, "literal", name)
+        label is all ASCII digits or 0x hex, or it is a bare integer
+                                                      -> Refusal(400, "literal", name)
       host not ASCII, > 253 chars, a label empty or > 63 chars, a label with a
         character outside [a-z0-9-] after ASCII lowering, or starting or
         ending with '-' (a trailing dot is an empty label)  -> Refusal(400, "bad_name", name=None)

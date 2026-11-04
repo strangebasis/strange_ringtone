@@ -522,6 +522,23 @@ class HeadParsingTest(ForwarderTestCase):
         for host in ("192.0.2.1", "3221225985", "[::1]"):
             with self.subTest(host=host):
                 self.assert_refused(connect_head(host), 400)
+
+    def test_hex_ip_literals_are_refused_400(self) -> None:
+        # G2 (RC2-5): inet_aton also reads hex parts with a 0x prefix, so a
+        # host whose last label is 0x hex is an address, not a name: 400
+        # literal, never 403 unlisted.
+        for host in ("0xc0000201", "0XC0000201", "0xc0.0x0.0x2.0x1", "192.0.2.0x1", "0x7f.1", "1.2.3.0x"):
+            with self.subTest(host=host):
+                self.assert_refusal_raised(connect_head(host), 400, "literal")
+        # Acceptance: a hex-looking label anywhere but last is a name, and a
+        # last label that only starts like hex is one too (refused by the
+        # allowlist, not as a literal).
+        self.assertEqual(policy.parse_connect(connect_head("0x7f.youtube.com")), "0x7f.youtube.com")
+        self.assertEqual(policy.parse_connect(connect_head("www.0xg")), "www.0xg")
+        self.assertEqual(policy.parse_connect(connect_head("www.x0c")), "www.x0c")
+        self.start()
+        self.assert_refused(connect_head("0xc0.0x0.0x2.0x1"), 400)
+        self.assertEqual(self.resolver.calls, [])
         self.assertEqual(self.resolver.calls, [])
         self.assertEqual(self.connector.calls, [])
 
@@ -1339,6 +1356,63 @@ class WindowTest(unittest.TestCase):
         self.assertIs(window.add(), False)
         clock.now += 21
         self.assertIs(window.add(), True)
+
+    def test_a_burst_of_tiny_adds_keeps_one_bucket_and_an_exact_total(self) -> None:
+        # G9 (RS3-3): one entry per add would let a client sending one byte
+        # per chunk grow the upload window past the forwarder's memory limit.
+        clock = FakeClock()
+        window = server_module.Window(50_000, clock)
+        for step in range(50_000):
+            clock.now = 1000.0 + step / 131072      # under 0.4 s in all
+            self.assertIs(window.add(1), True)
+        self.assertEqual(window.buckets, 1)
+        # The total is exact: the 50,000 bytes fill the budget to the byte.
+        self.assertIs(window.add(1), False)
+        # Nothing leaves early: just under a minute after the latest add, the
+        # budget is still full; a minute after it, all of it is back.
+        latest = clock.now
+        clock.now = latest + 59.99
+        self.assertIs(window.add(1), False)
+        clock.now = latest + 60.0
+        self.assertIs(window.add(50_000), True)
+        self.assertIs(window.add(1), False)
+
+    def test_a_steady_trickle_keeps_the_buckets_bounded(self) -> None:
+        # G9 (RS3-3): 1024 one-byte adds a second for 130 seconds (133,120
+        # adds) stay within about one bucket per second of the window, and the
+        # total in the window stays exact. Steps of 1/1024 s are exact in
+        # binary, so the arithmetic below is too.
+        clock = FakeClock()
+        window = server_module.Window(70_000, clock)
+        most = 0
+        for step in range(1024 * 130):
+            clock.now = 1000.0 + step / 1024
+            self.assertIs(window.add(1), True, step)
+            if step % 256 == 0:
+                most = max(most, window.buckets)
+        self.assertLessEqual(most, 62)
+        self.assertLessEqual(window.buckets, 62)
+        # At t = 1129 + 1023/1024 the buckets of seconds 1070 to 1129 are in
+        # the window (1069's latest add is exactly a minute old): 60 buckets
+        # of 1024 bytes. The rest of the budget fits exactly, and no more.
+        self.assertIs(window.add(70_000 - 60 * 1024), True)
+        self.assertIs(window.add(1), False)
+
+    def test_a_refused_add_does_not_join_a_bucket(self) -> None:
+        # G9: a refused add records nothing, bucket or not.
+        clock = FakeClock()
+        window = server_module.Window(10, clock)
+        self.assertIs(window.add(6), True)
+        clock.now += 0.5
+        self.assertIs(window.add(5), False)
+        self.assertIs(window.add(4), True)
+        self.assertEqual(window.buckets, 1)
+        # Both adds share the bucket, which leaves a minute after its latest
+        # add (t+0.5), not after its first.
+        clock.now = 1060.4
+        self.assertIs(window.add(1), False)
+        clock.now = 1060.5
+        self.assertIs(window.add(10), True)
 
 
 class RelayCapsTest(ForwarderTestCase):
