@@ -34,6 +34,13 @@ _PYTHON_RE = re.compile(r"^python[0-9.]*$")
 # Instructions whose text could put the venv on a later step's PATH,
 # PYTHONPATH or shell.
 _SETTING_INSTRUCTIONS = {"ENV", "ARG", "SHELL"}
+# The venv's bin directory written relative to a parent (a WORKDIR of /opt,
+# say): a later step can name the venv's interpreter without its full path.
+_RELATIVE_BIN = "yt-dlp/bin"
+
+
+def _names_venv(text: str) -> bool:
+    return VENV in text or _RELATIVE_BIN in text
 
 
 def instructions(text: str) -> list[tuple[str, str]]:
@@ -122,7 +129,9 @@ def venv_hazards(text: str) -> tuple[list[str], list[list[str]]]:
     A problem is any later step that names the venv's bin directory, uses
     pip's --python again, sets anything to a path in the venv, starts any
     interpreter on a file or directory in the venv other than a site-free
-    compile, or compiles the venv without -I and -S.
+    compile, compiles the venv without -I and -S, or names the venv in any
+    other way (a cd or WORKDIR into it, a COPY onto it): this is a tripwire
+    for our own Dockerfile, so it fails closed rather than model the shell.
     """
     problems: list[str] = []
     compiles: list[list[str]] = []
@@ -137,8 +146,14 @@ def venv_hazards(text: str) -> tuple[list[str], list[list[str]]]:
                         problems.extend(_check(steps[index + 1:], compiles))
                         break
             continue
-        if keyword in _SETTING_INSTRUCTIONS and VENV in arguments:
+        if keyword in _SETTING_INSTRUCTIONS and _names_venv(arguments):
             problems.append(f"{keyword} {arguments}: puts the venv on a later step's path")
+        elif keyword != "RUN" and _names_venv(arguments):
+            # WORKDIR, COPY, ADD and the rest: a working directory in the venv
+            # lets a later step start its interpreter by a relative path (and
+            # puts its modules first on sys.path for python -c), and nothing
+            # after the install has a reason to name the venv at all.
+            problems.append(f"{keyword} {arguments}: names the venv after its install")
         elif keyword == "RUN":
             problems.extend(_check(commands(arguments), compiles))
     if not installed:
@@ -159,7 +174,7 @@ def _check(steps: list[list[str]], compiles: list[list[str]]) -> list[str]:
         if any("=" in token and VENV in token.partition("=")[2] for token in argv if not token.startswith("-")):
             problems.append(f"{line}: sets a variable to a path in the venv")
             continue
-        if not any(VENV in token for token in argv):
+        if not any(_names_venv(token) for token in argv):
             continue
         compiling = any("compileall" in token or "py_compile" in token for token in argv)
         if _is_site_free_compile(argv):
@@ -168,6 +183,12 @@ def _check(steps: list[list[str]], compiles: list[list[str]]) -> list[str]:
             problems.append(f"{line}: compiles the venv other than as the base interpreter's -I -S -m compileall")
         elif any(_PYTHON_RE.match(token.rsplit("/", 1)[-1]) for token in argv):
             problems.append(f"{line}: runs an interpreter on a path in the venv")
+        else:
+            # Any other mention: a cd into the venv lets the next command
+            # start bin/python, or put the venv's modules first on sys.path,
+            # without naming the venv again. Fail closed; the site-free
+            # compile is the only later step that needs it.
+            problems.append(f"{line}: names the venv after its install")
     return problems
 
 
@@ -212,6 +233,9 @@ class VenvBuildStepTest(unittest.TestCase):
             "a venv file run by base": "python /opt/yt-dlp/lib/python3.12/site-packages/yt_dlp/__main__.py",
             "the venv's site dir": "python -m site /opt/yt-dlp",
             "activate": ". /opt/yt-dlp/bin/activate",
+            "cd into the venv, then bin/python": "cd /opt/yt-dlp && bin/python -c pass",
+            "cd into site-packages, then python -c": "cd /opt/yt-dlp/lib/python3.12/site-packages && python -c pass",
+            "the bin directory by a relative path": "cd /opt && yt-dlp/bin/python -c pass",
         }
         for label, command in bad.items():
             with self.subTest(label=label):
@@ -230,6 +254,9 @@ class VenvBuildStepTest(unittest.TestCase):
             "ENV PATH=/opt/yt-dlp/bin:$PATH\n",
             "ENV PYTHONPATH=/opt/yt-dlp/lib/python3.12/site-packages\n",
             'SHELL ["/opt/yt-dlp/bin/python", "-c"]\n',
+            "WORKDIR /opt/yt-dlp\nRUN bin/python -c pass\n",
+            "WORKDIR /opt/yt-dlp/lib/python3.12/site-packages\nRUN python -c pass\n",
+            "WORKDIR /opt\nRUN yt-dlp/bin/python -c pass\n",
         ):
             with self.subTest(added=added):
                 problems, _compiles = venv_hazards(self.text.replace(anchor, anchor + added))
