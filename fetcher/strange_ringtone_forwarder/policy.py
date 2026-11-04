@@ -3,13 +3,15 @@
 No sockets and no I/O here, so every rule can be tested on its own and the
 server (strange_ringtone_forwarder.server) only applies what this module
 decides. Everything a client sends is checked by hand against a fixed
-grammar: no library parser ever sees it.
+grammar: no HTTP or URL library parser ever sees it, and ipaddress only ever
+sees text that already passed the request-line grammar.
 """
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 # The forwarder's fixed listening port: the conventional proxy port, distinct
 # from the fetcher's 8080 so both can share a network namespace. No setting.
@@ -76,7 +78,7 @@ def limits_table() -> dict[str, int]:
     The README names every limit with its value so an operator can see what
     the forwarder enforces; a test compares that table with this dict.
     """
-    raise NotImplementedError
+    return {field.name: getattr(DEFAULT_LIMITS, field.name) for field in fields(Limits)}
 
 
 class Refusal(Exception):
@@ -97,13 +99,35 @@ class Refusal(Exception):
         self.name = name
 
 
+# The only versions a CONNECT may carry; anything else is not the protocol
+# the gate understands, so it is refused rather than guessed at.
+_VERSIONS = (b"HTTP/1.0", b"HTTP/1.1")
+# A request-line token: visible ASCII, no space. Control characters (ESC,
+# NUL, DEL, a bare CR or LF) and every byte >= 0x80 fall outside it, so a
+# token carries neither a terminal escape nor a second request line, and no
+# Unicode rule (IDNA, case folding, normalisation) ever gets a byte to read.
+_TOKEN = re.compile(rb"[\x21-\x7e]+")
+# The hostname grammar for logging (G10): text it matches can't forge a log
+# line or a field in one. Explicit ranges, so no Unicode class applies.
+_LOGGABLE = re.compile(r"[A-Za-z0-9.-]{1,253}")
+# One label after ASCII lowering: letters, digits and '-', not at either end.
+_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
+# Python calls the deprecated 6to4 relay anycast block global; it reaches
+# whichever relay is nearest, not YouTube.
+_SIXTO4_ANYCAST = ipaddress.IPv4Network("192.88.99.0/24")
+
+
 def split_head(buffer: bytes) -> tuple[bytes, bytes] | None:
     """(head including the blank line, the bytes after it), or None if HEAD_END is not in buffer.
 
     The bytes after the head are the start of the client's TLS stream; they
     are relayed unparsed (G7).
     """
-    raise NotImplementedError
+    end = buffer.find(HEAD_END)
+    if end < 0:
+        return None
+    end += len(HEAD_END)
+    return buffer[:end], buffer[end:]
 
 
 def loggable_name(text: str) -> str | None:
@@ -112,7 +136,52 @@ def loggable_name(text: str) -> str | None:
     The only thing from a request that may ever be logged (G10), so no
     unvalidated byte from a client reaches the log.
     """
-    raise NotImplementedError
+    return text if _LOGGABLE.fullmatch(text) else None
+
+
+def _split_authority(target: str) -> tuple[str, str, bool] | None:
+    """(host part as sent, port text, bracketed) of a bare `host:port`, or None for any other form.
+
+    Userinfo ('@'), a path or a scheme ('/'), a missing or extra colon, and
+    an empty host or port are not an authority. Refusing them here means no
+    later step has to guess which part another parser would take as the host.
+    """
+    if "@" in target or "/" in target:
+        return None
+    if target.startswith("["):
+        # The IPv6 literal form: the brackets hold the colons, and the port
+        # follows the closing bracket. Whatever is inside is refused later.
+        close = target.find("]")
+        if close < 0 or not target.startswith(":", close + 1):
+            return None
+        host, port = target[: close + 1], target[close + 2 :]
+        bracketed = True
+    else:
+        if target.count(":") != 1:
+            return None
+        host, port = target.split(":")
+        bracketed = False
+    if host in ("", "[]") or not port:
+        return None
+    return host, port, bracketed
+
+
+def _is_literal(host: str) -> bool:
+    """True for an IP address in any notation a resolver or a socket call might accept.
+
+    ipaddress reads only the canonical forms, so the last-label rule also
+    catches what inet_aton would read as an address: a bare integer
+    (3221225985), a short dotted form (192.0.2, 1.1) and octal-looking parts
+    (0177.0.0.1). No top-level domain is all digits, so no real name is lost.
+    """
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return True
+    last = host.rsplit(".", 1)[-1]
+    return last.isascii() and last.isdigit()
 
 
 def parse_connect(head: bytes) -> str:
@@ -133,7 +202,52 @@ def parse_connect(head: bytes) -> str:
     Headers after the request line are not parsed at all: the gate needs only
     the authority, and every parsed byte is attack surface.
     """
-    raise NotImplementedError
+    # The request line ends at the first CRLF. A bare LF or CR before it stays
+    # inside the line and fails the token rule, so no line-ending ambiguity
+    # survives (request smuggling lives on two parsers disagreeing there).
+    end = head.find(b"\r\n")
+    if end < 0:
+        raise Refusal(400, "malformed")
+    parts = head[:end].split(b" ")
+    # Exactly one space between tokens: an empty part is a doubled, leading
+    # or trailing space.
+    if len(parts) != 3 or not all(_TOKEN.fullmatch(part) for part in parts):
+        raise Refusal(400, "malformed")
+    if parts[2] not in _VERSIONS:
+        raise Refusal(400, "malformed")
+    # Visible ASCII only by now, so decoding can't fail and every later check
+    # sees exactly the characters the client sent.
+    method, target = parts[0].decode("ascii"), parts[1].decode("ascii")
+    authority = _split_authority(target)
+    if method != "CONNECT":
+        # Plain-HTTP proxying (GET http://...) and everything else. Only an
+        # authority's host part can be a name worth logging; an origin-form
+        # or absolute-form target logs '-'.
+        raise Refusal(405, "method", loggable_name(authority[0]) if authority is not None else None)
+    if authority is None:
+        raise Refusal(400, "malformed")
+    host, port, bracketed = authority
+    name = loggable_name(host)
+    # Exactly the text "443": no leading zero, no sign, no other port.
+    if port != str(ALLOWED_PORT):
+        raise Refusal(403, "port", name)
+    if bracketed:
+        # Brackets are only for an IPv6 literal, which is refused either way.
+        if _is_literal(host[1:-1]):
+            raise Refusal(400, "literal", name)
+        raise Refusal(400, "malformed")
+    # Before the name grammar, which would pass 192.0.2.1 as four labels.
+    if _is_literal(host):
+        raise Refusal(400, "literal", name)
+    # str.lower() on ASCII only, so no Unicode case rule can turn another
+    # character into a listed one (the dotless i, the Kelvin sign and such).
+    if not host.isascii() or len(host) > NAME_MAX_CHARS:
+        raise Refusal(400, "bad_name")
+    lowered = host.lower()
+    for label in lowered.split("."):
+        if len(label) > LABEL_MAX_CHARS or not _LABEL.fullmatch(label):
+            raise Refusal(400, "bad_name")
+    return lowered
 
 
 def name_allowed(name: str) -> bool:
@@ -142,7 +256,10 @@ def name_allowed(name: str) -> bool:
     Matched by whole labels, so notyoutube.com and youtube.com.example.invalid
     are refused (G3).
     """
-    raise NotImplementedError
+    for apex in ALLOW_APEX:
+        if name == apex or name.endswith("." + apex):
+            return True
+    return any(name.endswith("." + domain) for domain in ALLOW_SUBDOMAINS_OF)
 
 
 def is_global_unicast(address: ipaddress.IPv4Address) -> bool:
@@ -151,7 +268,7 @@ def is_global_unicast(address: ipaddress.IPv4Address) -> bool:
     Python calls multicast global, and 192.88.99.0/24 is the deprecated 6to4
     anycast block, so both are excluded explicitly (G5).
     """
-    raise NotImplementedError
+    return address.is_global and not address.is_multicast and address not in _SIXTO4_ANYCAST
 
 
 def check_addresses(answers: Sequence[str], name: str) -> tuple[ipaddress.IPv4Address, ...]:
@@ -163,7 +280,25 @@ def check_addresses(answers: Sequence[str], name: str) -> tuple[ipaddress.IPv4Ad
     tunnel, so a name that also points inside cannot be used to reach it.
     Order kept, duplicates dropped.
     """
-    raise NotImplementedError
+    if not answers:
+        raise Refusal(502, "resolve_failed", name)
+    checked: list[ipaddress.IPv4Address] = []
+    for answer in answers:
+        # Text only: IPv4Address also takes an int or packed bytes, which no
+        # resolver answer should be.
+        if not isinstance(answer, str):
+            raise Refusal(403, "not_global", name)
+        try:
+            address = ipaddress.IPv4Address(answer)
+        except ValueError:
+            raise Refusal(403, "not_global", name) from None
+        # The canonical text only, so what is connected to is exactly what was
+        # checked, with no second reading of a looser form.
+        if str(address) != answer or not is_global_unicast(address):
+            raise Refusal(403, "not_global", name)
+        if address not in checked:
+            checked.append(address)
+    return tuple(checked)
 
 
 def refusal_bytes(status: int) -> bytes:
@@ -172,4 +307,6 @@ def refusal_bytes(status: int) -> bytes:
     No body and no header from the request: a refusal tells the client the
     status and nothing else.
     """
-    raise NotImplementedError
+    return f"HTTP/1.1 {status} {STATUS_PHRASES[status]}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".encode(
+        "ascii"
+    )
