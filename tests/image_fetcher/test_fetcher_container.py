@@ -144,6 +144,50 @@ for dist in importlib.metadata.distributions():
 print(json.dumps(sorted(found)))
 """
 _VERSION_PROBE = "import importlib.metadata, sys; print(importlib.metadata.version(sys.argv[1]))"
+# Run under the venv's interpreter: for every module of the two packages, the
+# .pyc that interpreter would load (its own cache tag, no optimisation level)
+# must exist and match the source, by timestamp and size or by hash (PEP 552).
+# find_spec of a top-level package imports nothing.
+_BYTECODE_PROBE = """\
+import importlib.util, json, os, sys
+bad, counts = [], {}
+for package in ("yt_dlp", "yt_dlp_ejs"):
+    spec = importlib.util.find_spec(package)
+    root = spec.submodule_search_locations[0]
+    counts[package] = 0
+    for directory, subdirectories, files in os.walk(root):
+        subdirectories[:] = [name for name in subdirectories if name != "__pycache__"]
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            source = os.path.join(directory, name)
+            counts[package] += 1
+            cached = importlib.util.cache_from_source(source)
+            try:
+                with open(cached, "rb") as handle:
+                    header = handle.read(16)
+                with open(source, "rb") as handle:
+                    data = handle.read()
+            except OSError as error:
+                bad.append([source, type(error).__name__])
+                continue
+            stat = os.stat(source)
+            flags = int.from_bytes(header[4:8], "little")
+            if header[:4] != importlib.util.MAGIC_NUMBER:
+                bad.append([source, "magic"])
+            elif flags & 1:
+                if header[8:16] != importlib.util.source_hash(data):
+                    bad.append([source, "hash"])
+            elif (int.from_bytes(header[8:12], "little"), int.from_bytes(header[12:16], "little")) != (
+                    int(stat.st_mtime) & 0xFFFFFFFF, stat.st_size & 0xFFFFFFFF):
+                bad.append([source, "timestamp"])
+print(json.dumps({"tag": sys.implementation.cache_tag, "magic": importlib.util.MAGIC_NUMBER.hex(),
+                  "counts": counts, "bad": bad}))
+"""
+_TAG_PROBE = (
+    "import importlib.util, json, sys; "
+    "print(json.dumps({'tag': sys.implementation.cache_tag, 'magic': importlib.util.MAGIC_NUMBER.hex()}))"
+)
 _EJS_PIN_PROBE = """\
 from importlib import metadata
 import json
@@ -513,6 +557,25 @@ class DependenciesTest(unittest.TestCase):
         self.assertEqual(_fetcher().command, DEFAULT_COMMAND)
         proc = _run([DEFAULT_COMMAND[0], "-I", "-c", "import sys; print(sys.prefix)"])
         self.assertEqual((proc.returncode, proc.stdout.strip()), (0, str(VENV)), proc.stderr)
+
+    def test_venv_bytecode_is_current_for_the_venvs_interpreter(self) -> None:
+        # The build compiles the venv with the base interpreter under -I -S,
+        # so no .pth line runs as root (tests/test_venv_build_steps.py).
+        # That must still leave bytecode the venv's interpreter loads: the
+        # root filesystem is read-only at run time, so a missing or stale
+        # .pyc would make every yt-dlp run compile its modules again.
+        data, why = _python_json(VENV_PYTHON, _BYTECODE_PROBE)
+        self.assertIsNotNone(data, why)
+        assert data is not None
+        base, why = _python_json(CMD[0], _TAG_PROBE)
+        self.assertIsNotNone(base, why)
+        assert base is not None
+        # The interpreter that compiled them shares the venv's cache tag and
+        # magic number: the same binary.
+        self.assertEqual((data["tag"], data["magic"]), (base["tag"], base["magic"]))
+        self.assertGreater(data["counts"]["yt_dlp"], 500, data["counts"])
+        self.assertGreater(data["counts"]["yt_dlp_ejs"], 0, data["counts"])
+        self.assertEqual(data["bad"], [])
 
     def test_one_yt_dlp_range_plus_headroom_fits_the_download_cap(self) -> None:
         # G9, the owner's decision of 2026-11-03: the forwarder's per-tunnel

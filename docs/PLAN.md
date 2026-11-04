@@ -544,7 +544,12 @@ source of abuse.
 - `python -I` still runs `.pth` lines from its site-packages (`-S` doesn't),
   and pip writes a wheel's scripts and data files into the interpreter's
   prefix. A wheel installed for the server's interpreter is code in the
-  server.
+  server. The same holds at build time: any interpreter that starts with
+  site enabled on the venv (the venv's own `python`, for one) after its
+  wheels are in runs their `.pth` lines as root, where they could rewrite
+  the base interpreter. pip's `--python` re-runs pip under the venv's
+  interpreter, but that interpreter starts while the venv is empty, and
+  site reads `.pth` files only at startup.
 - A container on an `internal: true` network has no default route. From
   Docker Engine 26.0 it also has no external DNS (CVE-2024-29018 stopped DNS
   forwarding from internal networks).
@@ -799,7 +804,10 @@ a malicious yt-dlp would ignore.
 lock, and only yt-dlp runs from it: in the fetcher's process tree in PR A,
 in the runner from PR B. The fetcher and the forwarder run the base
 interpreter, whose site-packages hold no third-party distribution, so a
-wheel's `.pth`, scripts and data files can't reach them.
+wheel's `.pth`, scripts and data files can't reach them. Once the wheels
+are in, no build step starts the venv's interpreter: the base interpreter
+compiles the venv's bytecode with `-I -S`, so no `.pth` line runs as root
+during the build either.
 Keeping one image leaves CI, Trivy, publishing, provenance and Dependabot as
 they are.
 
@@ -906,7 +914,7 @@ test to fail.
 | R3 | The runner deletes its job directory in `finally`, and the audio once collected or after a deadline | unit | PR B |
 | S1 | The fetcher caps, times out and re-validates everything the runner returns | unit, with a fake runner | PR B |
 | S2 | The fetcher (PR A) and the runner (PR B) refuse to start with a default route, or an unreadable or unparsable route table, unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`), in-image and Compose topology tests | PR A (the fetcher), PR B (the runner) |
-| I1 | The base interpreter's site-packages hold no third-party distribution and no `.pth` file, and its `sys.path` leaves out the venv | in-image | PR A |
+| I1 | The base interpreter's site-packages hold no third-party distribution and no `.pth` file, and its `sys.path` leaves out the venv; no build step after the wheels' install starts the venv's interpreter or compiles the venv with site enabled, and the venv's bytecode is current for the image's interpreter | in-image; unit (static read of `fetcher/Dockerfile`) | PR A |
 | T1 | In the compose layout, the fetcher (PR A) and the runner (PR B) have no default route and resolve no external name, and the host has no IPv4 or IPv6 address on their internal networks (also with IPv6 turned on for such a network); the forwarder has the only default route, and the fetcher image refuses to start on `outside` unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | Compose topology tests | PR A, extended in PR B |
 | T2 | PR A: the fetcher reaches the forwarder over `egress`, the forwarder reaches nothing on the `fetcher` network and nothing there reaches it, and the fetcher and the forwarder have forwarding 0 on every interface and every `accept_redirects` 0 (a container with the forwarder's settings routes no datagram between two networks, against a control router that does). PR B: the runner reaches the forwarder and nothing on the `fetcher` network, and the fetcher can't reach the forwarder | Compose topology tests | PR A, reworded in PR B |
 | T3 | The running forwarder refuses an unlisted name, an IP literal, port 80 and other methods before DNS, and logs the name and the reason only | Compose topology tests | PR A |

@@ -244,7 +244,10 @@ their own at `/opt/yt-dlp`, and copies Deno from the official `denoland/deno`
 image pinned by digest. Only yt-dlp runs from the venv
 (`/opt/yt-dlp/bin/python -I -m yt_dlp`). The base interpreter, which runs the
 fetcher and the forwarder, keeps no third-party distribution at all, not
-even pip, so no wheel's `.pth` line, script or data file reaches them. To
+even pip, so no wheel's `.pth` line, script or data file reaches them. Once
+the wheels are installed, no build step starts the venv's interpreter: the
+base interpreter compiles their bytecode with `-I -S`, so a wheel's `.pth`
+line can't run as root during the build either. To
 change a pin, edit `requirements.in` (yt-dlp-ejs must stay at the version
 yt-dlp's own metadata pins), then recompile in Git Bash from the repository
 root:

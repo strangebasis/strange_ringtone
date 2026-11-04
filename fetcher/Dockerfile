@@ -39,14 +39,21 @@ COPY --from=deno /deno /usr/local/bin/deno
 # interpreter's prefix). The venv is made without pip and filled by the base
 # image's pip through its --python option, so no installer ends up in it;
 # --require-hashes --no-deps --only-binary :all: as before. Root owns it.
-# The venv's bytecode is compiled now for the same reason as /app's below.
-# The lock stays in the image, so the in-image tests can compare what is
-# installed with it (tests/image_fetcher).
+# (--python runs pip under the venv's interpreter, but it starts while the
+# venv is still empty, and site reads .pth files only at startup.)
+# The venv's bytecode is compiled now for the same reason as /app's below,
+# by the base interpreter with -I -S: once the wheels are in, no build step
+# may start the venv's interpreter, or any interpreter with site enabled on
+# it, because site would run a malicious wheel's .pth lines here as root,
+# where they could rewrite the base interpreter the fetcher and the
+# forwarder run on (tests/test_venv_build_steps.py). Same binary, so the
+# same cache tag. The lock stays in the image, so the in-image tests can
+# compare what is installed with it (tests/image_fetcher).
 COPY fetcher/requirements.txt /app/fetcher/requirements.txt
 RUN python -m venv --without-pip /opt/yt-dlp \
     && python -m pip --python /opt/yt-dlp/bin/python install --no-cache-dir --disable-pip-version-check \
         --require-hashes --no-deps --only-binary :all: -r /app/fetcher/requirements.txt \
-    && /opt/yt-dlp/bin/python -m compileall -q /opt/yt-dlp/lib \
+    && python -I -S -m compileall -q /opt/yt-dlp/lib \
     # The base interpreter runs the fetcher and the forwarder, so it keeps no
     # installer either: after this nothing third-party is importable by it,
     # and tests/image_fetcher proves it (I1).
