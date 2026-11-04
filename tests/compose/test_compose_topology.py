@@ -53,6 +53,17 @@ OVERRIDE_HEALTH_SECONDS = 15.0
 LOG_WAIT_SECONDS = 5.0
 UID_GID = "10001:10001"
 FORWARDER_COMMAND = ["python", "-I", "/app/fetcher/forwarder.py"]
+# The image's CMD (fetcher/Dockerfile): the base interpreter, isolated. Not the
+# venv's interpreter, which holds yt-dlp (docs/PLAN.md 6.1, I1).
+FETCHER_COMMAND = ["python", "-I", "/app/fetcher"]
+# The engine release that added the bridge driver's `isolated` gateway mode,
+# which the internal networks use so the Docker host has no address on them
+# (it also has the CVE-2024-29018 DNS fix of 26.0).
+ENGINE_FLOOR = (28, 2)
+GATEWAY_MODE = "com.docker.network.bridge.gateway_mode_ipv4"
+INTERNAL_NETWORKS = ("core", "fetcher", "egress")
+# Every service's log rotates, so a flood of refusals can't fill the host's disk.
+LOGGING = {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}}
 PROXY_URL = f"http://fetcher-forwarder:{FORWARDER_PORT}"
 
 # The flags the contract runs a container with (README, Deployment contract),
@@ -168,6 +179,31 @@ for request in REQUESTS:
 print(json.dumps(lines))
 """
 
+# Run in the host's network namespace: the IPv4 address of each named
+# interface (SIOCGIFADDR), or the errno name when it has none. A bridge of an
+# isolated network has none (EADDRNOTAVAIL); a missing bridge is ENODEV.
+_BRIDGE_PROBE = r"""
+import errno, fcntl, json, socket, struct
+SIOCGIFADDR = 0x8915
+out = {}
+for name in BRIDGES:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        try:
+            packed = fcntl.ioctl(sock.fileno(), SIOCGIFADDR, struct.pack('256s', name.encode('ascii')))
+        except OSError as error:
+            out[name] = errno.errorcode.get(error.errno, str(error.errno))
+        else:
+            out[name] = socket.inet_ntoa(packed[20:24])
+print(json.dumps(out))
+"""
+
+# PID 1 of a service container is its command; the arguments are NUL-separated.
+_CMDLINE_PROBE = r"""
+import json
+with open('/proc/1/cmdline', 'rb') as handle:
+    print(json.dumps(handle.read().decode('ascii').split('\0')[:-1]))
+"""
+
 # http.client to loopback, as the service's own healthcheck does.
 _HEALTH_PROBE = r"""
 import http.client
@@ -188,6 +224,10 @@ def _connect_probe(targets: list[tuple[str, int]]) -> str:
 
 def _request_probe(host: str, port: int, requests: list[bytes]) -> str:
     return f"HOST = {host!r}\nPORT = {port!r}\nREQUESTS = {requests!r}\nTIMEOUT = {PROBE_TIMEOUT!r}\n" + _REQUEST_PROBE
+
+
+def _bridge_probe(bridges: list[str]) -> str:
+    return f"BRIDGES = {bridges!r}\n" + _BRIDGE_PROBE
 
 
 def _health_probe() -> str:
@@ -388,6 +428,26 @@ class EngineTest(unittest.TestCase):
         )
 
 
+    def test_docker_engine_supports_the_isolated_gateway_mode(self) -> None:
+        """Engine 28.2+ (supporting T1): the internal networks' `isolated` gateway mode; a failure, not a skip."""
+        try:
+            result = _docker("version", "--format", "{{.Server.Version}}", timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self.fail(f"docker version failed: {_describe(error)}")
+        self.assertEqual(result.returncode, 0, f"docker version failed: {result.stderr.strip()}")
+        version = result.stdout.strip()
+        match = re.match(r"(\d+)\.(\d+)", version)
+        self.assertIsNotNone(match, f"unexpected Docker Engine version {version!r}")
+        assert match is not None
+        found = (int(match.group(1)), int(match.group(2)))
+        self.assertGreaterEqual(
+            found,
+            ENGINE_FLOOR,
+            f"Docker Engine {ENGINE_FLOOR[0]}.{ENGINE_FLOOR[1]} or newer is required (the bridge driver's "
+            f"isolated gateway mode, which keeps the Docker host off the internal networks); found {version}",
+        )
+
+
 class LayoutTest(unittest.TestCase):
     """compose.example.yaml as compose resolves it, with the test override (T2 static, hardening)."""
 
@@ -453,6 +513,28 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(self._networks_of(services["fetcher"]), {"fetcher", "egress"})
         self.assertEqual(self._networks_of(services["fetcher-forwarder"]), {"egress", "outside"})
         self.assertEqual(self._networks_of(services["core"]), {"core"})
+
+    def test_internal_networks_give_the_host_no_address(self) -> None:
+        """T1/T2 (static): every internal network is also isolated from the Docker host; `outside` keeps its gateway."""
+        networks = self._config().get("networks") or {}
+        for name in INTERNAL_NETWORKS:
+            with self.subTest(network=name):
+                self.assertIn(name, networks, f"compose.example.yaml has no {name!r} network")
+                options = networks[name].get("driver_opts") or {}
+                # internal: true alone leaves the host an address on the
+                # bridge, and with it every service the host listens on.
+                self.assertEqual(options.get(GATEWAY_MODE), "isolated", f"{name} gives the host an address")
+        self.assertIn("outside", networks)
+        outside = (networks["outside"].get("driver_opts") or {}).get(GATEWAY_MODE)
+        self.assertNotEqual(outside, "isolated", "outside needs its gateway: it is the forwarder's route out")
+
+    def test_every_service_rotates_its_log(self) -> None:
+        """Supporting (G10): a json-file log with max-size and max-file on every service, so no log fills the disk."""
+        for name, service in self._services().items():
+            with self.subTest(service=name):
+                logging = service.get("logging") or {}
+                self.assertEqual(logging.get("driver"), LOGGING["driver"], f"{name}: {logging!r}")
+                self.assertEqual(logging.get("options"), LOGGING["options"], f"{name}: {logging!r}")
 
     def test_fetcher_points_https_proxy_at_the_forwarder(self) -> None:
         """T2 (static): yt-dlp's only way out is the forwarder, set on the service so .env can't change it."""
@@ -635,6 +717,46 @@ class StackTest(unittest.TestCase):
         output = logs.stdout + logs.stderr
         self.assertIn("FETCH_ALLOW_DEFAULT_ROUTE is set", output)
         self.assertNotIn("refusing to start", output)
+
+    def test_t1_internal_networks_give_the_host_no_address(self) -> None:
+        """T1: the Docker host has no address on the `fetcher` and `egress` bridges, so the fetcher can't reach it."""
+        bridges: dict[str, str] = {}
+        for name in ("fetcher", "egress", "outside"):
+            network = self._stack.network(name)
+            result = _docker("network", "inspect", "--format", "{{json .}}", network, timeout=PROBE_RUN_TIMEOUT)
+            self.assertEqual(result.returncode, 0, f"docker network inspect {network}: {result.stderr.strip()}")
+            info = json.loads(result.stdout)
+            bridges[name] = "br-" + info["Id"][:12]
+            gateways = [config.get("Gateway") for config in (info.get("IPAM") or {}).get("Config") or []]
+            if name == "outside":
+                # Control: the network with a route out has its gateway.
+                self.assertTrue(any(gateways), f"{network} has no gateway: {info.get('IPAM')}")
+                continue
+            self.assertEqual((info.get("Options") or {}).get(GATEWAY_MODE), "isolated", network)
+            self.assertFalse(any(gateways), f"{network} gives the host an address: {gateways}")
+        # The host's own view, from its network namespace: the isolated
+        # bridges hold no IPv4 address, while `outside`'s does (so the probe
+        # finds the bridges and reads addresses).
+        name = self._stack.container_name("host-probe")
+        result = self._stack.docker_run(
+            "--rm", "--name", name, "--network", "host", *HARDENING, IMAGE,
+            "python", "-I", "-c", _bridge_probe(sorted(bridges.values())),
+        )
+        addresses = self._probe_output(result, "host bridge probe")
+        self.assertTrue(_is_ip(addresses.get(bridges["outside"])), f"control failed: {addresses}")
+        for network in ("fetcher", "egress"):
+            self.assertEqual(addresses.get(bridges[network]), "EADDRNOTAVAIL",
+                             f"the host has an address on {network}: {addresses}")
+
+    def test_the_image_and_the_services_run_the_base_interpreter_isolated(self) -> None:
+        """I1: the image's CMD and both running services use the base interpreter with -I, never the venv's."""
+        result = _docker("image", "inspect", "--format", "{{json .Config.Cmd}}", IMAGE, timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        self.assertEqual(json.loads(result.stdout), FETCHER_COMMAND, "the image's CMD changed")
+        for service, expected in (("fetcher", FETCHER_COMMAND), ("fetcher-forwarder", FORWARDER_COMMAND)):
+            with self.subTest(service=service):
+                running = self._probe_output(self._stack.exec_in(service, _CMDLINE_PROBE), f"{service} cmdline")
+                self.assertEqual(running, expected)
 
     # T2
 

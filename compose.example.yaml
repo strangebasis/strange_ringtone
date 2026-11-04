@@ -16,13 +16,21 @@
 # also joins the `fetcher` network and forwards paths under /fetch/ to
 # fetcher:8080 unchanged, on the same origin, and everything else to the core.
 #
-# Networks: `core`, `fetcher` and `egress` are internal, with no route out.
-# `egress` is now the internal link between the fetcher and its forwarder (it
-# used to be the fetcher's way out); `outside` is the one network with a route
-# out, and only the forwarder joins it. This needs Docker Engine 26.0 or
-# newer: older engines forward DNS queries from internal networks to the
-# host's resolvers (CVE-2024-29018), so the fetcher could resolve external
-# names.
+# Networks: `core`, `fetcher` and `egress` are internal, with no route out,
+# and isolated from the Docker host: `internal: true` alone still gives the
+# host an address on each bridge, through which a container reaches every
+# service the host listens on (SSH, admin ports), so these networks also set
+# `gateway_mode_ipv4: isolated`, which leaves the bridge without one. `egress`
+# is now the internal link between the fetcher and its forwarder (it used to
+# be the fetcher's way out); `outside` is the one network with a route out,
+# and only the forwarder joins it. This needs Docker Engine 28.2 or newer:
+# older engines forward DNS queries from internal networks to the host's
+# resolvers (CVE-2024-29018, fixed in 26.0), so the fetcher could resolve
+# external names, and the `isolated` gateway mode arrived in 28.2.
+#
+# Logs: every service rotates its json-file log (`logging:` below). The
+# Docker daemon doesn't rotate by default, and the forwarder logs every
+# refusal, so an unrotated log could fill the host's disk.
 
 name: strange_ringtone
 
@@ -61,6 +69,14 @@ services:
       - /tmp:rw,noexec,nosuid,size=64m,mode=1777
     networks:
       - core
+    # json-file with rotation: Docker keeps every line forever unless the
+    # daemon or the service sets max-size, so a flood of refusals could fill
+    # the host's disk. 3 x 10 MB per container at most.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
     healthcheck:
       # http.client to loopback: inside the container, with no proxy lookup.
@@ -128,6 +144,14 @@ services:
     # `up -d fetcher` brings the forwarder up too, so yt-dlp's proxy is there.
     depends_on:
       - fetcher-forwarder
+    # json-file with rotation: Docker keeps every line forever unless the
+    # daemon or the service sets max-size, so a flood of refusals could fill
+    # the host's disk. 3 x 10 MB per container at most.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
     healthcheck:
       test:
@@ -171,11 +195,26 @@ services:
     # Its own limits bound each tunnel (README); this bounds the process.
     mem_limit: 128m
     # `egress` for the fetcher to reach it; `outside` for its route out. Not
-    # on `fetcher` or `core`, so a compromised forwarder reaches neither
-    # server.
+    # on `fetcher` or `core`, so a compromised forwarder reaches neither the
+    # core nor the reverse proxy. Until PR B (docs/PLAN.md 6.1) it shares
+    # `egress` with the fetcher, which listens on all its interfaces, so it
+    # can reach the fetcher's port 8080 there, where the fetcher's Origin and
+    # rate checks still apply. It listens on 3128 on all its interfaces,
+    # `outside` included, where the Docker host itself can reach it (Engine
+    # 28 and newer drop direct routing to unpublished ports from elsewhere):
+    # nothing but the forwarder may join `outside`, and nothing on the host
+    # should use that port.
     networks:
       - egress
       - outside
+    # json-file with rotation: Docker keeps every line forever unless the
+    # daemon or the service sets max-size, so a flood of refusals could fill
+    # the host's disk. 3 x 10 MB per container at most.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
     healthcheck:
       # A TCP connect to loopback and nothing sent: the forwarder neither
@@ -195,15 +234,28 @@ networks:
     # internal: no route out of this network. The core never makes an
     # outbound connection, so it needs none.
     internal: true
+    # isolated: the bridge gets no address on the Docker host, so nothing on
+    # this network reaches the host's own services either (internal: true
+    # alone leaves the host reachable through the bridge's gateway address).
+    # Container-to-container traffic and service names work as before.
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
   fetcher:
-    # Between the proxy and the fetcher only, with no route out of its own.
+    # Between the proxy and the fetcher only, with no route out of its own,
+    # and isolated from the host as `core` is.
     internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
   egress:
-    # Between the fetcher and the forwarder only: no route out and, with
-    # Engine 26.0 or newer, no external DNS, so the forwarder is the
-    # fetcher's one way out.
+    # Between the fetcher and the forwarder only: no route out, no external
+    # DNS (Engine 26.0 and newer) and no address on the host (the isolated
+    # gateway mode, Engine 28.2 and newer), so the forwarder is the fetcher's
+    # one way out.
     internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
   outside:
-    # The one network with a route out, for the forwarder only. The core and
-    # the fetcher never join it.
+    # The one network with a route out, for the forwarder only, so it keeps
+    # its gateway (the route out goes through it). The core and the fetcher
+    # never join it.
     internal: false
