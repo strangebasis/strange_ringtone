@@ -73,7 +73,7 @@ you care about, for example in Files.
 | 7 | Licence | **AGPL-3.0-or-later.** The full text, with the "how to apply" lines naming this project. | Section 13 of the licence: the UI must offer users the source (section 7.5). |
 | 8 | Releases | **release-please** opens release PRs from conventional commits | The release-please job needs `contents` and `pull-requests` write, and commit prefixes are mandatory (section 9.3). |
 | 9 | Tone names (2026-10-25) | **Readable Unicode.** iOS shows the download's filename as the tone name (section 5.6). | A bigger sanitiser and test set. Look-alike characters are possible, which is harmless for names on your own phone. |
-| 10 | Fetcher egress (2026-11-03) | **The fetcher image confines itself.** yt-dlp runs in a runner container on internal networks only, and its one way out is the image's own CONNECT forwarder, which allows YouTube's hosts on port 443 within budgets (section 6.1). No TLS interception. | Two more containers from the fetcher image. The gate confines the fetcher to Google's front ends, not to YouTube alone. Docker Engine 26.0 or newer. |
+| 10 | Fetcher egress (2026-11-03) | **The fetcher image confines itself.** yt-dlp runs in a runner container on internal networks only, and its one way out is the image's own CONNECT forwarder, which allows YouTube's hosts on port 443 within budgets (section 6.1). No TLS interception. | Two more containers from the fetcher image. The gate confines the fetcher to Google's front ends, not to YouTube alone. Docker Engine 28.2 or newer. |
 
 Phase 0 confirmed decision 2: the share sheet accepts `.m4a`, `.m4r` and
 `.mp3` up to 30.0 s. A `MAX_CLIP_SECONDS` above 30 only helps people who
@@ -484,8 +484,9 @@ forwarder. PR B will move yt-dlp into the runner and update them again.
   `http://fetcher-forwarder:3128`, and it refuses to start (exit 3) when its
   container has a default route, IPv4 or IPv6, or its route table can't be
   read, unless `FETCH_ALLOW_DEFAULT_ROUTE=true` says egress is filtered
-  another way. Docker Engine 26.0 or newer, because older engines forward DNS
-  from internal networks. Settings: `PUBLIC_ORIGIN` (required),
+  another way. Docker Engine 28.2 or newer: engines before 26.0 forward DNS
+  from internal networks, and the internal networks' `isolated` gateway mode,
+  which keeps the Docker host off them, arrived in 28.2. Settings: `PUBLIC_ORIGIN` (required),
   `TRUSTED_PROXIES`, `FETCH_MAX_SECONDS` (600, at most 600: `decode.js`
   refuses input over 10 minutes, so a longer video would be downloaded only
   for the phone to refuse it), `FETCH_MAX_BYTES` (40 MiB; 10 minutes of
@@ -542,13 +543,23 @@ source of abuse.
 - A container on an `internal: true` network has no default route. From
   Docker Engine 26.0 it also has no external DNS (CVE-2024-29018 stopped DNS
   forwarding from internal networks).
+- `internal: true` alone does not keep the host out: the bridge still has a
+  host address, and a container on it reaches every service the host listens
+  on at that address or on all addresses (SSH, a TCP Docker API, admin
+  ports). The bridge driver's `gateway_mode_ipv4: isolated` (Engine 28.2)
+  leaves the bridge without one; connections to the host then fail, while
+  container-to-container traffic and the embedded DNS keep working (checked
+  on Engine 29.8 by the refute stage, 2026-11-03).
 - Python 3.12's `ipaddress` calls `64:ff9b::a9fe:a9fe` (NAT64 for
   169.254.169.254) and `::169.254.169.254` global.
 - A child with the same UID can read its parent's `/proc/<pid>/environ`, and
   it can ptrace the parent where Yama's `ptrace_scope` is 0.
 
 **Layout.** The fetcher image runs as three containers. Every network but
-`outside` is `internal: true`.
+`outside` is `internal: true` and isolated from the host
+(`gateway_mode_ipv4: isolated`); `outside` keeps its gateway, the forwarder's
+route out. Every service rotates its log (json-file, `max-size` and
+`max-file`), so a flood of refusals can't fill the host's disk.
 
 ```
  reverse proxy
@@ -601,7 +612,9 @@ request head per connection and never parses anything after it. In order:
    per minute (yt-dlp sends requests, never large bodies), download bytes per
    tunnel, an idle timeout and a lifetime.
 6. Log refusals and cut tunnels with the name and the reason only, never
-   payload.
+   payload, at most `log_lines_per_minute` lines per minute: refusals cost a
+   client no budget, so the log has its own, and one
+   `forwarder log suppressed <n>` line counts what it dropped.
 
 Steps 1 to 3 refuse before any DNS lookup, so a refused name can't leak
 through DNS. A hard cap on open connections before the head comes on top, so
@@ -641,8 +654,10 @@ they are.
   - `FETCH_ALLOW_DEFAULT_ROUTE`
   - `HTTPS_PROXY` pointing at the forwarder (set on the fetcher service by
     `compose.example.yaml`)
-  - the forwarder's limits, named in the README
-  - Docker Engine 26.0 or newer
+  - the forwarder's limits, named in the README (its log budget included)
+  - `gateway_mode_ipv4: isolated` on the internal networks, and log rotation
+    on every service
+  - Docker Engine 28.2 or newer
 - planned for PR B:
   - the runner command and the `jobs` network (`egress` moves from the
     fetcher to the runner)
@@ -678,8 +693,15 @@ they are.
 **Accepted risks.** A compromised runner can still reach other Google
 services through the shared front ends, within the forwarder's budgets.
 YouTube stays a command channel. Docker Engine before 26.0 leaks DNS from
-internal networks, which is why the contract requires 26.0. The forwarder is
-our own code at the boundary, so it stays small.
+internal networks, and before 28.2 has no way to keep the host off them,
+which is why the contract requires 28.2. The forwarder is our own code at the
+boundary, so it stays small. It listens on all its interfaces, `outside`
+included, where the Docker host can reach port 3128 (Engine 28 and newer drop
+direct routing to unpublished ports from elsewhere); nothing else may join
+`outside`. Until PR B, a compromised forwarder shares `egress` with the
+fetcher and can reach its port 8080 there, where the fetcher's Origin and
+rate checks still apply. Binding the forwarder to its `egress` address alone
+would need a fixed subnet in the example, which is the owner's call.
 
 **Checks and their tests.** Every check gets its failing test before its code
 (section 12), and the verification panel removes each check and expects a
@@ -703,7 +725,7 @@ test to fail.
 | S1 | The fetcher caps, times out and re-validates everything the runner returns | unit, with a fake runner | PR B |
 | S2 | The fetcher (PR A) and the runner (PR B) refuse to start with a default route, or an unreadable route table, unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`), in-image and Compose topology tests | PR A (the fetcher), PR B (the runner) |
 | I1 | The base interpreter's site-packages hold no third-party distribution and no `.pth` file, and its `sys.path` leaves out the venv | in-image | PR A |
-| T1 | In the compose layout, the fetcher (PR A) and the runner (PR B) have no default route and resolve no external name; the forwarder has the only default route, and the fetcher image refuses to start on `outside` unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | Compose topology tests | PR A, extended in PR B |
+| T1 | In the compose layout, the fetcher (PR A) and the runner (PR B) have no default route and resolve no external name, and the host has no address on their internal networks; the forwarder has the only default route, and the fetcher image refuses to start on `outside` unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | Compose topology tests | PR A, extended in PR B |
 | T2 | PR A: the fetcher reaches the forwarder over `egress`, the forwarder reaches nothing on the `fetcher` network and nothing there reaches it. PR B: the runner reaches the forwarder and nothing on the `fetcher` network, and the fetcher can't reach the forwarder | Compose topology tests | PR A, reworded in PR B |
 | T3 | The running forwarder refuses an unlisted name, an IP literal, port 80 and other methods before DNS, and logs the name and the reason only | Compose topology tests | PR A |
 
