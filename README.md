@@ -101,8 +101,10 @@ Privacy:
 - **It keeps no state.** Results live in a tmpfs for a few minutes and then
   disappear.
 - **The core image never makes an outbound connection.**
-- **YouTube fetching is a separate, opt-in image.** It is the only part with
-  internet access, and it accepts nothing but an 11-character video ID.
+- **YouTube fetching is a separate, opt-in image.** It accepts nothing but an
+  11-character video ID, and it reaches the internet only through the
+  forwarder, a second command of the same image that allows `CONNECT` to
+  YouTube's names on port 443 and nothing else.
 
 ## Repository layout
 
@@ -110,14 +112,14 @@ Privacy:
 | --- | --- |
 | `docs/PLAN.md` | Research, decisions and the v0.1.0 plan |
 | `core/` | The core server: the `strange_ringtone` package and its static files, the image's `Dockerfile`, and in `core/ffmpeg/` the pinned, verified ffmpeg build inputs (version, checksum, signing key, configure line, component allowlist) |
-| `fetcher/` | The optional YouTube fetcher, a second image: the `strange_ringtone_fetch` package, its `Dockerfile`, and the hashed lock for yt-dlp and yt-dlp-ejs (`requirements.txt`, compiled from `requirements.in`). It shares the core's request checks by importing them from `core/` |
+| `fetcher/` | The optional YouTube fetcher, a second image with two commands: the fetcher server (the `strange_ringtone_fetch` package, run through `__main__.py`) and its egress forwarder (the stdlib `strange_ringtone_forwarder` package, run through `forwarder.py`). Also its `Dockerfile` and the hashed lock for yt-dlp and yt-dlp-ejs (`requirements.txt`, compiled from `requirements.in`), which the image installs into a venv of their own at `/opt/yt-dlp`. The fetcher shares the core's request checks by importing them from `core/`; the forwarder imports nothing from either |
 | `.env.example` | The core's settings and the optional fetcher's, with placeholders and defaults |
-| `compose.example.yaml` | A hardened Compose example, with no published ports |
+| `compose.example.yaml` | A hardened Compose example, with no published ports, the fetcher on internal networks only and the forwarder its one way out |
 | `.dockerignore` | An allowlist: only `core/` and `fetcher/` reach the build context the two images share |
 | `tools/spike/phase0.py` | Generates the test tones that established the share sheet's rules |
 | `tools/dev_fetch_stack.py` | An offline development stack on loopback: the core, the fetcher with a stub yt-dlp, and one origin, for trying the YouTube flow without touching YouTube |
 | `scripts/` | Stdlib checks that CI runs: the PR title and contract checks on pull requests, and the weekly FFmpeg release watch |
-| `tests/` | Stdlib `unittest` tests (the in-image suites in `tests/image/` and `tests/image_fetcher/`, the ffmpeg and yt-dlp stubs in `tests/stubs/`), plus `node:test` unit tests for the browser's code in `tests/js/` |
+| `tests/` | Stdlib `unittest` tests (the in-image suites in `tests/image/` and `tests/image_fetcher/`, the compose topology tests in `tests/compose/`, the ffmpeg and yt-dlp stubs in `tests/stubs/`), plus `node:test` unit tests for the browser's code in `tests/js/` |
 | `.github/` | CI workflows, Dependabot, and hashed lockfiles for the CI tools |
 
 ## Development
@@ -211,18 +213,41 @@ server that needs yt-dlp and Deno, so it runs for real only in its image. To
 try the whole YouTube flow on this machine without any YouTube traffic, run
 `python -I tools/dev_fetch_stack.py` and open <http://127.0.0.1:8080/>: it
 starts the core, the fetcher with the stub yt-dlp (`tests/stubs/ytdlp_stub.py`)
-and a proxy that sends `/fetch/` to the fetcher, all on loopback. Build its
-image from the repository root:
+and a proxy that sends `/fetch/` to the fetcher, all on loopback. The dev
+stack needs no setting for that. Started on its own as `python -I fetcher`,
+the fetcher refuses to start (exit 3) where it finds a default route, which a
+development machine has, or can't read `/proc/net/route`, as on Windows; set
+`FETCH_ALLOW_DEFAULT_ROUTE=true` for such a run, never in a deployment whose
+egress the forwarder is meant to confine.
+
+The forwarder, the fetcher's only way out in a deployment, runs from a
+checkout too, on the fixed port 3128:
+
+```bash
+python -I fetcher/forwarder.py --bind 127.0.0.1
+```
+
+It reads no setting and writes no file. As for the core, `--bind` takes an
+IP address only, and without it the forwarder listens on `0.0.0.0`, which is
+meant for the container. A `CONNECT` it accepts makes a real DNS lookup and a
+real connection, so its tests use a fake resolver and connector instead.
+
+Build the fetcher image from the repository root:
 
 ```bash
 docker build -f fetcher/Dockerfile -t strange_ringtone-fetcher:local .
 ```
 
 The build installs exactly the wheels in `fetcher/requirements.txt`, a
-hashed pip-tools lock compiled from `fetcher/requirements.in`, and copies
-Deno from the official `denoland/deno` image pinned by digest. To change a
-pin, edit `requirements.in` (yt-dlp-ejs must stay at the version yt-dlp's own
-metadata pins), then recompile in Git Bash from the repository root:
+hashed pip-tools lock compiled from `fetcher/requirements.in`, into a venv of
+their own at `/opt/yt-dlp`, and copies Deno from the official `denoland/deno`
+image pinned by digest. Only yt-dlp runs from the venv
+(`/opt/yt-dlp/bin/python -I -m yt_dlp`). The base interpreter, which runs the
+fetcher and the forwarder, keeps no third-party distribution at all, not
+even pip, so no wheel's `.pth` line, script or data file reaches them. To
+change a pin, edit `requirements.in` (yt-dlp-ejs must stay at the version
+yt-dlp's own metadata pins), then recompile in Git Bash from the repository
+root:
 
 ```bash
 MSYS_NO_PATHCONV=1 docker run --rm -v "$(cygpath -w "$PWD/fetcher"):/work" -w /work python:3.12-slim sh -c 'pip install -q pip-tools==7.5.3 && pip-compile --generate-hashes --strip-extras --output-file=requirements.txt requirements.in'
@@ -239,11 +264,37 @@ MSYS_NO_PATHCONV=1 docker run --rm --name strange_ringtone-fetcher-image-tests  
 ```
 
 These are the CI job **Fetcher image tests**. They check the container
-contract, that the installed yt-dlp and yt-dlp-ejs are the lock and agree
-with each other, that yt-dlp finds Deno and Deno runs under the fetcher's
-resource limits, and they run the fetcher's unit tests (`tests/test_fetcher_*.py`)
+contract, that the venv's yt-dlp and yt-dlp-ejs are the lock and agree with
+each other, that the base interpreter holds nothing third-party, that one
+yt-dlp download range plus headroom fits the forwarder's per-tunnel cap, that
+yt-dlp finds Deno and Deno runs under the fetcher's resource limits, that the
+forwarder command answers refusals without any DNS lookup, and that the
+fetcher finds no default route under `--network none` and starts. They also
+run the fetcher's and the forwarder's unit tests (`tests/test_fetcher_*.py`)
 again under the image's Python 3.12. Outside the image
 (`STRANGE_RINGTONE_FETCHER_IMAGE_TESTS` unset) they are skipped.
+
+**Run the compose topology tests.** They bring up `compose.example.yaml`
+itself with the fetcher image built above and check the layout for real: the
+fetcher has no default route and resolves no external name, the forwarder is
+the only container with a route out, the fetcher refuses to start on that
+network unless `FETCH_ALLOW_DEFAULT_ROUTE` is set, and the running forwarder
+refuses what it should and logs only the name and the reason. From the
+repository root:
+
+```bash
+STRANGE_RINGTONE_COMPOSE_TESTS=1 python -I -m unittest discover -s tests/compose -t tests -v
+```
+
+`STRANGE_RINGTONE_COMPOSE_IMAGE=<tag>` picks another image than
+`strange_ringtone-fetcher:local`; it is never pulled or built. They need
+Docker Engine 26.0 or newer (a test fails on an older engine, which forwards
+DNS from internal networks). Each run uses a unique project name and a
+temporary env file, so it never reads your `.env`, publishes no port, sends
+nothing to YouTube or any other external host (every name it gives the
+forwarder is refused before DNS), and tears its containers and networks down
+afterwards. These are the CI job **Compose topology tests**. Without
+`STRANGE_RINGTONE_COMPOSE_TESTS=1` they are skipped.
 
 **Pull requests:** branch from `main` as `feat/…` or `fix/…`. PRs are
 squash-merged, so their titles must be conventional-commit subjects (`feat:`,
@@ -262,20 +313,24 @@ change to this section unless the PR is marked as breaking.
 Run it only if you want YouTube links (set `FETCH_ENABLED=true` on the core
 too). It is the only part that needs the internet, and it never talks to the
 core: the phone downloads the audio from the fetcher and sends the core only
-the trimmed WAV, as for a picked file. Draft, from
-[docs/PLAN.md](docs/PLAN.md) section 6.
+the trimmed WAV, as for a picked file. The image runs as two containers: the
+fetcher, on internal networks only, and the forwarder, its one way out.
+Draft, from [docs/PLAN.md](docs/PLAN.md) sections 6 and 6.1.
 
 | Item | Value |
 | --- | --- |
 | Image | `ghcr.io/<owner>/strange_ringtone-fetcher:<semver>`, consumed by digest, linux/amd64 |
-| User | UID 10001, GID 10001 (fixed, non-root), the same as the core |
-| Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
-| Paths | The fetcher serves the `/fetch/` prefix itself: `GET /fetch/healthz`, `POST /fetch/api/jobs`, `GET /fetch/api/jobs/<id>` and `GET /fetch/api/jobs/<id>/audio`. The reverse proxy forwards every path under `/fetch/` to it unchanged, on the same origin as the core (no rewriting), and everything else to the core. |
-| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`, and a memory limit (`mem_limit`, 512 MB in `compose.example.yaml`): yt-dlp runs under `prlimit` for CPU time, file size, open files and processes, but with no address-space limit, because Deno reserves a huge virtual range, so the cgroup limit is what bounds memory. |
-| Egress | Needs outbound HTTPS to YouTube's hosts and nothing else. Restricting it to them (an allowlisting proxy, firewall rules) and blocking private address ranges is the deployment's job. It never needs to reach the core, so give it a network of its own shared only with the proxy (`compose.example.yaml`). It honours `HTTPS_PROXY`, but only `http://` proxies: yt-dlp is installed without `requests`, so it reaches a proxy through urllib (CONNECT for HTTPS). |
-| Writable | `/tmp` (tmpfs) and nothing else, sized `2 × FETCH_MAX_BYTES + 16 MB`: one download in flight, one finished result waiting to be collected, the info JSON and Deno's cache. 96 MB with the defaults. No volumes, and nothing survives a restart. |
+| User | UID 10001, GID 10001 (fixed, non-root), the same as the core, for both commands |
+| Commands | The image's CMD, `python -I /app/fetcher`, is the fetcher. `python -I /app/fetcher/forwarder.py` is the forwarder, run from the same image as a second container (`command:` in `compose.example.yaml`). |
+| Port | 8080/tcp for the fetcher, plain HTTP; TLS is the proxy's job. 3128/tcp for the forwarder command, plain HTTP that answers only `CONNECT`. Both are fixed. |
+| Paths | The fetcher serves the `/fetch/` prefix itself: `GET /fetch/healthz`, `POST /fetch/api/jobs`, `GET /fetch/api/jobs/<id>` and `GET /fetch/api/jobs/<id>/audio`. The reverse proxy forwards every path under `/fetch/` to it unchanged, on the same origin as the core (no rewriting), and everything else to the core. The forwarder serves no path, and the reverse proxy never reaches it. |
+| Runs with | The fetcher: `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`, and a memory limit (`mem_limit`, 512 MB in `compose.example.yaml`): yt-dlp runs under `prlimit` for CPU time, file size, open files and processes, but with no address-space limit, because Deno reserves a huge virtual range, so the cgroup limit is what bounds memory. The forwarder: the same flags with no `/tmp` and a smaller memory limit (128 MB in `compose.example.yaml`). |
+| Egress | The fetcher needs none of its own. It refuses to start (exit 3) when its container has a default route, IPv4 or IPv6, or when it can't read `/proc/net/route`, unless `FETCH_ALLOW_DEFAULT_ROUTE=true`, and it reaches YouTube only through `HTTPS_PROXY`, which points at the forwarder. Only `http://` proxies work: yt-dlp is installed without `requests`, so it reaches a proxy through urllib (`CONNECT` for HTTPS). The forwarder needs outbound TCP 443 to `youtube.com`, its subdomains and the subdomains of `googlevideo.com`, and DNS for those names. It connects only to IPv4 global unicast addresses it checked, and it resolves a name only after the allowlist and its budgets have passed, so a refused name never reaches DNS. It is the only container with a route out. |
+| Networks | `fetcher`: the reverse proxy and the fetcher. `egress`: the fetcher and the forwarder, and nothing else. `outside`: the forwarder only, the one network with a route out. Every network but `outside` is `internal: true`, the core's `core` network included. Docker Engine 26.0 or newer: older engines forward DNS from internal networks (CVE-2024-29018), which would let the fetcher resolve names without the forwarder. |
+| Writable | The fetcher: `/tmp` (tmpfs) and nothing else, sized `2 × FETCH_MAX_BYTES + 16 MB`: one download in flight, one finished result waiting to be collected, the info JSON and Deno's cache. 96 MB with the defaults. The forwarder: nothing, not even `/tmp`. No volumes, and nothing survives a restart. |
 | Results | One job runs at a time, with up to 4 more queued (503 `busy` beyond that). At most one finished, uncollected result is held: when a newer download finishes, an older one still waiting is deleted, and its page gets a 404. A result being downloaded by its page counts against the same budget: while one is still streaming, the next download starts only once the older waiting result is gone, and a stream that would push a third file onto `/tmp` is cut short. A result is deleted when the page collects it, and in any case `FETCH_RESULT_TTL_SECONDS` after it finished. |
-| Health | `GET /fetch/healthz` returns 200 with the body `ok` and nothing else |
+| Health | The fetcher: `GET /fetch/healthz` returns 200 with the body `ok` and nothing else. The forwarder: it accepts a TCP connection on 3128 and answers nothing until a request arrives, and a connection closed before its first byte is not logged (`compose.example.yaml` shows the check). |
+| Logs | The forwarder writes one stderr line per refused request or cut tunnel, `forwarder refused <reason> <name>` or `forwarder cut <reason> <name>`, and nothing for a tunnel that ends normally. `-` stands for a name that didn't parse as a host name. It never logs payload, headers or anything else a client sent. |
 
 | Variable | Default | Notes |
 | --- | --- | --- |
@@ -286,7 +341,43 @@ the trimmed WAV, as for a picked file. Draft, from
 | `FETCH_TIMEOUT_SECONDS` | 120 | Wall clock per yt-dlp run, 1 to 600 |
 | `RATE_LIMIT_FETCHES_PER_MINUTE` | 5 | Per client IP, counted on accepted jobs |
 | `FETCH_RESULT_TTL_SECONDS` | 600 | How long a finished result waits to be collected |
-| `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | unset | Passed to yt-dlp, and the only part of the fetcher's environment it sees. `http://host:port` only, with no credentials. |
+| `FETCH_ALLOW_DEFAULT_ROUTE` | false | `true` turns off the start check that refuses a container with a default route (IPv4 or IPv6). Set it only where egress is filtered another way (a NetworkPolicy, a firewall). The check also refuses when `/proc/net/route` can't be read. |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` | unset | Passed to yt-dlp, and the only part of the fetcher's environment it sees. `compose.example.yaml` sets `HTTPS_PROXY` to `http://fetcher-forwarder:3128` on the service, which wins over `.env`; a deployment that gates egress another way may point it elsewhere. `http://host:port` only, with no credentials. |
+
+#### Forwarder limits
+
+The forwarder reads no setting: its limits are fixed in the image,
+provisional values sized with headroom that a release may change. A test
+compares this table with the code.
+
+| Limit | Value | Meaning |
+| --- | --- | --- |
+| `head_max_bytes` | 4096 | Largest request head in bytes, its blank line included; a longer one gets 431 |
+| `head_deadline_seconds` | 10 | Seconds from accepting a connection to the end of its request head; a slower one gets 408 |
+| `connections_max` | 64 | Client connections open at once, counted before the head is read; one more is closed without a response |
+| `tunnels_max_concurrent` | 8 | Tunnels open at once; one more gets 503 |
+| `tunnels_per_minute` | 90 | New tunnels in any 60-second window; one more gets 429 |
+| `upload_bytes_per_tunnel` | 262144 | Bytes (256 KiB) a client may send through one tunnel after the head; more cuts the tunnel |
+| `upload_bytes_per_minute` | 4194304 | Bytes (4 MiB) clients may send through all tunnels in any 60-second window; more cuts the tunnel |
+| `download_bytes_per_tunnel` | 16777216 | Bytes (16 MiB) one tunnel may carry back from YouTube; more cuts the tunnel |
+| `idle_timeout_seconds` | 30 | Seconds a tunnel may carry no byte either way before it is cut |
+| `lifetime_seconds` | 300 | Seconds from accepting a connection after which its tunnel is cut, however busy |
+| `resolve_deadline_seconds` | 5 | Seconds the IPv4 lookup may take; a slower one gets 504 |
+| `connect_timeout_seconds` | 10 | Seconds for each connection attempt to a checked address; when every address fails, the answer is 504 if the last attempt timed out and 502 otherwise |
+
+How these relate to `FETCH_MAX_BYTES`: the pinned yt-dlp downloads
+googlevideo audio in ranges of at most 10 MiB (`http_chunk_size`), one
+`CONNECT` tunnel per range because it sends `Connection: close`. So
+`download_bytes_per_tunnel` is a fixed 16 MiB, one range plus headroom, which
+holds any `FETCH_MAX_BYTES` up to 512 MiB. It is deliberately not sized from
+`FETCH_MAX_BYTES`: a compromised fetcher moves at most 16 MiB per tunnel. The
+in-image tests read the range size from the installed yt-dlp and fail when one
+range plus headroom no longer fits the cap, so a yt-dlp bump that changes it
+fails CI before it fails fetches; the remedy is to raise the cap and this
+table's row together. What a larger `FETCH_MAX_BYTES` consumes is
+`tunnels_per_minute`: about `FETCH_MAX_BYTES / 10 MiB` tunnels for the audio,
+plus roughly 6 to 8 for the watch page, the player JavaScript and the
+innertube calls of the three default clients.
 
 ## Security
 
