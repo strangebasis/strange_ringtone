@@ -228,7 +228,8 @@ class Forwarder(socketserver.ThreadingTCPServer):
         sink defaults to self._log_outcome, which writes outcome_line through
         _write_log: at most limits.log_lines_per_minute lines per sliding
         minute, the rest counted and reported in one `forwarder log
-        suppressed <n>` line. An injected sink is not limited (the product
+        suppressed <n>` line, which counts against the same budget. An
+        injected sink is not limited (the product
         check records every outcome). log defaults to sys.stderr, resolved at
         call time when None so a redirected stderr is honoured.
         """
@@ -251,7 +252,8 @@ class Forwarder(socketserver.ThreadingTCPServer):
         # The log's own budget: refusals cost no tunnel budget, so this is
         # what stops a client from filling the host's disk with log lines.
         # Lines over it are dropped and counted, and the count is printed
-        # once the window has room again. The lock keeps that count and the
+        # once the window has room for it: the count line takes a place too,
+        # or the budget wouldn't bound the disk. The lock keeps that count and the
         # line order consistent across tunnel threads.
         self._log_window = Window(limits.log_lines_per_minute, clock)
         self._log_lock = threading.Lock()
@@ -269,21 +271,36 @@ class Forwarder(socketserver.ThreadingTCPServer):
     def _write_log(self, line: str) -> None:
         """Write one line to the log within log_lines_per_minute, or count it as suppressed.
 
-        At most log_lines_per_minute lines per sliding minute, plus one
-        `forwarder log suppressed <n>` line when the window has room again
-        after dropping n lines, so a flood costs the host a bounded amount of
-        disk and the operator still sees that it happened.
+        At most log_lines_per_minute lines in any sliding minute, counting
+        the `forwarder log suppressed <n>` line, which reports n dropped
+        lines the next time the window has room for it. That line takes a
+        place in the window like any other: uncounted, one could follow every
+        place a flood frees, and the budget would no longer bound the disk.
+        With room for the count but not for this line, the count goes out
+        and this line is dropped and counted in the next one, so the counts
+        add up to every line dropped.
         """
         with self._log_lock:
-            if not self._log_window.add(1):
+            if self._log_suppressed:
+                # The count and the line together, or the count alone.
+                if self._log_window.add(2):
+                    lines = (f"forwarder log suppressed {self._log_suppressed}\n", line)
+                    self._log_suppressed = 0
+                elif self._log_window.add(1):
+                    lines = (f"forwarder log suppressed {self._log_suppressed}\n",)
+                    self._log_suppressed = 1
+                else:
+                    self._log_suppressed += 1
+                    return
+            elif self._log_window.add(1):
+                lines = (line,)
+            else:
                 self._log_suppressed += 1
                 return
             # Looked up per line, so a stderr redirected after start is honoured.
             log = self.log if self.log is not None else sys.stderr
-            if self._log_suppressed:
-                log.write(f"forwarder log suppressed {self._log_suppressed}\n")
-                self._log_suppressed = 0
-            log.write(line)
+            for text in lines:
+                log.write(text)
             log.flush()
 
     def server_bind(self) -> None:

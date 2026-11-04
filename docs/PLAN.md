@@ -749,7 +749,8 @@ request head per connection and never parses anything after it. In order:
 6. Log refusals and cut tunnels with the name and the reason only, never
    payload, at most `log_lines_per_minute` lines per minute: refusals cost a
    client no budget, so the log has its own, and one
-   `forwarder log suppressed <n>` line counts what it dropped.
+   `forwarder log suppressed <n>` line, itself within that budget, counts
+   what it dropped.
 
 Steps 1 to 3 refuse before any DNS lookup, so a refused name can't leak
 through DNS. A hard cap on open connections before the head comes on top, so

@@ -2219,6 +2219,109 @@ class LoggingTest(ForwarderTestCase):
         time.sleep(SETTLE)
         self.assertEqual(self.log.lines(), ["forwarder refused method -"] * 3)
 
+    SUPPRESSED = re.compile(r"^forwarder log suppressed ([1-9][0-9]*)$")
+
+    def timed_log(self) -> tuple[list[tuple[float, str]], io.TextIOBase]:
+        # A log that records the FakeClock's time of every line written.
+        written: list[tuple[float, str]] = []
+        clock = self.clock
+
+        class TimedLog(io.TextIOBase):
+            def write(self, text: str) -> int:
+                for line in text.splitlines():
+                    written.append((clock.now, line))
+                return len(text)
+
+        return written, TimedLog()
+
+    def assert_no_minute_over(self, written: list[tuple[float, str]], limit: int) -> None:
+        # Every 60-second window [t, t + 60) that starts at a written line
+        # holds at most `limit` lines, the suppressed counts included.
+        times = [moment for moment, _line in written]
+        for index, start in enumerate(times):
+            inside = [line for moment, line in written if start <= moment < start + 60]
+            self.assertLessEqual(len(inside), limit, f"the minute from line {index} at {start}: {inside}")
+
+    def test_the_suppressed_count_takes_a_place_in_the_log_window(self) -> None:
+        # G10: the count line is a line on the host's disk like any other, so
+        # it is charged to the same window. When a single place comes free
+        # it goes to the count, and the line that found it is dropped and
+        # counted in the next one, so no minute exceeds the budget.
+        written, log = self.timed_log()
+        server = self.start(Limits(log_lines_per_minute=3), clock=self.clock, sink=None, log=log)
+        start = self.clock.now
+        for offset in (0, 10, 20):
+            self.clock.now = start + offset
+            server.sink(Outcome(None, f"refused:{('method', 'port', 'busy')[offset // 10]}", 0, 0, 0.0))
+        self.clock.now = start + 30
+        for _ in range(5):
+            server.sink(Outcome("example.invalid", "refused:unlisted", 0, 0, 0.0))
+        # Each of the first three lines leaves the window on its own: room
+        # for one line each time, which the count takes.
+        for offset in (60.5, 70.5, 80.5):
+            self.clock.now = start + offset
+            server.sink(Outcome(None, "refused:malformed", 0, 0, 0.0))
+        # Once the window is empty, the count and the line go out together.
+        self.clock.now = start + 141
+        server.sink(Outcome(None, "refused:literal", 0, 0, 0.0))
+        self.assertEqual([line for _moment, line in written], [
+            "forwarder refused method -",
+            "forwarder refused port -",
+            "forwarder refused busy -",
+            "forwarder log suppressed 5",
+            "forwarder log suppressed 1",
+            "forwarder log suppressed 1",
+            "forwarder log suppressed 1",
+            "forwarder refused literal -",
+        ])
+        self.assert_no_minute_over(written, 3)
+        # The counts add up to every line dropped: five, then three.
+        self.assertEqual(sum(int(match[1]) for _moment, line in written if (match := self.SUPPRESSED.match(line))), 8)
+
+    def test_no_minute_holds_more_than_the_budget_under_a_flood(self) -> None:
+        # G10/G8: a flood whose lines leave the window at staggered moments,
+        # with bursts. In no 60-second window does the log hold more than
+        # log_lines_per_minute lines, counts included, and the counts add up
+        # to every line dropped.
+        limit = 4
+        written, log = self.timed_log()
+        server = self.start(Limits(log_lines_per_minute=limit), clock=self.clock, sink=None, log=log)
+        # Mostly a second or more apart, so most lines leave the window one
+        # at a time; the bursts and the 0.4 s step share buckets.
+        steps = (2.3, 4.1, 1.7, 9.0, 3.3, 0.4)
+        sent = 0
+        alone = together = 0
+        for index in range(600):
+            self.clock.now += steps[index % len(steps)]
+            for _ in range(3 if index % 37 == 0 else 1):
+                before = len(written)
+                server.sink(Outcome("example.invalid", "refused:unlisted", 0, 0, 0.0))
+                sent += 1
+                new = [line for _moment, line in written[before:]]
+                if new and self.SUPPRESSED.match(new[0]):
+                    if len(new) == 1:
+                        alone += 1
+                    else:
+                        together += 1
+        # A quiet minute, then one more line, which brings the last count.
+        self.clock.now += 61
+        server.sink(Outcome(None, "refused:method", 0, 0, 0.0))
+        sent += 1
+        self.assert_no_minute_over(written, limit)
+        counts = [int(match[1]) for _moment, line in written if (match := self.SUPPRESSED.match(line))]
+        refusals = [line for _moment, line in written if not self.SUPPRESSED.match(line)]
+        self.assertEqual(sum(counts) + len(refusals), sent)
+        self.assertEqual(refusals[-1], "forwarder refused method -")
+        # The flood really was cut, more than once, both ways (a count alone
+        # where one place came free, a count with its line where two did),
+        # and lines kept coming through after the first minute.
+        self.assertGreater(len(counts), 10)
+        self.assertGreater(alone, 0)
+        self.assertGreater(together, 0)
+        self.assertGreater(len(refusals), 2 * limit)
+        for line in refusals[:-1]:
+            self.assertEqual(line, "forwarder refused unlisted example.invalid")
+
 
 class ServerClassTest(ForwarderTestCase):
     """Supporting (SPEC 3.2): the server class behaves like FetchServer where it must, and binding looks nothing up."""
