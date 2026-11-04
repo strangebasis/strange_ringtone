@@ -147,7 +147,9 @@ jobs:
     # image brought up with compose.example.yaml itself, the fetcher on
     # internal networks and the forwarder the only way out, with no YouTube
     # traffic. The engine must be 28.0 or newer, as the contract says, and
-    # Compose 2.27.1 or newer, for the example's per-network driver_opts.
+    # Compose 2.27.1 or newer, for the example's per-network driver_opts
+    # (endpoint sysctls that turn forwarding and redirects off on each
+    # interface; the engine has had them since 27.0.1).
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

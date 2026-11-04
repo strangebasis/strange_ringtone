@@ -49,11 +49,13 @@
 # Docker daemon doesn't rotate by default, and the forwarder logs every
 # refusal, so an unrotated log could fill the host's disk.
 #
-# The fetcher and its forwarder also turn IP forwarding off in their network
-# namespaces, refuse ICMP redirects, and cap their processes and threads
-# (`sysctls`, the `driver_opts` on each of their networks, and `pids_limit`
-# below); none of these settings needs a capability. The per-network
-# `driver_opts` need Docker Compose 2.27.1 or newer.
+# The fetcher and its forwarder also turn IP forwarding off on every
+# interface of their network namespaces, refuse ICMP redirects, and cap their
+# processes and threads (`sysctls`, the `driver_opts` on each of their
+# networks, and `pids_limit` below); none of these settings needs a
+# capability. Inside them net.ipv4.ip_forward still reads 1, by design: see
+# the fetcher's `sysctls`. The per-network `driver_opts` (endpoint sysctls,
+# Docker Engine 27.0.1 and newer) need Docker Compose 2.27.1 or newer.
 
 name: strange_ringtone
 
@@ -167,33 +169,42 @@ services:
     # that reports 64 CPUs), so 1 + 16 + 2 + 1 + 67 = 87. 200 is more than
     # twice that.
     pids_limit: 200
-    # Forwarding off. A new network namespace copies the host's
-    # net.ipv4.ip_forward, which dockerd turns on, so a container on two
+    # Forwarding off, on every interface. A new network namespace copies the
+    # host's IPv4 forwarding, which dockerd turns on, so a container on two
     # networks would route packets between them. The fetcher routes nothing:
-    # yt-dlp leaves through the forwarder's CONNECT gate. Docker sets this
-    # namespaced sysctl as it creates the container, so it needs no
-    # capability, and /proc/sys is read-only inside, so UID 10001 can't turn
-    # it back on. Nothing for IPv6: its forwarding is already 0 in these
-    # containers, and an IPv6 sysctl would stop the container from starting
-    # on a kernel without IPv6.
+    # yt-dlp leaves through the forwarder's CONNECT gate. The kernel forwards
+    # a packet only when the interface it arrived on has forwarding on
+    # (Documentation/networking/ip-sysctl.rst, conf/interface/forwarding), so
+    # `default` (for each interface created later), `lo`, and each attached
+    # interface (the endpoint sysctl on each network below) are all 0, and
+    # nothing is forwarded.
     #
-    # ICMP redirects refused. Linux treats a namespace with forwarding off as
-    # a host, and a host follows its router's redirects (RFC 1122), so
-    # turning forwarding off sets all.accept_redirects to 1. Only a route's
-    # current gateway can redirect it, and the fetcher has no gateway, but it
-    # refuses them anyway. With forwarding off the kernel accepts a redirect
-    # when `all` or the receiving interface says 1, so every value is 0:
-    # `all`; `default`, for any interface added later; `lo`, which exists
-    # before Docker writes `default`; and each interface Docker attaches,
-    # through the endpoint sysctl on each network below (IFNAME is that
-    # interface, whose name follows the attach order). Nothing for IPv6:
-    # these networks give the container no IPv6, and an IPv6 sysctl would
-    # stop it from starting on a kernel without IPv6.
-    # Known gap (docs/PLAN.md 6.1): Docker writes these sysctls in no fixed
-    # order, and when it writes ip_forward after all.accept_redirects the
-    # kernel sets `all` back to 1, which this file can't prevent.
+    # The global switch is left alone, so net.ipv4.ip_forward (the same value
+    # as conf/all/forwarding) still reads 1 in here, by design: don't read
+    # it as forwarding on. Writing it, or conf/all/forwarding, makes the
+    # kernel reset all.accept_redirects to 1 (the host defaults of RFC 1122),
+    # and Docker writes a container's sysctls in no fixed order, so that
+    # write would undo the redirect refusal below in most starts (measured:
+    # 10 of 12). Never add either here.
+    #
+    # ICMP redirects refused. A namespace whose interfaces don't forward is a
+    # host, and a host follows its router's redirects (RFC 1122). Only a
+    # route's current gateway can redirect it, and the fetcher has no
+    # gateway, but it refuses them anyway. The kernel accepts a redirect when
+    # `all` or the receiving interface says 1, so every value is 0: `all`;
+    # `default`, for any interface added later; `lo`, which exists before
+    # Docker writes `default`; and each interface Docker attaches, through the
+    # endpoint sysctl on each network below.
+    #
+    # Docker sets these namespaced sysctls as it creates the container, so
+    # they need no capability, and /proc/sys is read-only inside, so UID
+    # 10001 can't change them back. Nothing for IPv6: its forwarding is
+    # already 0 in these containers, these networks give them no IPv6, and an
+    # IPv6 sysctl would stop the container from starting on a kernel without
+    # IPv6.
     sysctls:
-      net.ipv4.ip_forward: "0"
+      net.ipv4.conf.default.forwarding: "0"
+      net.ipv4.conf.lo.forwarding: "0"
       net.ipv4.conf.all.accept_redirects: "0"
       net.ipv4.conf.default.accept_redirects: "0"
       net.ipv4.conf.lo.accept_redirects: "0"
@@ -210,18 +221,20 @@ services:
     # owns the fetcher's /tmp job directories and results, and able to read
     # the server's environment. This layout alone doesn't keep third-party
     # code off the proxy or out of the app's requests and responses.
-    # Each attachment sets its own interface's accept_redirects to 0 (see
-    # `sysctls` above): Docker replaces IFNAME with the interface it creates
-    # for that network. This engine (29.8) attaches the interfaces after it
-    # writes `default`, so they would read 0 without it; the option sets each
-    # one directly whatever the engine's order.
+    # Each attachment turns forwarding and redirects off on its own interface
+    # (see `sysctls` above): Docker replaces IFNAME with the interface it
+    # creates for that network, whose name follows the attach order. Engine
+    # 29.8 attaches the interfaces after it writes `default`, so they would
+    # read 0 without this; the option sets each one directly whatever the
+    # engine's order. It is the per-interface form Docker supports: a
+    # `sysctls` entry naming eth0 is refused, or deprecated on older engines.
     networks:
       fetcher:
         driver_opts:
-          com.docker.network.endpoint.sysctls: net.ipv4.conf.IFNAME.accept_redirects=0
+          com.docker.network.endpoint.sysctls: "net.ipv4.conf.IFNAME.forwarding=0,net.ipv4.conf.IFNAME.accept_redirects=0"
       egress:
         driver_opts:
-          com.docker.network.endpoint.sysctls: net.ipv4.conf.IFNAME.accept_redirects=0
+          com.docker.network.endpoint.sysctls: "net.ipv4.conf.IFNAME.forwarding=0,net.ipv4.conf.IFNAME.accept_redirects=0"
     # `up -d fetcher` brings the forwarder up too, so yt-dlp's proxy is there.
     depends_on:
       - fetcher-forwarder
@@ -285,18 +298,21 @@ services:
     # tunnels_per_minute (90) bounds them; and the health check: 1 + 64 + 90
     # + 1 = 156. 320 is more than twice that.
     pids_limit: 320
-    # Forwarding off, as for the fetcher. The forwarder has an interface on
-    # `egress` and on `outside`, with a default route, so with forwarding on
-    # its kernel would route a packet from the fetcher out, around the
-    # CONNECT gate, the moment anything could send it one. It relays in user
-    # space and needs no kernel forwarding.
+    # Forwarding off on every interface, as for the fetcher, and for the same
+    # reasons with the global switch left alone (net.ipv4.ip_forward reads 1
+    # in here by design; never set it or conf/all/forwarding). The forwarder
+    # has an interface on `egress` and on `outside`, with a default route, so
+    # with forwarding on its kernel would route a packet from the fetcher
+    # out, around the CONNECT gate, the moment anything could send it one. It
+    # relays in user space and needs no kernel forwarding.
     #
-    # ICMP redirects refused, as for the fetcher, and with the same known gap.
-    # Forwarding off makes the forwarder a host that would follow its
-    # router's redirects; its one gateway is the Docker host on `outside`,
-    # the only sender a redirect is taken from, and it refuses them anyway.
+    # ICMP redirects refused, as for the fetcher. With its interfaces not
+    # forwarding, the forwarder is a host that would follow its router's
+    # redirects; its one gateway is the Docker host on `outside`, the only
+    # sender a redirect is taken from, and it refuses them anyway.
     sysctls:
-      net.ipv4.ip_forward: "0"
+      net.ipv4.conf.default.forwarding: "0"
+      net.ipv4.conf.lo.forwarding: "0"
       net.ipv4.conf.all.accept_redirects: "0"
       net.ipv4.conf.default.accept_redirects: "0"
       net.ipv4.conf.lo.accept_redirects: "0"
@@ -309,15 +325,15 @@ services:
     # `outside` included, where the Docker host itself can reach it (Engine
     # 28 and newer drop direct routing to unpublished ports from elsewhere):
     # nothing but the forwarder may join `outside`, and nothing on the host
-    # should use that port. Each attachment refuses redirects on its own
-    # interface, as for the fetcher.
+    # should use that port. Each attachment turns forwarding and redirects
+    # off on its own interface, as for the fetcher.
     networks:
       egress:
         driver_opts:
-          com.docker.network.endpoint.sysctls: net.ipv4.conf.IFNAME.accept_redirects=0
+          com.docker.network.endpoint.sysctls: "net.ipv4.conf.IFNAME.forwarding=0,net.ipv4.conf.IFNAME.accept_redirects=0"
       outside:
         driver_opts:
-          com.docker.network.endpoint.sysctls: net.ipv4.conf.IFNAME.accept_redirects=0
+          com.docker.network.endpoint.sysctls: "net.ipv4.conf.IFNAME.forwarding=0,net.ipv4.conf.IFNAME.accept_redirects=0"
     # json-file with rotation: Docker keeps every line forever unless the
     # daemon or the service sets max-size, so a flood of refusals could fill
     # the host's disk. 3 x 10 MB per container at most.

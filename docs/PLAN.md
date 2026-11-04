@@ -489,8 +489,8 @@ forwarder. PR B will move yt-dlp into the runner and update them again.
   from internal networks, and the internal networks' `isolated` gateway
   modes, which keep the Docker host off them, arrived in 28.0
   (moby/moby#49262). With Compose, Docker Compose 2.27.1 or newer, for the
-  per-network `driver_opts` that refuse ICMP redirects on each interface
-  (6.1).
+  per-network `driver_opts` that turn forwarding off and refuse ICMP
+  redirects on each interface (6.1).
   Settings: `PUBLIC_ORIGIN` (required), `TRUSTED_PROXIES`,
   `FETCH_MAX_SECONDS` (600, at most 600: `decode.js`
   refuses input over 10 minutes, so a longer video would be downloaded only
@@ -574,52 +574,77 @@ source of abuse.
   one today (the fetcher's only routes are its on-link subnets, it has no
   capability to add a route or craft a frame, and the host has no address
   on the isolated networks), but that is one capability or one route away
-  from a path around the gate. So the fetcher and the forwarder set
-  `sysctls: {net.ipv4.ip_forward: "0"}` (owner, 2026-11-04). Docker writes
-  the namespaced sysctl as it creates the container, so it needs no
-  capability; it works under `read_only` and `cap_drop: [ALL]`, turns
-  forwarding off on every interface, and UID 10001 can't turn it back on,
-  because `/proc/sys` is read-only inside (EROFS). IPv6 forwarding already
-  reads 0 in these containers, on the example's networks and on an internal
-  network with IPv6 turned on, so no IPv6 sysctl is set: it would stop a
-  container from starting on a kernel without IPv6 (checked on Engine 29.8
-  by the fix stage, 2026-11-04).
-- Forwarding off makes Linux treat the namespace as a host, and a host
-  follows its router's ICMP redirects (RFC 1122): writing
-  `net.ipv4.ip_forward` 0 sets `net.ipv4.conf.all.accept_redirects` to 1,
-  and with forwarding off the kernel takes a redirect when `all` or the
-  receiving interface says 1. A redirect is taken only from a route's
-  current gateway: the fetcher has none, and the forwarder's is the Docker
-  host on `outside`. Both refuse them anyway (owner, 2026-11-04): `all`,
-  `default` and `lo` at 0 in `sysctls`, and each interface Docker attaches
-  through its endpoint sysctl on every network attachment
+  from a path around the gate. So the fetcher and the forwarder turn
+  forwarding off (owner, 2026-11-04), on every interface rather than with
+  the global switch (owner, 2026-11-04, after the race below).
+- The kernel forwards a packet only when the interface it arrived on has
+  forwarding on (`Documentation/networking/ip-sysctl.rst`,
+  `conf/interface/forwarding`). So the fetcher and the forwarder set
+  `net.ipv4.conf.default.forwarding` (every interface created later) and
+  `net.ipv4.conf.lo.forwarding` to 0 in `sysctls`, and each interface
+  Docker attaches through its endpoint sysctl on every network attachment
   (`driver_opts: {com.docker.network.endpoint.sysctls:
-  net.ipv4.conf.IFNAME.accept_redirects=0}`; Docker replaces `IFNAME` with
-  the interface it creates, whose name follows the attach order). Engine
-  29.8 attaches the interfaces after it writes the container's sysctls, so
-  they take `default`'s 0 anyway (with a network's option removed, its
-  interface still read 0); the per-attachment option sets each one
-  whatever the engine's order. `lo` exists before `default` is written, so
-  it needs its own sysctl. An endpoint sysctl must name `IFNAME` (the engine
-  refuses `all`, `default` or `lo` there), and the engine refuses an
-  interface's sysctl through `--sysctl` (`eth0`) but not `lo`'s. Endpoint
-  sysctls predate the 28.0 floor (Engine 27); a service network's
-  `driver_opts` needs Docker Compose 2.27.1 or newer. Nothing for IPv6, as
-  for forwarding. All checked on Engine 29.8 and Compose 5.5 by the fix
-  stage, 2026-11-04.
-- **Open, for the owner:** Docker passes a container's sysctls as a map, and
-  they are written in no fixed order, so when `ip_forward` is written after
-  `all.accept_redirects` the kernel sets `all` back to 1. Measured on Engine
-  29.8: with the example's settings, `all` read 1 in 5 of 6 fetcher starts
-  and 1 of 6 forwarder starts, and 8 to 10 of 12 `docker run` starts, while
-  `default`, `lo` and every interface read 0 every time. An endpoint sysctl
-  can't set `all`. Turning forwarding off per interface instead
-  (`default.forwarding` and `lo.forwarding` 0 in `sysctls`, and
-  `net.ipv4.conf.IFNAME.forwarding=0` beside the redirect setting on each
-  attachment) and leaving `ip_forward` alone made every `accept_redirects`
-  and every interface's `forwarding` read 0 in 12 of 12 `docker run` and 6
-  of 6 Compose starts; `ip_forward`, the `all` switch, then reads 1, though
-  the kernel forwards by the receiving interface's own value.
+  "net.ipv4.conf.IFNAME.forwarding=0,net.ipv4.conf.IFNAME.accept_redirects=0"}`;
+  Docker replaces `IFNAME` with the interface it creates, whose name follows
+  the attach order). With every interface at 0 nothing is forwarded, while
+  the global switch, `net.ipv4.ip_forward` (the same value as
+  `conf/all/forwarding`), still reads 1 inside, by design. A compose test
+  routes datagrams from a helper on a stand-in for `egress` through a
+  container with the forwarder's settings toward a listener on a stand-in
+  for `outside`: none arrive, the router's own counters show it received
+  them and forwarded none, and a control router with forwarding on delivers
+  them (checked on Engine 29.8 by the fix stage, 2026-11-04). Docker writes
+  these namespaced sysctls as it creates the container, so they need no
+  capability; they work under `read_only` and `cap_drop: [ALL]`, and UID
+  10001 can't change them back, because `/proc/sys` is read-only inside
+  (EROFS). IPv6 forwarding already reads 0 in these containers, on the
+  example's networks and on an internal network with IPv6 turned on, so no
+  IPv6 sysctl is set: it would stop a container from starting on a kernel
+  without IPv6.
+- Why the global switch is left alone: writing `net.ipv4.ip_forward` (or
+  `conf/all/forwarding`) runs the kernel's forwarding change, which sets
+  `net.ipv4.conf.all.accept_redirects` to 1 (RFC 1122's host defaults), and
+  Docker passes a container's sysctls as a map and writes them in no fixed
+  order. With `ip_forward` 0 beside `all.accept_redirects` 0, `all` read 1
+  in 10 of 12 `docker run` starts and in 5 of 6 fetcher and 1 of 6
+  forwarder Compose starts on Engine 29.8. With forwarding off per
+  interface and `ip_forward` never written, every `accept_redirects` and
+  every interface's `forwarding` read 0 in 12 of 12 `docker run` and 6 of 6
+  Compose starts, both services healthy (redirects stage, 2026-11-04), and
+  the stack test passed 5 of 5 runs (fix stage). Anyone who checks only
+  `ip_forward` sees 1: read the per-interface values instead.
+- A namespace whose interfaces don't forward is a host, and a host follows
+  its router's ICMP redirects (RFC 1122); the kernel takes a redirect when
+  `all` or the receiving interface says 1, and only from a route's current
+  gateway: the fetcher has none, and the forwarder's is the Docker host on
+  `outside`. Both refuse them anyway (owner, 2026-11-04): `all`, `default`
+  and `lo` at 0 in `sysctls`, and each attached interface through the same
+  endpoint sysctl. Engine 29.8 attaches the interfaces after it writes the
+  container's sysctls, so they take `default`'s 0 anyway (with a network's
+  option removed, its interface still read 0); the per-attachment option
+  sets each one whatever the engine's order. `lo` exists before `default`
+  is written, so it needs its own sysctls. An endpoint sysctl must name
+  `IFNAME` (the engine refuses `all`, `default`, `lo` and
+  `net.ipv4.ip_forward` there), and the engine refuses an interface's
+  sysctl through `--sysctl` (`eth0`) but not `lo`'s. Nothing for IPv6, as
+  for forwarding. Checked on Engine 29.8 and Compose 5.5 (redirects stage,
+  2026-11-04).
+- Versions, from Docker's documentation (checked 2026-11-04): endpoint
+  sysctls (`com.docker.network.endpoint.sysctls`) first appear in the
+  Docker Engine 27.0.1 release notes (2024-06-24), below the 28.0 floor,
+  and the same notes say that a per-interface `--sysctl` such as
+  `net.ipv4.conf.eth0.*` will be rejected in a future release (Engine 29.8
+  does reject it), which is why the per-attachment option is the way to set
+  an interface. The Compose Specification gives Docker Compose v2.27.1 for
+  `driver_opts` on a service's network (compose-spec commit d04baf3,
+  2024-07-18), so 2.27.1 is the Compose floor.
+- On an internal network, Docker's own host rules drop a packet whose
+  destination is off the network's subnet before it reaches any container
+  on the bridge: a router container with forwarding on received none of the
+  datagrams sent through it (Engine 29.8, fix stage, 2026-11-04). That is a
+  second layer on `egress` today, not one the layout relies on: it depends
+  on the engine's firewall rules, and the per-interface settings hold
+  without it.
 - prlimit's `--nproc` for yt-dlp is `RLIMIT_NPROC`, which the kernel counts
   per UID across every container that runs as 10001 (without user-namespace
   remapping), so it is no per-container bound. The cgroup's pids controller
@@ -651,9 +676,11 @@ IPv6 on for them doesn't bring the host back); `outside` keeps its gateway,
 the forwarder's route out. Every service rotates its log (json-file, `max-size` and
 `max-file`), so a flood of refusals can't fill the host's disk. Every
 container of the fetcher image (the fetcher and the forwarder in PR A, the
-runner too from PR B) sets `net.ipv4.ip_forward: "0"`, so none of them routes
-between its networks, refuses ICMP redirects (`accept_redirects` 0 for `all`,
-`default`, `lo` and, on each network attachment, its interface), and sets a
+runner too from PR B) turns forwarding off on every interface (`forwarding`
+0 for `default`, `lo` and, on each network attachment, its interface, and
+never the global `ip_forward`, which reads 1 inside by design), so none of
+them routes between its networks, refuses ICMP redirects (`accept_redirects`
+0 for `all`, `default`, `lo` and each attachment's interface), and sets a
 `pids_limit` of at least twice its worst case.
 
 ```
@@ -725,11 +752,12 @@ a flood of half-open connections can't exhaust threads before step 3's
 budgets apply.
 
 The forwarder's container has the contract's flags, nothing writable, a
-128 MB memory limit, IP forwarding off (it relays in user space, so its
-kernel never routes from `egress` to `outside`), ICMP redirects refused on
-every interface (forwarding off would otherwise let its one gateway, the
-Docker host on `outside`, redirect its routes; see the open ordering
-question above), and `pids_limit: 320`. That
+128 MB memory limit, IP forwarding off on every interface (it relays in
+user space, so its kernel never routes from `egress` to `outside`; the
+global `ip_forward` is left at 1, see What it rests on), ICMP redirects
+refused on every interface (with its interfaces not forwarding, its one
+gateway, the Docker host on `outside`, could otherwise redirect its routes),
+and `pids_limit: 320`. That
 is at least twice its worst case of 156 threads: the main thread, one per
 open connection (`connections_max`, 64), the lookups (each in a thread that
 lives until glibc gives up, at most 10 s with the `resolv.conf` Docker
@@ -788,18 +816,20 @@ they are.
   - the forwarder's limits, named in the README (its log budget included)
   - `gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated` on the
     internal networks, and log rotation on every service
-  - `sysctls: {net.ipv4.ip_forward: "0"}` and a `pids_limit` on the fetcher
-    (200) and the forwarder (320), neither needing a capability (owner,
+  - IP forwarding off per interface and ICMP redirects refused on the
+    fetcher and the forwarder: `net.ipv4.conf.{default,lo}.forwarding: "0"`
+    and `net.ipv4.conf.{all,default,lo}.accept_redirects: "0"` in `sysctls`,
+    and `com.docker.network.endpoint.sysctls:
+    "net.ipv4.conf.IFNAME.forwarding=0,net.ipv4.conf.IFNAME.accept_redirects=0"`
+    in the `driver_opts` of each of their network attachments, with
+    `net.ipv4.ip_forward` and `conf/all/forwarding` never set (so
+    `ip_forward` reads 1 inside by design), no capability needed (owner,
     2026-11-04)
-  - ICMP redirects refused on the fetcher and the forwarder:
-    `net.ipv4.conf.{all,default,lo}.accept_redirects: "0"` in `sysctls`, and
-    `com.docker.network.endpoint.sysctls:
-    net.ipv4.conf.IFNAME.accept_redirects=0` in the `driver_opts` of each of
-    their network attachments, no capability needed (owner, 2026-11-04);
-    the ordering question above is open
+  - a `pids_limit` on the fetcher (200) and the forwarder (320), no
+    capability needed (owner, 2026-11-04)
   - Docker Engine 28.0 or newer (the first release with the isolated gateway
-    modes), and Docker Compose 2.27.1 or newer for a service network's
-    `driver_opts`
+    modes; endpoint sysctls date from 27.0.1), and Docker Compose 2.27.1 or
+    newer for a service network's `driver_opts`
 - planned for PR B:
   - the runner command and the `jobs` network (`egress` moves from the
     fetcher to the runner)
@@ -878,7 +908,7 @@ test to fail.
 | S2 | The fetcher (PR A) and the runner (PR B) refuse to start with a default route, or an unreadable or unparsable route table, unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`), in-image and Compose topology tests | PR A (the fetcher), PR B (the runner) |
 | I1 | The base interpreter's site-packages hold no third-party distribution and no `.pth` file, and its `sys.path` leaves out the venv | in-image | PR A |
 | T1 | In the compose layout, the fetcher (PR A) and the runner (PR B) have no default route and resolve no external name, and the host has no IPv4 or IPv6 address on their internal networks (also with IPv6 turned on for such a network); the forwarder has the only default route, and the fetcher image refuses to start on `outside` unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | Compose topology tests | PR A, extended in PR B |
-| T2 | PR A: the fetcher reaches the forwarder over `egress`, the forwarder reaches nothing on the `fetcher` network and nothing there reaches it. PR B: the runner reaches the forwarder and nothing on the `fetcher` network, and the fetcher can't reach the forwarder | Compose topology tests | PR A, reworded in PR B |
+| T2 | PR A: the fetcher reaches the forwarder over `egress`, the forwarder reaches nothing on the `fetcher` network and nothing there reaches it, and the fetcher and the forwarder have forwarding 0 on every interface and every `accept_redirects` 0 (a container with the forwarder's settings routes no datagram between two networks, against a control router that does). PR B: the runner reaches the forwarder and nothing on the `fetcher` network, and the fetcher can't reach the forwarder | Compose topology tests | PR A, reworded in PR B |
 | T3 | The running forwarder refuses an unlisted name, an IP literal, port 80 and other methods before DNS, and logs the name and the reason only | Compose topology tests | PR A |
 
 ## 7. Web app
@@ -1349,13 +1379,14 @@ docs/PLAN.md
        (`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`,
        Docker Engine 28.0 or newer), log rotation on every service, the
        forwarder's log budget and its absolute-name lookups
-     - IP forwarding off (`net.ipv4.ip_forward: "0"`) and a `pids_limit` on
+     - IP forwarding off on every interface (`forwarding` 0 for `default`,
+       `lo` and each network attachment's interface, never the global
+       `ip_forward`, which reads 1 inside by design) and a `pids_limit` on
        the fetcher (200) and the forwarder (320), each at least twice its
        worst case from its own caps (owner, 2026-11-04)
      - ICMP redirects refused on both (`accept_redirects` 0 for `all`,
        `default`, `lo` and each network attachment's interface, Docker
-       Compose 2.27.1 or newer; owner, 2026-11-04), with the sysctl
-       ordering question in 6.1 open
+       Compose 2.27.1 or newer; owner, 2026-11-04)
      - the **Compose topology tests** job (T1 to T3, in PR A's wording)
      - the README contract, `.env.example`, CLAUDE.md and section 6
 

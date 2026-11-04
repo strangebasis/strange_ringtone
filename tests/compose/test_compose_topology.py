@@ -94,6 +94,45 @@ YTDLP_RUN_THREADS = 1 + 1 + 2 + 63
 ACCEPT_REDIRECTS_SYSCTLS = tuple(f"net.ipv4.conf.{name}.accept_redirects" for name in ("all", "default", "lo"))
 ENDPOINT_SYSCTLS = "com.docker.network.endpoint.sysctls"
 IFNAME_ACCEPT_REDIRECTS = "net.ipv4.conf.IFNAME.accept_redirects"
+# Forwarding off per interface (compose.example.yaml): the kernel forwards a
+# packet only when the interface it arrived on has forwarding on, so default
+# and lo are set through `sysctls` and each attached interface through its
+# attachment's endpoint sysctl. The global switch (ip_forward, the same value
+# as conf/all/forwarding) is never written: writing it resets
+# all.accept_redirects to 1, and Docker writes sysctls in no fixed order. So
+# ip_forward reads 1 inside by design, and no running test asserts it.
+FORWARDING_SYSCTLS = tuple(f"net.ipv4.conf.{name}.forwarding" for name in ("default", "lo"))
+IFNAME_FORWARDING = "net.ipv4.conf.IFNAME.forwarding"
+GLOBAL_FORWARDING_SYSCTLS = (IP_FORWARD, "net.ipv4.conf.all.forwarding")
+# The behaviour proof (ForwardingBehaviourTest): UDP datagrams from a helper
+# on a copy of `egress`, routed through a router container, to a listener on
+# a copy of `outside`. Each phase sends this many, this far apart.
+ROUTED_DATAGRAMS = 20
+ROUTED_INTERVAL = 0.05
+ROUTED_PORT = 18082
+ROUTED_WAIT_SECONDS = 15.0
+
+
+def _endpoint_sysctls(options: dict[str, Any]) -> dict[str, list[str]]:
+    """The endpoint sysctls of one network attachment's driver_opts: each key with every value it is given."""
+    entries: dict[str, list[str]] = {}
+    for entry in str(options.get(ENDPOINT_SYSCTLS, "")).split(","):
+        key, _sep, value = entry.strip().partition("=")
+        if key:
+            entries.setdefault(key, []).append(value)
+    return entries
+
+
+def _network_flag(network: str, options: dict[str, Any]) -> str:
+    """docker run's --network value for one network with these driver options (a CSV field each, quoted)."""
+    fields = [f"name={network}"]
+    for key, value in sorted(options.items()):
+        text = f"{key}={value}"
+        # The value is a comma-separated list, so the field is quoted; a quote
+        # inside would need CSV escaping, which no example option has.
+        assert '"' not in text, text
+        fields.append(f'"driver-opt={text}"')
+    return ",".join(fields)
 
 
 def _worst_case_threads() -> dict[str, int]:
@@ -372,6 +411,67 @@ for name in sorted(os.listdir(base)):
     with open(base + '/' + name + '/accept_redirects') as handle:
         values[name] = handle.read().strip()
 print(json.dumps(values))
+"""
+
+# A UDP listener on a copy of `outside`: it says `ready`, then prints each
+# datagram's text and source address, until LIFETIME seconds pass in silence.
+_ROUTED_LISTENER = r"""
+import socket
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+    server.bind(('0.0.0.0', PORT))
+    server.settimeout(LIFETIME)
+    print('ready', flush=True)
+    while True:
+        try:
+            data, peer = server.recvfrom(64)
+        except socket.timeout:
+            break
+        print(data.decode('ascii', 'replace') + ' ' + peer[0], flush=True)
+"""
+
+# The helper on a copy of `egress` (root, NET_ADMIN and nothing else): for each
+# phase it points a /32 route to the listener at that phase's router (netlink
+# RTM_NEWROUTE, create or replace, in the main table), then sends the phase's
+# name in UDP datagrams to the listener. It prints netlink's answer per phase
+# (0 is success). A router forwards them only if the interface they arrive on
+# has forwarding on.
+_ROUTING_HELPER = r"""
+import json, socket, struct, time
+RTM_NEWROUTE, NLMSG_ERROR = 24, 2
+FLAGS = 0x1 | 0x4 | 0x400 | 0x100  # NLM_F_REQUEST, ACK, CREATE, REPLACE
+
+def set_route(destination, gateway):
+    attributes = b''
+    for kind, value in ((1, socket.inet_aton(destination)), (5, socket.inet_aton(gateway))):  # RTA_DST, RTA_GATEWAY
+        attributes += struct.pack('=HH', 4 + len(value), kind) + value
+    # rtmsg: AF_INET, /32, no source, tos 0, RT_TABLE_MAIN, RTPROT_BOOT,
+    # RT_SCOPE_UNIVERSE, RTN_UNICAST, no flags.
+    body = struct.pack('=BBBBBBBBI', socket.AF_INET, 32, 0, 0, 254, 3, 0, 1, 0) + attributes
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE) as sock:
+        sock.bind((0, 0))
+        sock.sendall(struct.pack('=IHHII', 16 + len(body), RTM_NEWROUTE, FLAGS, 1, 0) + body)
+        reply = sock.recv(65536)
+    if struct.unpack('=H', reply[4:6])[0] != NLMSG_ERROR:
+        return 'unexpected reply'
+    return struct.unpack('=i', reply[16:20])[0]
+
+answers = {}
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+    for phase, router in PHASES:
+        answers[phase] = set_route(LISTENER, router)
+        for _ in range(COUNT):
+            sender.sendto(phase.encode('ascii'), (LISTENER, PORT))
+            time.sleep(INTERVAL)
+print(json.dumps(answers))
+"""
+
+# The IPv4 counters of the reader's network namespace (/proc/net/snmp, the
+# `Ip:` header line and its value line).
+_IP_COUNTERS_PROBE = r"""
+import json
+with open('/proc/net/snmp', encoding='ascii') as handle:
+    lines = [line.split() for line in handle.read().splitlines() if line.startswith('Ip:')]
+print(json.dumps(dict(zip(lines[0][1:], lines[1][1:]))))
 """
 
 # http.client to loopback, as the service's own healthcheck does.
@@ -858,15 +958,36 @@ class LayoutTest(unittest.TestCase):
         """T2 (static): no kernel routing between the networks of a two-network container, around the CONNECT gate."""
         for name in FETCHER_IMAGE_SERVICES:
             with self.subTest(service=name):
-                sysctls = self._service(name).get("sysctls") or {}
+                service = self._service(name)
+                sysctls = service.get("sysctls") or {}
                 self.assertIsInstance(sysctls, dict, sysctls)
-                # A new network namespace copies the host's 1, so leaving it
-                # out turns forwarding on.
-                self.assertEqual(str(sysctls.get(IP_FORWARD)), "0", f"{name}: {sysctls!r}")
+                # A new network namespace copies the host's 1, and the kernel
+                # forwards whatever arrives on an interface whose forwarding
+                # is on, so default (interfaces made later) and lo are 0 here
+                # and each attached interface is 0 below.
+                for key in FORWARDING_SYSCTLS:
+                    self.assertEqual(str(sysctls.get(key)), "0", f"{name}: {key} in {sysctls!r}")
+                # Never the global switch: writing it resets
+                # all.accept_redirects to 1, and Docker writes sysctls in no
+                # fixed order, so the redirect refusal would hold only in
+                # some starts.
+                for key in GLOBAL_FORWARDING_SYSCTLS:
+                    self.assertNotIn(key, sysctls, f"{name} writes the global forwarding switch {key}")
                 # IPv6 forwarding is already 0 there (StackTest), and an IPv6
                 # sysctl would stop the container from starting on a kernel
                 # without IPv6.
                 self.assertEqual([key for key in sysctls if key.startswith("net.ipv6.")], [], sysctls)
+                networks = service.get("networks") or {}
+                self.assertIsInstance(networks, dict, networks)
+                self.assertTrue(networks, f"{name} joins no network")
+                for network, attachment in networks.items():
+                    entries = _endpoint_sysctls((attachment or {}).get("driver_opts") or {})
+                    # Exactly one setting each, 0, on the interface Docker
+                    # creates for this attachment.
+                    self.assertEqual(entries.get(IFNAME_FORWARDING), ["0"], f"{name} on {network}: {entries!r}")
+                    self.assertEqual(entries.get(IFNAME_ACCEPT_REDIRECTS), ["0"], f"{name} on {network}: {entries!r}")
+                    for key in GLOBAL_FORWARDING_SYSCTLS:
+                        self.assertNotIn(key, entries, f"{name} on {network}: {entries!r}")
 
     def test_the_fetcher_and_its_forwarder_cap_processes_at_twice_their_worst_case(self) -> None:
         """Supporting (G8): a cgroup pids_limit of at least twice each service's worst case from its own caps."""
@@ -1133,12 +1254,16 @@ class StackTest(unittest.TestCase):
                 expected = (services.get(service) or {}).get("pids_limit")
                 self.assertIsInstance(expected, int, f"{service} sets no pids_limit")
                 state = self._probe_output(self._stack.exec_in(service, _FORWARDING_PROBE), f"{service} forwarding")
-                self.assertEqual(state["ip_forward"], "0", state)
-                # Per interface too: the global switch sets every interface,
-                # and both networks' interfaces must be among them (control).
+                # Per interface: the kernel forwards only what arrives on an
+                # interface whose forwarding is on. Control: default, lo and
+                # one interface per network are there to read. `all` (the
+                # global switch, ip_forward) is left alone by design and
+                # reads 1, so it isn't asserted.
                 interfaces = {name for name in state["ipv4"] if name not in ("all", "default", "lo")}
+                self.assertLessEqual({"default", "lo"}, set(state["ipv4"]), state)
                 self.assertEqual(len(interfaces), 2, state)
-                self.assertEqual({value for value in state["ipv4"].values()}, {"0"}, state)
+                per_interface = {name: value for name, value in state["ipv4"].items() if name != "all"}
+                self.assertEqual({name: value for name, value in per_interface.items() if value != "0"}, {}, state)
                 # IPv6 forwarding is off without a sysctl of ours, wherever the
                 # kernel has IPv6 at all.
                 self.assertTrue({value for value in state["ipv6"].values()} <= {"0", None}, state)
@@ -1358,21 +1483,192 @@ class Ipv6HostIsolationTest(unittest.TestCase):
         network = self._network("v6-forwarding", options)
         for service in FETCHER_IMAGE_SERVICES:
             with self.subTest(service=service):
-                sysctls = ((loaded.get("services") or {}).get(service) or {}).get("sysctls") or {}
-                self.assertEqual(str(sysctls.get(IP_FORWARD)), "0", sysctls)
+                definition = (loaded.get("services") or {}).get(service) or {}
+                sysctls = definition.get("sysctls") or {}
+                for key in FORWARDING_SYSCTLS:
+                    self.assertEqual(str(sysctls.get(key)), "0", sysctls)
+                # Both services are on `egress`; its attachment's endpoint
+                # sysctls set the interface this network gets.
+                attachment = dict(((definition.get("networks") or {}).get("egress") or {}).get("driver_opts") or {})
+                self.assertEqual(_endpoint_sysctls(attachment).get(IFNAME_FORWARDING), ["0"], attachment)
                 flags: list[str] = []
                 for key, value in sorted(sysctls.items()):
                     flags += ["--sysctl", f"{key}={value}"]
                 state = self._output(
-                    self._run("--rm", "--name", self._container(f"v6-forwarding-{service}"), "--network", network,
+                    self._run("--rm", "--name", self._container(f"v6-forwarding-{service}"),
+                              "--network", _network_flag(network, attachment),
                               *HARDENING, *flags, IMAGE, "python", "-I", "-c", _FORWARDING_PROBE),
                     f"{service} forwarding probe on {network}",
                 )
-                self.assertEqual(state["ip_forward"], "0", state)
+                # IPv4 per interface (default, lo, eth0); `all` is the global
+                # switch, left alone by design.
+                self.assertLessEqual({"default", "lo", "eth0"}, set(state["ipv4"]), state)
+                self.assertEqual({name: value for name, value in state["ipv4"].items()
+                                  if name != "all" and value != "0"}, {}, state)
                 # Control: IPv6 is really on for the container's interface,
                 # so the zeros below are read from a live IPv6 stack.
                 self.assertEqual(state["ipv6_disabled"].get("eth0"), "0", state)
                 self.assertEqual({value for value in state["ipv6"].values()}, {"0"}, state)
+
+
+class ForwardingBehaviourTest(unittest.TestCase):
+    """T2 by behaviour: a container with the forwarder's settings routes nothing, although ip_forward reads 1.
+
+    The example turns forwarding off per interface and leaves the global
+    switch alone, so net.ipv4.ip_forward reads 1 inside; this shows that the
+    kernel still forwards nothing. Two throwaway bridge networks named after
+    a unique project stand in for `egress` and `outside`. Both are plain
+    bridges: on an internal network Docker's own host rules drop a packet
+    whose destination is off the network's subnet before it reaches any
+    container (measured on Engine 29.8: the control router received
+    nothing), which would hide the kernel's behaviour behind the host's. On
+    both, the router under test runs the forwarder's command with the
+    forwarder's sysctls and endpoint sysctls from `compose config`, and a
+    control router has forwarding on (net.ipv4.ip_forward=1). A listener
+    sits on the `outside` stand-in, and a helper on the `egress` stand-in
+    sends datagrams to it through the router under test first and then
+    through the control, which must deliver them or the setup proves
+    nothing. The router's own counters show the datagrams reached it. Only
+    the helper has a capability (root with NET_ADMIN alone, to set its own
+    route). Nothing is published and nothing leaves the host: every
+    destination is a container's address on these two networks.
+    """
+
+    def setUp(self) -> None:
+        self.stack = Stack()
+        self.addCleanup(self.stack.close)
+
+    def _network(self, suffix: str) -> str:
+        name = self.stack.network(suffix)
+        result = _docker("network", "create", name, timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, f"docker network create {name}: {result.stderr.strip()}")
+        # Cleanups run last in, first out: the containers on it go first.
+        self.addCleanup(_docker, "network", "rm", name, timeout=60)
+        return name
+
+    def _container(self, suffix: str) -> str:
+        name = f"{self.stack.project}-{suffix}"
+        self.addCleanup(_docker, "rm", "-f", name, timeout=60)
+        return name
+
+    def _start(self, *args: str) -> None:
+        # --pull never: a missing image must fail here, not fetch from a registry.
+        result = _docker("run", "--pull", "never", "-d", *args, timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+
+    def _address(self, container: str, network: str) -> str:
+        result = _docker("inspect", "--format", "{{json .NetworkSettings.Networks}}", container,
+                         timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        address = ((json.loads(result.stdout) or {}).get(network) or {}).get("IPAddress", "")
+        self.assertTrue(_is_ip(address), f"{container} has no address on {network}: {result.stdout}")
+        return address
+
+    def _listener_lines(self, container: str) -> list[str]:
+        result = _docker("logs", container, timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def test_a_container_with_the_forwarders_settings_routes_nothing(self) -> None:
+        """Datagrams routed through the forwarder's settings never arrive; through the control router they do."""
+        config = self.stack.compose("config", "--format", "json")
+        self.assertEqual(config.returncode, 0, f"docker compose config: {config.stderr.strip()}")
+        loaded = json.loads(config.stdout)
+        forwarder = (loaded.get("services") or {}).get("fetcher-forwarder") or {}
+        attachments = forwarder.get("networks") or {}
+        sysctls = forwarder.get("sysctls") or {}
+        endpoint = {name: dict(((attachments.get(name) or {}).get("driver_opts")) or {})
+                    for name in ("egress", "outside")}
+        for name, options in endpoint.items():
+            self.assertEqual(_endpoint_sysctls(options).get(IFNAME_FORWARDING), ["0"], f"{name}: {options!r}")
+        egress = self._network("route-egress")
+        outside = self._network("route-outside")
+        flags: list[str] = []
+        for key, value in sorted(sysctls.items()):
+            flags += ["--sysctl", f"{key}={value}"]
+
+        listener = self._container("route-listener")
+        self._start("--name", listener, "--network", outside, *HARDENING, IMAGE, "python", "-I", "-c",
+                    f"PORT = {ROUTED_PORT!r}\nLIFETIME = 120\n" + _ROUTED_LISTENER)
+        router = self._container("route-forwarder")
+        self._start("--name", router, "--network", _network_flag(egress, endpoint["egress"]),
+                    "--network", _network_flag(outside, endpoint["outside"]),
+                    *HARDENING, *flags, IMAGE, *FORWARDER_COMMAND)
+        control = self._container("route-control")
+        self._start("--name", control, "--network", egress, "--network", outside, *HARDENING,
+                    "--sysctl", f"{IP_FORWARD}=1", IMAGE, "python", "-I", "-c", "import time; time.sleep(300)")
+
+        deadline = time.monotonic() + ROUTED_WAIT_SECONDS
+        while "ready" not in self._listener_lines(listener) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertIn("ready", self._listener_lines(listener), "the listener did not start")
+        target = self._address(listener, outside)
+        phases = [("forwarder", self._address(router, egress)), ("control", self._address(control, egress))]
+
+        state = self._output_of(_docker("exec", router, "python", "-I", "-c", _FORWARDING_PROBE,
+                                        timeout=PROBE_RUN_TIMEOUT), "router forwarding probe")
+        # Control: the router is on both networks. The switch nobody writes
+        # goes into the failure message, not an assertion.
+        interfaces = {name for name in state["ipv4"] if name not in ("all", "default", "lo")}
+        self.assertEqual(len(interfaces), 2, state)
+        before = self._ip_counters(router)
+
+        helper = self._container("route-helper")
+        answers = self._output_of(
+            _docker("run", "--pull", "never", "--rm", "--name", helper, "--network", egress,
+                    "--user", "0:0", "--read-only", "--cap-drop", "ALL", "--cap-add", "NET_ADMIN",
+                    "--security-opt", "no-new-privileges:true", IMAGE, "python", "-I", "-c",
+                    f"PHASES = {phases!r}\nLISTENER = {target!r}\nPORT = {ROUTED_PORT!r}\n"
+                    f"COUNT = {ROUTED_DATAGRAMS!r}\nINTERVAL = {ROUTED_INTERVAL!r}\n" + _ROUTING_HELPER,
+                    timeout=PROBE_RUN_TIMEOUT),
+            "routing helper",
+        )
+        self.assertEqual(answers, {"forwarder": 0, "control": 0}, f"setting the helper's route failed: {answers}")
+
+        # The control's datagrams were sent last: once they are in, anything
+        # the router under test had forwarded would be in too.
+        deadline = time.monotonic() + ROUTED_WAIT_SECONDS
+        while True:
+            lines = self._listener_lines(listener)
+            if any(line.startswith("control ") for line in lines) or time.monotonic() > deadline:
+                break
+            time.sleep(0.2)
+        subnet = ipaddress.ip_network(self._subnet(egress))
+        received = [line.split() for line in lines if line != "ready"]
+        control_sources = {fields[1] for fields in received if fields[0] == "control"}
+        self.assertTrue(control_sources, f"control: nothing arrived through the forwarding router: {lines}")
+        # Routed, not translated: the listener sees the helper's own address.
+        self.assertTrue(all(ipaddress.ip_address(source) in subnet for source in control_sources), lines)
+        self.assertEqual(
+            [fields for fields in received if fields[0] == "forwarder"], [],
+            f"the forwarder's settings forwarded datagrams (ip_forward reads {state['ip_forward']!r}): {state}",
+        )
+        # The router under test received them (so they were refused there,
+        # not lost on the way) and forwarded none.
+        after = self._ip_counters(router)
+        self.assertGreaterEqual(after["InReceives"] - before["InReceives"], ROUTED_DATAGRAMS, (before, after))
+        self.assertEqual(after["ForwDatagrams"], before["ForwDatagrams"], (before, after))
+
+    def _ip_counters(self, container: str) -> dict[str, int]:
+        """The container's own IPv4 counters from /proc/net/snmp (its network namespace's)."""
+        return {key: int(value) for key, value in self._output_of(
+            _docker("exec", container, "python", "-I", "-c", _IP_COUNTERS_PROBE, timeout=PROBE_RUN_TIMEOUT),
+            f"{container} IP counters",
+        ).items()}
+
+    def _subnet(self, network: str) -> str:
+        result = _docker("network", "inspect", "--format", "{{json .IPAM.Config}}", network, timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        subnets = [entry.get("Subnet") for entry in json.loads(result.stdout) or []
+                   if "." in (entry.get("Subnet") or "")]
+        self.assertEqual(len(subnets), 1, result.stdout)
+        return subnets[0]
+
+    def _output_of(self, result: subprocess.CompletedProcess[str], what: str) -> Any:
+        self.assertEqual(result.returncode, 0, f"{what} failed: {result.stderr.strip()}")
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines, f"{what} printed nothing: {result.stderr.strip()}")
+        return json.loads(lines[-1])
 
 
 class ResolverSearchDomainTest(unittest.TestCase):
