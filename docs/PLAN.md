@@ -1,9 +1,9 @@
 # strange_ringtone: research and v0.1.0 plan
 
 Status: design agreed on 2026-10-24 (decisions in section 3). Milestones 0
-to 2 are done, milestone 3 (render) is implemented, and milestone 4 (web app)
-is implemented with its Web Share check pending the owner's phone test
-(section 12).
+to 5 are merged; the owner's phone tests of the share sheet and the Shortcut
+are still open (section 12). Before the release (milestone 6), the fetcher's
+egress confinement (section 6.1, decided on 2026-11-03) lands in two PRs.
 This file is the design record; the README's "Deployment contract" becomes the
 source of truth for operators once v0.1.0 ships.
 
@@ -73,6 +73,7 @@ you care about, for example in Files.
 | 7 | Licence | **AGPL-3.0-or-later.** The full text, with the "how to apply" lines naming this project. | Section 13 of the licence: the UI must offer users the source (section 7.5). |
 | 8 | Releases | **release-please** opens release PRs from conventional commits | The release-please job needs `contents` and `pull-requests` write, and commit prefixes are mandatory (section 9.3). |
 | 9 | Tone names (2026-10-25) | **Readable Unicode.** iOS shows the download's filename as the tone name (section 5.6). | A bigger sanitiser and test set. Look-alike characters are possible, which is harmless for names on your own phone. |
+| 10 | Fetcher egress (2026-11-03) | **The fetcher image confines itself.** yt-dlp runs in a runner container on internal networks only, and its one way out is the image's own CONNECT forwarder, which allows YouTube's hosts on port 443 within budgets (section 6.1). No TLS interception. | Two more containers from the fetcher image. The gate confines the fetcher to Google's front ends, not to YouTube alone. Docker Engine 26.0 or newer. |
 
 Phase 0 confirmed decision 2: the share sheet accepts `.m4a`, `.m4r` and
 `.mp3` up to 30.0 s. A `MAX_CLIP_SECONDS` above 30 only helps people who
@@ -130,6 +131,9 @@ install through Finder or iMazing.
 The browser is the only bridge. Audio from the fetcher reaches the core only as
 WAV that the browser made, so the core's input surface is the same with or
 without the fetcher.
+
+Inside the fetcher, yt-dlp moves to a container of its own whose only way out
+is the image's forwarder (section 6.1, milestone 5's follow-up).
 
 ## 5. Core image
 
@@ -370,6 +374,11 @@ core still needs no egress, and `FETCH_ENABLED` only shows the YouTube box.
 
 ## 6. Fetcher image (opt-in)
 
+Section 6.1, decided on 2026-11-03, moves yt-dlp into a container of its own
+and gives the image its own egress gate. The bullets below describe the
+fetcher as merged in milestone 5; the follow-up PRs (section 12) update them as
+they land.
+
 - **Input:** JSON `{video_id}` only. The ID must match `^[A-Za-z0-9_-]{11}$`, and
   the server builds `https://www.youtube.com/watch?v=<id>` itself. No URL a user
   typed ever reaches yt-dlp, which removes the SSRF path (yt-dlp's generic
@@ -479,6 +488,182 @@ core still needs no egress, and `FETCH_ENABLED` only shows the YouTube box.
   `tests/image_fetcher/` (not `tests/image/`, which is the core's), gated by
   `STRANGE_RINGTONE_FETCHER_IMAGE_TESTS=1`.
 
+### 6.1 Egress confinement (decided 2026-11-03)
+
+The owner chose this design on 2026-11-03, after a review of five options.
+Milestone 5's follow-up builds it in two PRs (section 12). Until they land,
+the bullets above describe the fetcher as merged.
+
+**Threat.** The likeliest compromise is a malicious yt-dlp, yt-dlp-ejs or
+Deno release that arrives through a Dependabot bump and runs as the fetcher's
+UID. The fetcher holds no secrets, so the design limits reach. That code must
+not get to the LAN, the host, a VPN, cloud metadata, the reverse proxy, or the
+app's requests and responses, and it must not turn the owner's address into a
+source of abuse.
+
+**What it rests on** (checked on 2026-11-03 in throwaway containers):
+
+- Google's front ends route by the `Host` header, so a tunnel to
+  `www.youtube.com` also reaches other Google services, including relays that
+  fetch any website. A hostname allowlist therefore confines the fetcher to
+  Google's front ends, not to YouTube. Only TLS interception would narrow it.
+- yt-dlp follows redirects and format URLs to any host, so a response alone
+  can steer it. It sends `Connection: close`, so each tunnel carries one
+  request.
+- Deno, as yt-dlp runs it, has no access to files, the environment,
+  subprocesses or the network.
+- `python -I` still runs `.pth` lines from its site-packages (`-S` doesn't),
+  and pip writes a wheel's scripts and data files into the interpreter's
+  prefix. A wheel installed for the server's interpreter is code in the
+  server.
+- A container on an `internal: true` network has no default route. From
+  Docker Engine 26.0 it also has no external DNS (CVE-2024-29018 stopped DNS
+  forwarding from internal networks).
+- Python 3.12's `ipaddress` calls `64:ff9b::a9fe:a9fe` (NAT64 for
+  169.254.169.254) and `::169.254.169.254` global.
+- A child with the same UID can read its parent's `/proc/<pid>/environ`, and
+  it can ptrace the parent where Yama's `ptrace_scope` is 0.
+
+**Layout.** The fetcher image runs as three containers. Every network but
+`outside` is `internal: true`.
+
+```
+ reverse proxy
+      │  fetcher network
+      ▼
+ fetcher            our server only, on the base interpreter
+      │  jobs network
+      ▼
+ fetcher-runner     yt-dlp and Deno, from the venv
+      │  egress network (HTTPS_PROXY)
+      ▼
+ fetcher-forwarder  the CONNECT gate, on the base interpreter
+      │  outside network: the only route out
+      ▼
+ YouTube's hosts, port 443
+```
+
+- **fetcher** keeps the reverse-proxy side: the API, the queue, the rate
+  limit and the result store of section 6. It sends the runner a validated
+  video ID and treats everything that comes back as untrusted, with timeouts,
+  size caps on the JSON and the audio, and the same metadata whitelist.
+  `TRUSTED_PROXIES` and the proxy's routing stay as they are.
+- **fetcher-runner** runs yt-dlp as section 6 describes (the argument list,
+  `prlimit`, the timeout, an environment built from scratch) behind a small
+  stdlib server that takes one job at a time. It shares no network with the
+  reverse proxy, never sees a browser's request and can't set a response
+  header on the app's origin.
+- **fetcher-forwarder** is the only container with a route out.
+- The core doesn't change.
+
+**The forwarder.** Stdlib Python on one plain port. It reads one request head
+per connection and never parses anything after it. In order:
+
+1. Read the head within a size cap and a deadline. Accept only
+   `CONNECT <name>:443`. Refuse plain-HTTP proxying, other methods, other
+   ports, IP literals, and malformed or non-ASCII names.
+2. Match the lowercased name, by whole labels, against the allowlist:
+   `youtube.com` and its subdomains, and the subdomains of `googlevideo.com`.
+   Suffixes cost nothing here, because every allowed name reaches the same
+   front ends, and they keep churn low. Piped's proxy allowlists the same way.
+3. Check the budgets: concurrent tunnels and new tunnels per minute.
+4. Only then resolve the name, IPv4 only and within a deadline. Refuse unless
+   every address is global unicast. IPv4 only sidesteps the NAT64 and
+   IPv4-compatible forms above.
+5. Connect to an address that passed, without resolving again, and answer
+   `200`. Then copy bytes both ways within caps: upload bytes per tunnel and
+   per minute (yt-dlp sends requests, never large bodies), download bytes per
+   tunnel, an idle timeout and a lifetime.
+6. Log refusals and cut tunnels with the name and the reason only, never
+   payload.
+
+Steps 1 to 3 refuse before any DNS lookup, so a refused name can't leak
+through DNS. The budgets are sized with headroom from one measured fetch, or
+set generously if the owner declines that fetch, and they become contract
+limits.
+
+**Fail closed.** The fetcher and the runner refuse to start when their
+container has a default route, IPv4 or IPv6, because something other than the
+forwarder could then carry traffic out. `FETCH_ALLOW_DEFAULT_ROUTE=true` turns
+the check off where egress is filtered some other way (a Kubernetes
+NetworkPolicy, for example), and the offline dev stack sets it. The check
+replaces requiring `HTTPS_PROXY`, which a malicious yt-dlp would ignore.
+
+**Image.** yt-dlp and yt-dlp-ejs install into a venv from the same hashed
+lock, and only the runner starts yt-dlp from it. The fetcher and the forwarder
+run the base interpreter, whose site-packages hold no third-party
+distribution, so a wheel's `.pth`, scripts and data files can't reach them.
+Keeping one image leaves CI, Trivy, publishing, provenance and Dependabot as
+they are.
+
+**Contract changes**, none of which needs a breaking marker before v0.1.0:
+
+- the runner and forwarder commands, and the `jobs`, `egress` and `outside`
+  networks
+- `FETCH_ALLOW_DEFAULT_ROUTE`, how the fetcher finds the runner (an address
+  that defaults to the compose service) and how the runner finds the
+  forwarder (`HTTPS_PROXY`)
+- the forwarder's limits
+- `/tmp` per container (expected: the runner `FETCH_MAX_BYTES + 16 MB`, the
+  fetcher `2 × FETCH_MAX_BYTES`)
+- Docker Engine 26.0 or newer
+
+**Dropped, and why.**
+
+- **TLS interception.** It would narrow the gate from Google's front ends to
+  YouTube, but the fetcher holds nothing worth stealing, traffic relayed
+  through Google reaches its target from Google's addresses, and YouTube
+  itself stays a command channel (descriptions, comments, an attacker's
+  account) that no `Host` check closes. It would put a TLS server, an HTTP
+  parser and a CA in the path, and replace yt-dlp's TLS fingerprint, which
+  rules out curl_cffi impersonation if YouTube ever fingerprints TLS.
+- **A "front" container before the fetcher.** The runner split keeps
+  third-party code off the reverse proxy's network without a new image or a
+  second `X-Forwarded-For` hop.
+- **Requiring `HTTPS_PROXY` at startup.** The route check replaces it.
+- **Making the server non-dumpable.** Moot once yt-dlp runs in another
+  container. If a release ever ships PR A without PR B, PR A must add it.
+- **An off-the-shelf gate.** Smokescreen (Stripe's egress proxy) came closest,
+  but it has no port rule or byte budgets, accepts clients without
+  certificates only through a YAML setting, and its release tags are years
+  apart. Squid, tinyproxy, Envoy and mitmproxy fit worse: an audit backlog; a
+  critical header-parsing bug and no address check after DNS; warnings about
+  confused-deputy attacks from untrusted clients; and a large dependency tree.
+- **An environment variable that extends the allowlist.** A new YouTube host
+  means a release. This is a default the owner can overrule before PR A.
+
+**Accepted risks.** A compromised runner can still reach other Google
+services through the shared front ends, within the forwarder's budgets.
+YouTube stays a command channel. Docker Engine before 26.0 leaks DNS from
+internal networks, which is why the contract requires 26.0. The forwarder is
+our own code at the boundary, so it stays small.
+
+**Checks and their tests.** Every check gets its failing test before its code
+(section 12), and the verification panel removes each check and expects a
+test to fail.
+
+| ID | Check | Tested by |
+| --- | --- | --- |
+| G1 | Only `CONNECT` to port 443; plain-HTTP proxying, other methods and other ports are refused | unit |
+| G2 | IP literals and malformed, over-long or non-ASCII names are refused | unit |
+| G3 | The name matches the allowlist by whole labels (`youtube.com.example.net` and `notyoutube.com` are refused) | unit |
+| G4 | G1 to G3 and the budgets are decided before any DNS lookup | unit, with a resolver that records its calls |
+| G5 | IPv4 only, and every resolved address is global unicast | unit, with fake answers: private, loopback, link-local, CGNAT, multicast, mixed |
+| G6 | The connection goes to an address that passed, without a second lookup | unit |
+| G7 | The request head has a size cap and a read deadline | unit |
+| G8 | Concurrent tunnels and new tunnels per minute are capped | unit |
+| G9 | Upload and download bytes are capped, with an idle timeout and a lifetime | unit |
+| G10 | Logs hold the name and the reason only | unit |
+| R1 | The runner accepts only a valid video ID, and one job at a time | unit |
+| R2 | The runner builds yt-dlp's environment from scratch, with the proxy settings | unit (today's tests move) |
+| R3 | The runner deletes its job directory in `finally`, and the audio once collected or after a deadline | unit |
+| S1 | The fetcher caps, times out and re-validates everything the runner returns | unit, with a fake runner |
+| S2 | The fetcher and the runner refuse to start with a default route unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`) and in-image |
+| I1 | The base interpreter's site-packages hold no third-party distribution and no `.pth` file, and its `sys.path` leaves out the venv | in-image |
+| T1 | In the compose layout, the fetcher and the runner have no default route and resolve no external name | Compose topology tests |
+| T2 | The runner reaches the forwarder and nothing on the `fetcher` network; the fetcher can't reach the forwarder | Compose topology tests |
+| T3 | The running forwarder refuses an unlisted name, an IP literal and port 80 | Compose topology tests |
+
 ## 7. Web app
 
 ### 7.1 Trimmer (phone first)
@@ -587,6 +772,10 @@ going off-site.
   caps. Body reads have socket timeouts, and a whole body must arrive within
   60 s of taking a render slot (408 otherwise), so a trickled upload can't hold
   a slot indefinitely. The proxy handles slow-client defence beyond that.
+- **Egress (fetcher):** the fetcher image's own forwarder is the only way
+  out: one CONNECT allowlist to YouTube's hosts on port 443, within budgets.
+  yt-dlp runs in a container that shares no network with the reverse proxy
+  (6.1).
 
 ## 9. Supply chain, CI and releases
 
@@ -634,6 +823,10 @@ Local jobs run with `permissions: contents: read`:
   fetcher's `prlimit` set, the real yt-dlp accepting the exact argument list
   (offline), the CMD answering `/fetch/healthz`, and the fetcher's unit tests
   again under the image's Python 3.12, with the yt-dlp stub.
+- **Compose topology tests** (from the egress follow-up's PR A on): the job
+  builds the fetcher image, brings up `compose.example.yaml` without any
+  YouTube traffic, and checks T1 to T3 of section 6.1. It is the only test
+  that proves the layout.
 - A **PR-title check** (conventional commits, so release-please works). It is a
   stdlib script that reads the title from an `env:` variable, never from inline
   `${{ }}`.
@@ -674,6 +867,8 @@ required, all reported by GitHub Actions:
 - Image tests (from milestone 3; the owner adds it to the ruleset)
 - Fetcher image tests (from milestone 5; the owner adds it to the ruleset,
   named exactly so)
+- Compose topology tests (from the egress follow-up's PR A; the owner adds it
+  to the ruleset, named exactly so)
 
 The repository squash-merges with the PR title as the commit subject, which is
 what release-please reads. A **tag ruleset** on `v*` lets only organisation
@@ -773,6 +968,11 @@ security repository, and never patched with a local copy here.
   tone name.
 - **Fetcher:** the ID regex, URL construction, argument building, metadata
   whitelisting, and heatmap validation. yt-dlp is stubbed, with no network.
+- **Egress (6.1):** the forwarder's policy, ordering and budgets with a fake
+  resolver and connector, the runner protocol against a fake runner, the
+  route check against a fake `/proc`, the image's interpreter isolation, and
+  the compose layout in its own CI job. The table in 6.1 maps each check to
+  its test.
 - **Every security check has a test that fails when the check is removed.**
 
 ## 11. Repository layout (proposed)
@@ -903,6 +1103,28 @@ docs/PLAN.md
    `bestaudio[ext=m4a]` is still served without a PO token; without it the
    first real fetch happens in a deployment. Also open: the owner's phone test
    of the Shortcut.
+
+   **Follow-up: egress confinement (section 6.1, decided on 2026-11-03).** Two
+   PRs before the release, one after the other, because their files overlap:
+
+   - **PR A**, branch `feat/fetcher-forwarder`: the venv, the route check, the
+     forwarder command, and `compose.example.yaml` with the fetcher on
+     internal networks only. The fetcher still runs yt-dlp itself, through the
+     forwarder. PR A also adds the **Compose topology tests** job and updates
+     the README contract, `.env.example`, CLAUDE.md and section 6. If the
+     owner agrees, its product check makes the one real fetch still open
+     above, through the forwarder, and sizes the budgets from it.
+   - **PR B**, branch `feat/fetcher-runner`, from `main` after PR A merges:
+     the runner command and its protocol, the fetcher's runner client, the
+     `jobs` network (`egress` moves from the fetcher to the runner), the dev
+     stack, and the same documentation.
+
+   Each PR runs test first. A spec maps 6.1's check IDs to interfaces and test
+   files. The tests are written, seen to fail for the right reason, reviewed
+   and frozen in a commit. The code then makes them pass without touching
+   them. Finally a verification panel tries to refute "done", which includes
+   removing each check and expecting a test to fail. The owner adds "Compose
+   topology tests" to the ruleset when PR A opens.
 6. **Release:** release-please, publish with provenance, SBOM and image scans, a
    complete README contract, then **v0.1.0**. Stop there. Integration into an
    infrastructure repository happens from that repository.
@@ -956,3 +1178,11 @@ docs/PLAN.md
 - [Tailscale: Enabling HTTPS (Certificate Transparency note)](https://tailscale.com/kb/1153/enabling-https)
 - [Tailscale Serve (identity headers)](https://tailscale.com/kb/1312/serve)
 - [SSD Nodes: Tailscale free plan limits](https://www.ssdnodes.com/learn/tailscale-pricing-explained)
+- [Docker Engine 26.0 release notes (CVE-2024-29018, DNS from internal networks)](https://docs.docker.com/engine/release-notes/26.0/)
+- [OSV MAL-2026-4770: a PyPI package that runs code through a `.pth` file](https://osv.dev/vulnerability/MAL-2026-4770)
+- [Smokescreen, Stripe's egress proxy](https://github.com/stripe/smokescreen)
+- [Zulip: outgoing proxies with Docker Compose](https://zulip.readthedocs.io/projects/docker/en/latest/how-to/compose-outgoing-proxy.html)
+- [piped-proxy's domain allowlist](https://github.com/TeamPiped/piped-proxy/blob/main/src/main.rs)
+- [Joshua Rogers: Squid security audit](https://joshua.hu/squid-security-audit-35-0days-45-exploits)
+- [Debian tracker: tinyproxy CVE-2023-49606](https://security-tracker.debian.org/tracker/CVE-2023-49606)
+- [Envoy: SNI dynamic forward proxy](https://www.envoyproxy.io/docs/envoy/latest/configuration/listeners/network_filters/sni_dynamic_forward_proxy_filter)
