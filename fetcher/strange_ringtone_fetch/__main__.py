@@ -3,9 +3,11 @@
 fetcher/__main__.py explains the directory form and how the core's shared
 modules are found. Settings come from the environment (docs/PLAN.md 6); the
 port is fixed by the contract and only the bind address can change, on the
-command line, so a local run can stay on loopback. Before it binds, the
-entry refuses to start (exit 3) when the container has a default route or its
-route tables can't be read, unless FETCH_ALLOW_DEFAULT_ROUTE=true;
+command line, so a local run can stay on loopback. The fetcher reaches its
+runner (FETCH_RUNNER_URL) over the internal `jobs` network and nothing else;
+yt-dlp runs in the runner's container. Before it binds, the entry refuses to
+start (exit 3) when the container has a default route or its route tables
+can't be read, unless FETCH_ALLOW_DEFAULT_ROUTE=true;
 strange_ringtone_fetch.routes says why.
 """
 from __future__ import annotations
@@ -63,9 +65,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{PROG}: configuration error: {error}", file=sys.stderr)
         return 2
     # After the settings, so a bad FETCH_ALLOW_DEFAULT_ROUTE is a configuration
-    # error and never permission; before FetchServer, so a container that
-    # could reach out past the forwarder never binds its port (docs/PLAN.md
-    # 6.1, S2).
+    # error and never permission; before FetchServer, so a fetcher whose
+    # container could reach anything beyond its internal networks (the reverse
+    # proxy's and the runner's) never binds its port (docs/PLAN.md 6.1, S2).
     if settings.allow_default_route:
         print(f"{PROG}: FETCH_ALLOW_DEFAULT_ROUTE is set: not checking for a default route", file=sys.stderr)
     else:

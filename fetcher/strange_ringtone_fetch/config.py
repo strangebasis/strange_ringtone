@@ -3,6 +3,11 @@
 The same rules as the core's (strange_ringtone.config, whose parsers this
 reuses): every value is checked strictly, any doubt refuses to start, and an
 error names the variable but never its value.
+
+The proxy variables and FETCH_MAX_SECONDS are the runner's settings now
+(strange_ringtone_runner.config, docs/PLAN.md 6.1): the fetcher runs no
+yt-dlp and reaches only its runner, at FETCH_RUNNER_URL. Their rules stay in
+this module, public, so the runner imports them instead of keeping a copy.
 """
 from __future__ import annotations
 
@@ -45,12 +50,16 @@ SCRATCH_DIR = Path("/tmp/strange_ringtone_fetch")
 # Windows is a development platform only, never a deployment target.
 _WINDOWS = sys.platform == "win32"
 
-# decode.js refuses input longer than MAX_INPUT_SECONDS (600 s), so a longer
-# video would be downloaded only for the phone to refuse it.
+# The upper bound of the runner's FETCH_MAX_SECONDS: decode.js refuses input
+# longer than MAX_INPUT_SECONDS (600 s), so a longer video would be
+# downloaded only for the phone to refuse it.
 MAX_SECONDS_LIMIT = 600
 MIB = 1024 * 1024
-# The proxy settings passed on to yt-dlp, and nothing else from the server's
-# environment (strange_ringtone_fetch.ytdlp builds the child's environment).
+# The proxy settings the runner passes on to yt-dlp, and nothing else from its
+# environment (strange_ringtone_runner.ytdlp builds the child's environment).
+# The fetcher reads none of them: it reaches only its runner, directly over
+# `jobs`. They are defined here because the runner's settings
+# (strange_ringtone_runner.config) import these rules rather than copy them.
 PROXY_VARIABLES = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY")
 # What a NO_PROXY list holds: host names, domain suffixes, IP literals, CIDRs
 # and ports, separated by commas, or a lone '*'.
@@ -74,13 +83,10 @@ def _default_scratch_dir() -> Path:
 class Settings:
     public_origin: str
     trusted_proxies: tuple[Network, ...] = ()
-    fetch_max_seconds: int = 600
     fetch_max_bytes: int = 40 * MIB
     fetch_timeout_seconds: int = 120
     rate_limit_fetches_per_minute: int = 5
     fetch_result_ttl_seconds: int = 600
-    # (name, value) pairs from PROXY_VARIABLES that the operator set.
-    proxies: tuple[tuple[str, str], ...] = ()
     # True turns the default-route start check off (docs/PLAN.md 6.1) where
     # egress is filtered some other way. Off by default: fail closed.
     allow_default_route: bool = False
@@ -96,7 +102,6 @@ class Settings:
         return cls(
             public_origin=_parse_public_origin(environ.get("PUBLIC_ORIGIN", "")),
             trusted_proxies=_parse_trusted_proxies(_optional(environ, "TRUSTED_PROXIES")),
-            fetch_max_seconds=_parse_int(environ, "FETCH_MAX_SECONDS", 600, 1, MAX_SECONDS_LIMIT),
             # At least 1 MiB, or no real audio track fits; at most 512 MiB,
             # because /tmp must hold two of them (docs/PLAN.md 6).
             fetch_max_bytes=_parse_int(environ, "FETCH_MAX_BYTES", 40 * MIB, MIB, 512 * MIB),
@@ -105,15 +110,32 @@ class Settings:
             fetch_timeout_seconds=_parse_int(environ, "FETCH_TIMEOUT_SECONDS", 120, 1, 600),
             rate_limit_fetches_per_minute=_parse_int(environ, "RATE_LIMIT_FETCHES_PER_MINUTE", 5, 1),
             fetch_result_ttl_seconds=_parse_int(environ, "FETCH_RESULT_TTL_SECONDS", 600, 1),
-            proxies=_parse_proxies(environ),
             # The core's boolean words only, unstripped: a value the parser
             # doesn't know is a configuration error, so a typo never turns
             # the start check off (docs/PLAN.md 6.1, S2).
             allow_default_route=_parse_bool(environ, "FETCH_ALLOW_DEFAULT_ROUTE", False),
+            runner_url=_parse_runner_url(environ),
         )
 
 
-def _parse_proxies(environ: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+def _parse_runner_url(environ: Mapping[str, str]) -> str:
+    # The proxy URLs' rules (http://host[:port], plain ASCII, no credentials,
+    # path, query or fragment), because the client speaks plain HTTP to one
+    # host and port and nothing else. Unset or empty means the compose service.
+    value = _optional(environ, "FETCH_RUNNER_URL")
+    if value is None:
+        return DEFAULT_RUNNER_URL
+    check_http_url("FETCH_RUNNER_URL", value)
+    return value
+
+
+def parse_proxies(environ: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+    """The (name, value) pairs of PROXY_VARIABLES that are set, in that order, or ConfigError.
+
+    Uppercase names only: the runner hands yt-dlp exactly these, and a
+    lowercase variant would be a second source of truth. Read by the
+    runner's settings (strange_ringtone_runner.config), never by the fetcher's.
+    """
     proxies: list[tuple[str, str]] = []
     for name in PROXY_VARIABLES:
         value = _optional(environ, name)
@@ -123,12 +145,16 @@ def _parse_proxies(environ: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
             if not _NO_PROXY_RE.fullmatch(value):
                 raise ConfigError(f"{name} must be a comma-separated list of hosts, domains or addresses")
         else:
-            _check_proxy_url(name, value)
+            check_http_url(name, value)
         proxies.append((name, value))
     return tuple(proxies)
 
 
-def _check_proxy_url(name: str, value: str) -> None:
+def check_http_url(name: str, value: str) -> None:
+    """Refuse (ConfigError naming name, never value) anything but http://host[:port].
+
+    The rule for the proxy variables and for FETCH_RUNNER_URL alike.
+    """
     # Plain ASCII with no whitespace or control characters, as for
     # PUBLIC_ORIGIN: invisible characters make the checked value differ from
     # what the operator wrote.
@@ -153,11 +179,3 @@ def _check_proxy_url(name: str, value: str) -> None:
         raise ConfigError(f"{name} has a malformed port")
     if parts.path not in ("", "/") or parts.query or parts.fragment or "?" in value or "#" in value:
         raise ConfigError(f"{name} must be a proxy address only: http://host:port")
-
-
-# Public names for the runner's settings (strange_ringtone_runner.config),
-# which read the proxy variables with exactly these rules. Aliases for now,
-# so the runner's package imports; they become the definitions once the
-# fetcher stops reading the proxies itself (docs/PLAN.md 6.1).
-parse_proxies = _parse_proxies
-check_http_url = _check_proxy_url

@@ -1,18 +1,22 @@
-"""An offline development stack for the YouTube flow: core, fetcher and a proxy, all on loopback.
+"""An offline development stack for the YouTube flow: core, runner, fetcher and a proxy, all on loopback.
 
     python -I tools/dev_fetch_stack.py [--port 8080] [--audio FILE] [--ffmpeg PATH] [--timeout SECONDS]
 
 Then open http://127.0.0.1:8080/ (or http://127.0.0.1:8080/#yt=<URL-encoded
-link>) in a browser on this machine. Three servers run in this one process:
+link>) in a browser on this machine. Four servers run in this one process:
 
 - the core from the checkout, with FETCH_ENABLED=true, on 127.0.0.1 and a
   free port. It renders with the stub ffmpeg (tests/stubs/ffmpeg_stub.py)
   unless --ffmpeg names a local one, so the downloaded tone is a placeholder;
-- the fetcher from the checkout, on 127.0.0.1 and a free port, running the
+- the runner from the checkout, on 127.0.0.1 and a free port, running the
   stub yt-dlp (tests/stubs/ytdlp_stub.py) instead of yt-dlp. Nothing ever
   talks to YouTube. The stub hands back --audio, or a generated 60-second
   WAV, as the "m4a" (the browser's decoder goes by content, not by name), with
   a heatmap that peaks about 60 % of the way in;
+- the fetcher from the checkout, on 127.0.0.1 and a free port. It talks to
+  the runner with its real client (strange_ringtone_fetch.runner_client), so
+  the whole chain browser -> proxy -> fetcher -> runner runs offline, with
+  every check the client makes on the runner's answers;
 - a small HTTP/1.0 proxy on 127.0.0.1:--port that forwards /fetch/ paths to
   the fetcher and everything else to the core, unchanged, as the
   deployment's reverse proxy does. PUBLIC_ORIGIN is http://127.0.0.1:<port>.
@@ -21,6 +25,10 @@ Any 11-character video ID fetches the audio. The stub's fixed IDs show each
 failure instead: tooLong____, blocked____, notFound___, failing____,
 oversize___, noAudio____, hanging____ (a timeout after --timeout seconds),
 ctrlTitle__, hugeHeatmap and badHeatmap_ (see the stub's docstring).
+
+No entry point's main() runs (the servers are built here directly), so
+neither the fetcher's nor the runner's default-route check runs, and the
+stack needs no setting.
 
 Development only: it binds loopback addresses and nothing else, and it is
 never part of an image.
@@ -51,8 +59,11 @@ from strange_ringtone.config import Settings as CoreSettings  # noqa: E402
 from strange_ringtone.render import Renderer  # noqa: E402
 from strange_ringtone.server import RingtoneServer  # noqa: E402
 from strange_ringtone_fetch.config import Settings as FetchSettings  # noqa: E402
+from strange_ringtone_fetch.runner_client import RunnerClient  # noqa: E402
 from strange_ringtone_fetch.server import FetchServer  # noqa: E402
-from strange_ringtone_fetch.ytdlp import YtDlp  # noqa: E402
+from strange_ringtone_runner.config import Settings as RunnerSettings  # noqa: E402
+from strange_ringtone_runner.server import RunnerServer  # noqa: E402
+from strange_ringtone_runner.ytdlp import YtDlp  # noqa: E402
 
 LOOPBACK = "127.0.0.1"
 FFMPEG_STUB = ROOT / "tests" / "stubs" / "ffmpeg_stub.py"
@@ -63,7 +74,7 @@ MAX_HEAD_BYTES = 65536
 
 
 class StubYtDlp(YtDlp):
-    """The fetcher's real runner with the stub as its program and the audio it should hand back."""
+    """The runner's real yt-dlp runner with the stub as its program and the audio it should hand back."""
 
     def __init__(self, audio: Path, duration: float, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -168,7 +179,7 @@ def serve(server: socketserver.BaseServer) -> threading.Thread:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Offline core + fetcher + proxy on 127.0.0.1.")
+    parser = argparse.ArgumentParser(description="Offline core + runner + fetcher + proxy on 127.0.0.1.")
     parser.add_argument("--port", type=int, default=8080, help="the proxy's loopback port (default 8080)")
     parser.add_argument("--audio", type=Path, help="a local audio file the stub returns (default: a generated WAV)")
     parser.add_argument("--ffmpeg", help="a local ffmpeg for real renders (default: the stub ffmpeg)")
@@ -188,28 +199,41 @@ def main(argv: list[str] | None = None) -> int:
         command = (args.ffmpeg,) if args.ffmpeg else (sys.executable, "-I", str(FFMPEG_STUB))
         core = RingtoneServer((LOOPBACK, 0), core_settings,
                               renderer=Renderer(command, core_settings.render_timeout_seconds))
+        runner_settings = RunnerSettings(fetch_timeout_seconds=args.timeout, scratch_dir=work / "runner")
+        runner = RunnerServer(
+            (LOOPBACK, 0),
+            runner_settings,
+            ytdlp=StubYtDlp(
+                audio,
+                duration,
+                max_seconds=runner_settings.fetch_max_seconds,
+                max_bytes=runner_settings.fetch_max_bytes,
+                timeout_seconds=runner_settings.fetch_timeout_seconds,
+                command=(sys.executable, "-I", str(YTDLP_STUB)),
+            ),
+        )
+        runner_port = runner.server_address[1]
         fetch_settings = FetchSettings(public_origin=origin, fetch_timeout_seconds=args.timeout,
                                        scratch_dir=work / "fetch")
-        runner = StubYtDlp(
-            audio,
-            duration,
-            max_seconds=fetch_settings.fetch_max_seconds,
-            max_bytes=fetch_settings.fetch_max_bytes,
-            timeout_seconds=fetch_settings.fetch_timeout_seconds,
-            command=(sys.executable, "-I", str(YTDLP_STUB)),
-        )
-        fetcher = FetchServer((LOOPBACK, 0), fetch_settings, runner)
+        # The fetcher's real client, as in a deployment, pointed at the
+        # loopback runner instead of the compose service.
+        client = RunnerClient(f"http://{LOOPBACK}:{runner_port}", fetch_settings.fetch_max_bytes,
+                              fetch_settings.fetch_timeout_seconds)
+        fetcher = FetchServer((LOOPBACK, 0), fetch_settings, client)
         proxy = Proxy(args.port, core.server_address[1], fetcher.server_address[1])
-        for server in (core, fetcher, proxy):
+        # Started in this order and stopped in reverse, so nothing is ever
+        # asked by a server in front of it before it is up.
+        servers: tuple[socketserver.BaseServer, ...] = (core, runner, fetcher, proxy)
+        for server in servers:
             serve(server)
-        print(f"dev stack: open {origin}/ (core :{core.server_address[1]}, fetcher :{fetcher.server_address[1]})",
-              file=sys.stderr)
+        print(f"dev stack: open {origin}/ (core :{core.server_address[1]}, runner :{runner_port}, "
+              f"fetcher :{fetcher.server_address[1]})", file=sys.stderr)
         try:
             threading.Event().wait()
         except KeyboardInterrupt:
             pass
         finally:
-            for server in (proxy, fetcher, core):
+            for server in reversed(servers):
                 server.shutdown()
                 server.server_close()
     return 0
