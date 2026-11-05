@@ -188,6 +188,48 @@ def wait_until(predicate: Callable[[], bool], timeout: float = DEADLINE) -> bool
     return predicate()
 
 
+# Windows takes a whole send into the socket's buffer whenever the buffer has
+# any room, however small SO_SNDBUF is, so a sender there never waits on a
+# slow reader and the tests that need one would prove nothing. The forwarder
+# runs on Linux, where a send waits for room and takes what fits.
+WHOLE_SENDS = "Windows buffers a whole send at once, so a sender never waits on a slow reader there"
+
+
+def throttled_pair(test: unittest.TestCase) -> tuple[socket.socket, socket.socket]:
+    """A connected pair with small buffers, so a send from near waits on far's reader; both closed at cleanup."""
+    near, far = socket.socketpair()
+    test.addCleanup(near.close)
+    test.addCleanup(far.close)
+    near.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    far.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    far.settimeout(DEADLINE)
+    return near, far
+
+
+def slow_reader(sock: socket.socket, want: int, step: int, gap: float) -> tuple[threading.Thread, bytearray]:
+    """Start a thread that reads at most step bytes every gap seconds until want bytes, EOF or an error.
+
+    The bytes it read collect in the returned bytearray; join the thread
+    before looking at them.
+    """
+    received = bytearray()
+
+    def read() -> None:
+        try:
+            while len(received) < want:
+                time.sleep(gap)
+                piece = sock.recv(step)
+                if not piece:
+                    return
+                received.extend(piece)
+        except OSError:
+            return
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    return thread, received
+
+
 class FakeClock:
     """Monotonic seconds that move only when a test says so, for the per-minute windows."""
 
@@ -1649,6 +1691,54 @@ class RelayCapsTest(ForwarderTestCase):
         # cut came from the send, not from a quiet receive side.
         self.assertNotEqual(writer.get("result"), "complete", "the forwarder never blocked on the client")
         self.assertLess(outcome.download_bytes, total)
+
+    @unittest.skipIf(sys.platform == "win32", WHOLE_SENDS)
+    def test_a_reader_that_keeps_reading_slowly_is_not_cut_as_idle(self) -> None:
+        # G9 (Copilot's review of 96b7db0): the idle timeout is time with no
+        # byte moving. sendall's timeout bounds the whole call (Python 3.5
+        # and later), so a relayed chunk to a peer that read it steadily but
+        # slowly was cut as idle while bytes were still moving. Each partial
+        # write must re-arm the idle timeout instead. 4 KiB every 0.05 s:
+        # room to send comes about every 0.1 s, five times inside the idle
+        # timeout, and the whole 128 KiB takes about 1.6 s, three times it.
+        idle = 0.5
+        server = self.start(Limits(idle_timeout_seconds=idle, lifetime_seconds=30))
+        near, far = throttled_pair(self)
+        payload = bytes(range(256)) * 512
+        reader, received = slow_reader(far, len(payload), 4096, 0.05)
+        started = time.monotonic()
+        try:
+            server._send(near, payload, started + 30)
+        except server_module._Cut as cut:
+            self.fail(f"a reader that kept reading was cut as {cut.token!r} after {time.monotonic() - started:.2f} s")
+        elapsed = time.monotonic() - started
+        reader.join(DEADLINE)
+        self.assertEqual(bytes(received), payload)
+        # The send outlasted the idle timeout, or this test proved nothing.
+        self.assertGreater(elapsed, 2 * idle)
+
+    @unittest.skipIf(sys.platform == "win32", WHOLE_SENDS)
+    def test_the_lifetime_still_bounds_a_send_that_keeps_moving(self) -> None:
+        # G9: re-arming the idle timeout on each partial write must not let a
+        # send that keeps moving outlive the tunnel. The lifetime still cuts
+        # it, on time and as "lifetime"; at this pace the whole 128 KiB would
+        # take about 1.6 s.
+        lifetime = 0.6
+        server = self.start(Limits(idle_timeout_seconds=5, lifetime_seconds=30))
+        near, far = throttled_pair(self)
+        payload = bytes(range(256)) * 512
+        reader, received = slow_reader(far, len(payload), 4096, 0.05)
+        started = time.monotonic()
+        with self.assertRaises(server_module._Cut) as raised:
+            server._send(near, payload, started + lifetime)
+        elapsed = time.monotonic() - started
+        # EOF for the reader, so it stops once it has drained what was sent.
+        near.close()
+        reader.join(DEADLINE)
+        self.assertEqual(raised.exception.token, "lifetime")
+        self.assertGreaterEqual(elapsed, lifetime * 0.8)
+        self.assertLess(elapsed, lifetime + 0.5)
+        self.assertLess(len(received), len(payload))
 
     def test_a_reset_ends_the_tunnel_ok_and_logs_nothing(self) -> None:
         # G9/G10: a peer that resets (or a send that fails) has gone, which

@@ -556,19 +556,25 @@ class Forwarder(socketserver.ThreadingTCPServer):
         counts[0] += len(chunk)
 
     def _send(self, sock: socket.socket, data: bytes, end_of_life: float) -> None:
-        # A peer that stops reading would block sendall forever; bound it by
-        # the idle timeout and by what is left of the lifetime, whichever
-        # comes first, and cut with the matching reason.
-        now = time.monotonic()
-        life_left = end_of_life - now
-        if life_left <= 0:
-            raise _Cut("lifetime")
+        # A peer that stops reading would block a send forever; bound each
+        # wait by the idle timeout and by what is left of the lifetime,
+        # whichever comes first, and cut with the matching reason. send(),
+        # not sendall(): since Python 3.5 sendall's timeout bounds the whole
+        # call, so a chunk to a peer that read it slowly but steadily was cut
+        # as idle while bytes were still moving. Each partial write re-arms
+        # the idle timeout, and the lifetime still bounds the whole send.
         idle = self.limits.idle_timeout_seconds
-        sock.settimeout(min(idle, life_left))
-        try:
-            sock.sendall(data)
-        except TimeoutError:
-            raise _Cut("lifetime" if life_left < idle else "idle") from None
+        view = memoryview(data)
+        while view:
+            life_left = end_of_life - time.monotonic()
+            if life_left <= 0:
+                raise _Cut("lifetime")
+            sock.settimeout(min(idle, life_left))
+            try:
+                sent = sock.send(view)
+            except TimeoutError:
+                raise _Cut("lifetime" if life_left < idle else "idle") from None
+            view = view[sent:]
 
 
 class TunnelHandler(socketserver.BaseRequestHandler):
