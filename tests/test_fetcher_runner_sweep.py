@@ -33,7 +33,9 @@ from unittest import mock
 
 import helpers
 from strange_ringtone_fetch.metadata import FetchError
+from strange_ringtone_fetch.routes import DefaultRoute
 from strange_ringtone_runner import __main__ as runner_entry
+from strange_ringtone_runner import config as runner_config
 from strange_ringtone_runner import ytdlp
 from strange_ringtone_runner.config import Settings
 from strange_ringtone_runner.server import RunnerServer
@@ -48,6 +50,13 @@ WNOHANG = getattr(os, "WNOHANG", 1)
 LEFTOVER_STUB = helpers.ROOT / "tests" / "stubs" / "leftover_stub.py"
 # The real sweep runs only where it can harm nothing but a throwaway
 # container: PID 1 on Linux, in the fetcher image's test run, which sets this.
+SWEEP_LINE = "strange_ringtone_runner: PID 1: killing and reaping a run's leftovers at each run boundary"
+# What the entry says when FETCH_ALLOW_NO_SWEEP lets it serve where the sweep
+# can't run (owner's decision Q4, 2026-11-05).
+NO_SWEEP_LINE = (
+    "strange_ringtone_runner: FETCH_ALLOW_NO_SWEEP is set and the sweep can't run here (not PID 1, or no "
+    "kill and waitpid): a run's leftovers are not killed and reaped (README, Runs with)"
+)
 IN_IMAGE_AS_PID_1 = (
     sys.platform.startswith("linux")
     and os.getpid() == 1
@@ -153,6 +162,52 @@ class Syscalls:
             yield self
 
 
+def start_entry(
+    pid: int, environ: dict[str, str], routes: tuple[DefaultRoute, ...] = (), missing: tuple[Any, str] | None = None,
+) -> tuple[int, str, list[dict[str, Any]], list[str]]:
+    """runner_entry.main() as process `pid`: (exit code, stderr, each RunnerServer's options, the order of steps).
+
+    os.kill, os.waitpid and os.getpid are the fakes of Syscalls, which never
+    pass -1 on, and RunnerServer is a fake that never runs a job, so no real
+    kill(-1) can happen even with the PID faked to 1. The route tables are a
+    fake too (`routes`), and so is the non-dumpable step: the test process
+    itself stays dumpable. `missing` is a (module, name) removed once the
+    fakes are in, as on a platform without that call.
+    """
+    started: list[dict[str, Any]] = []
+    order: list[str] = []
+    log = LogCapture()
+
+    class FakeServer:
+        def __init__(self, address: tuple[str, int], settings: Any, **options: Any) -> None:
+            order.append("server")
+            started.append(options)
+
+        def serve_forever(self) -> None:
+            raise KeyboardInterrupt
+
+        def server_close(self) -> None:
+            pass
+
+    def check_routes(*args: Any, **kwargs: Any) -> tuple[DefaultRoute, ...]:
+        order.append("routes")
+        return routes
+
+    def not_dumpable() -> None:
+        order.append("not dumpable")
+
+    with Syscalls(pid=pid).installed(), \
+            mock.patch.dict(os.environ, environ, clear=True), \
+            mock.patch.object(runner_entry, "RunnerServer", FakeServer), \
+            mock.patch.object(runner_entry, "default_routes", check_routes, create=True), \
+            mock.patch.object(runner_entry, "make_not_dumpable", not_dumpable), \
+            mock.patch("signal.signal"), \
+            contextlib.redirect_stderr(log), \
+            (without(*missing) if missing else contextlib.nullcontext()):
+        code = runner_entry.main(["--bind", "127.0.0.1"])
+    return code, log.getvalue(), started, order
+
+
 class KillAndReapTest(unittest.TestCase):
     """kill_and_reap itself: one kill(-1, SIGKILL), then waitpid(-1, WNOHANG) until no child is left, bounded."""
 
@@ -233,27 +288,13 @@ class SweepDecisionTest(unittest.TestCase):
         return self.run_main_logged(pid)[0]
 
     def run_main_logged(self, pid: int) -> tuple[list[dict[str, Any]], str]:
-        started: list[dict[str, Any]] = []
-        log = LogCapture()
-
-        class FakeServer:
-            def __init__(self, address: tuple[str, int], settings: Any, **options: Any) -> None:
-                started.append(options)
-
-            def serve_forever(self) -> None:
-                raise KeyboardInterrupt
-
-            def server_close(self) -> None:
-                pass
-
-        with Syscalls(pid=pid).installed(), \
-                mock.patch.dict(os.environ, {"FETCH_ALLOW_DEFAULT_ROUTE": "true"}, clear=True), \
-                mock.patch.object(runner_entry, "RunnerServer", FakeServer), \
-                mock.patch.object(runner_entry, "make_not_dumpable"), \
-                mock.patch("signal.signal"), \
-                contextlib.redirect_stderr(log):
-            self.assertEqual(runner_entry.main(["--bind", "127.0.0.1"]), 0)
-        return started, log.getvalue()
+        # Not PID 1, the entry refuses to start unless FETCH_ALLOW_NO_SWEEP
+        # permits it (NoSweepRefusalTest has the refusal); these tests are
+        # about the flag the server gets, so they set the override there.
+        environ = {} if pid == 1 else {"FETCH_ALLOW_NO_SWEEP": "true"}
+        code, stderr, started, _order = start_entry(pid, environ)
+        self.assertEqual(code, 0, stderr)
+        return started, stderr
 
     def test_the_entry_turns_the_sweep_on_only_as_pid_1(self) -> None:
         self.assertEqual(self.run_main(1), [{"sweep_strays": True}])
@@ -261,11 +302,11 @@ class SweepDecisionTest(unittest.TestCase):
 
     def test_the_entry_says_whether_it_sweeps(self) -> None:
         # Under an init (a daemon whose default is init, a deployment's
-        # `init: true`, a shared PID namespace) the runner is not PID 1 and
-        # serves without the sweep; one stderr line is how an operator sees
-        # that, and the PID-1 line is distinct from it.
-        on = "strange_ringtone_runner: PID 1: killing and reaping a run's leftovers at each run boundary"
-        off = "strange_ringtone_runner: not PID 1: a run's leftovers are not killed and reaped (README, Runs with)"
+        # `init: true`, a shared PID namespace) the runner is not PID 1; with
+        # FETCH_ALLOW_NO_SWEEP it serves without the sweep, and one stderr
+        # line is how an operator sees that, distinct from the PID-1 line.
+        on = SWEEP_LINE
+        off = NO_SWEEP_LINE
         for pid, expected, other in ((1, on, off), (4242, off, on), (7, off, on)):
             with self.subTest(pid=pid):
                 _started, stderr = self.run_main_logged(pid)
@@ -302,6 +343,119 @@ class SweepDecisionTest(unittest.TestCase):
             RunnerServer(("127.0.0.1", 0), settings, ytdlp=StubYtDlp(600, MIB, 30), sweep_strays=True)
         # Refused before binding or touching the scratch directory.
         self.assertFalse((Path(temp.name) / "scratch").exists())
+
+
+class NoSweepRefusalTest(unittest.TestCase):
+    """Q4 (owner, 2026-11-05): where the sweep can't run, the entry exits 4 unless FETCH_ALLOW_NO_SWEEP=true.
+
+    Under an init (a daemon whose default is init, a deployment's
+    `init: true`, a pod with a shared PID namespace) the runner is not PID 1
+    and can't sweep, which would quietly bring back the setsid survivor the
+    sweep removes. So it refuses, and only an operator's explicit override,
+    meant for a local run or a host that can't run the runner as PID 1, lets
+    it serve without the sweep.
+    """
+
+    def test_not_pid_1_without_the_override_exits_4_and_never_builds_the_server(self) -> None:
+        for environ in ({}, {"FETCH_ALLOW_NO_SWEEP": "false"}, {"FETCH_ALLOW_NO_SWEEP": ""},
+                        {"FETCH_ALLOW_NO_SWEEP": "0"}, {"FETCH_ALLOW_NO_SWEEP": "no"}):
+            with self.subTest(environ=environ):
+                code, stderr, started, order = start_entry(7, environ)
+                self.assertEqual(code, 4, stderr)
+                self.assertEqual(runner_entry.EXIT_NO_SWEEP, 4)
+                self.assertEqual(started, [])
+                self.assertNotIn("server", order)
+                lines = stderr.splitlines()
+                self.assertEqual(len(lines), 1, stderr)
+                refusal = lines[0]
+                self.assertTrue(refusal.startswith("strange_ringtone_runner: refusing to start: "), refusal)
+                # It names the variable, says what it is for and what it is
+                # never for, and points at the docs.
+                self.assertIn("FETCH_ALLOW_NO_SWEEP=true", refusal)
+                self.assertIn("only for a local run or a host that can't run the runner as PID 1", refusal)
+                self.assertIn("never for a deployment that can", refusal)
+                self.assertIn("PID 1", refusal)
+                self.assertNotIn("listening", stderr)
+                self.assertNotIn(SWEEP_LINE, lines)
+                self.assertNotIn(NO_SWEEP_LINE, lines)
+
+    def test_pid_1_on_a_platform_without_the_calls_exits_4_too(self) -> None:
+        # The sweep needs kill, SIGKILL, waitpid and WNOHANG as well as PID 1.
+        for module, name in ((signal, "SIGKILL"), (os, "waitpid"), (os, "WNOHANG"), (os, "kill")):
+            with self.subTest(missing=name):
+                code, stderr, started, _order = start_entry(1, {}, missing=(module, name))
+                self.assertEqual(code, 4, stderr)
+                self.assertEqual(started, [])
+                self.assertIn("FETCH_ALLOW_NO_SWEEP", stderr)
+
+    def test_the_order_is_settings_routes_not_dumpable_then_this(self) -> None:
+        # Settings (2) first: a bad override value is a configuration error.
+        code, stderr, _started, order = start_entry(7, {"FETCH_MAX_SECONDS": "0"})
+        self.assertEqual((code, order), (2, []), stderr)
+        # Then the route check (3): a default route wins over the sweep.
+        code, stderr, _started, order = start_entry(7, {}, routes=(DefaultRoute("IPv4", "eth0"),))
+        self.assertEqual((code, order), (3, ["routes"]), stderr)
+        self.assertNotIn("FETCH_ALLOW_NO_SWEEP", stderr)
+        # Then the non-dumpable step (1), then this check (4).
+        code, stderr, _started, order = start_entry(7, {})
+        self.assertEqual((code, order), (4, ["routes", "not dumpable"]), stderr)
+        # With the override, the server comes last.
+        code, stderr, _started, order = start_entry(7, {"FETCH_ALLOW_NO_SWEEP": "true"})
+        self.assertEqual((code, order), (0, ["routes", "not dumpable", "server"]), stderr)
+
+    def test_the_override_serves_without_the_sweep_and_says_so(self) -> None:
+        for value in ("true", "1", "yes", "TRUE"):
+            with self.subTest(value=value):
+                code, stderr, started, _order = start_entry(7, {"FETCH_ALLOW_NO_SWEEP": value})
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(started, [{"sweep_strays": False}])
+                lines = stderr.splitlines()
+                self.assertEqual(lines.count(NO_SWEEP_LINE), 1, stderr)
+                self.assertNotIn("refusing", stderr)
+                self.assertLess(lines.index(NO_SWEEP_LINE),
+                                lines.index("strange_ringtone_runner listening on 127.0.0.1:8080"))
+
+    def test_as_pid_1_it_sweeps_whatever_the_variable_says(self) -> None:
+        # The override permits serving without the sweep; it never turns the
+        # sweep off where it can run.
+        for environ in ({}, {"FETCH_ALLOW_NO_SWEEP": "true"}, {"FETCH_ALLOW_NO_SWEEP": "false"}):
+            with self.subTest(environ=environ):
+                code, stderr, started, _order = start_entry(1, environ)
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(started, [{"sweep_strays": True}])
+                self.assertEqual(stderr.splitlines().count(SWEEP_LINE), 1, stderr)
+                self.assertNotIn(NO_SWEEP_LINE, stderr.splitlines())
+
+    def test_a_bad_value_is_a_configuration_error_never_permission(self) -> None:
+        for value in ("on", "2", " true", "true ", "y", "١"):
+            for pid in (7, 1):
+                with self.subTest(value=value, pid=pid):
+                    code, stderr, started, order = start_entry(pid, {"FETCH_ALLOW_NO_SWEEP": value})
+                    self.assertEqual(code, 2, stderr)
+                    self.assertEqual((started, order), ([], []))
+                    self.assertIn("strange_ringtone_runner: configuration error", stderr)
+                    self.assertIn("FETCH_ALLOW_NO_SWEEP", stderr)
+
+    def test_the_setting_is_parsed_with_the_route_overrides_helper_and_defaults_to_false(self) -> None:
+        self.assertIs(Settings().allow_no_sweep, False)
+        self.assertIs(Settings.from_env({}).allow_no_sweep, False)
+        self.assertIs(Settings.from_env({"FETCH_ALLOW_NO_SWEEP": "true"}).allow_no_sweep, True)
+        # The lowercase spelling is not the setting (a plain mapping here:
+        # Windows' os.environ would fold the case).
+        self.assertIs(Settings.from_env({"fetch_allow_no_sweep": "true"}).allow_no_sweep, False)
+        # The same helper, with the same default, for both overrides: one
+        # set of boolean words, so neither can drift into accepting a typo.
+        with mock.patch.object(runner_config, "_parse_bool", wraps=runner_config._parse_bool) as parse:
+            Settings.from_env({})
+        self.assertIn(mock.call({}, "FETCH_ALLOW_DEFAULT_ROUTE", False), parse.call_args_list)
+        self.assertIn(mock.call({}, "FETCH_ALLOW_NO_SWEEP", False), parse.call_args_list)
+        # Read by the runner only: the fetcher never looks it up.
+        from strange_ringtone_fetch.config import Settings as FetcherSettings
+        from test_config import ReadRecorder
+        environ = ReadRecorder({"PUBLIC_ORIGIN": "https://example.internal"})
+        FetcherSettings.from_env(environ)
+        self.assertNotIn("FETCH_ALLOW_NO_SWEEP", environ.looked_up)
+        self.assertIn("FETCH_ALLOW_NO_SWEEP", runner_config.RUNNER_VARIABLES)
 
 
 class YtDlpSweepTest(unittest.TestCase):

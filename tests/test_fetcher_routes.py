@@ -517,6 +517,7 @@ class RunnerEntryRouteCheckTest(unittest.TestCase):
                 mock.patch.object(runner_entry, "default_routes", create=True, **check) as patched, \
                 mock.patch.object(runner_entry, "RunnerServer", FakeServer), \
                 mock.patch.object(runner_entry, "make_not_dumpable"), \
+                mock.patch.object(runner_entry, "sweep_is_safe_here", return_value=True), \
                 mock.patch("signal.signal"), \
                 contextlib.redirect_stderr(log):
             code = runner_entry.main(["--bind", "127.0.0.1"])

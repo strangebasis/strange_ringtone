@@ -4,8 +4,8 @@ The same rules as the fetcher's (strange_ringtone_fetch.config, whose proxy
 parser this reuses, and through it the core's): every value is checked
 strictly, any doubt refuses to start, and an error names the variable but
 never its value. The runner reads only what yt-dlp's run needs and the
-default-route override, never anything browser-facing (PUBLIC_ORIGIN,
-TRUSTED_PROXIES): it serves the fetcher, not a browser.
+default-route and no-sweep overrides, never anything browser-facing
+(PUBLIC_ORIGIN, TRUSTED_PROXIES): it serves the fetcher, not a browser.
 """
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ RUNNER_VARIABLES = (
     "FETCH_TIMEOUT_SECONDS",
     *PROXY_VARIABLES,
     "FETCH_ALLOW_DEFAULT_ROUTE",
+    "FETCH_ALLOW_NO_SWEEP",
 )
 
 
@@ -61,6 +62,11 @@ class Settings:
     # True turns the default-route start check off (docs/PLAN.md 6.1) where
     # egress is filtered some other way. Off by default: fail closed.
     allow_default_route: bool = False
+    # True lets the entry serve where it can't sweep (not PID 1), for a local
+    # run or a host that can't run the runner as PID 1 (owner's decision Q4,
+    # 2026-11-05). It never turns the sweep off where it can run. Off by
+    # default: a runner that can't sweep refuses to start.
+    allow_no_sweep: bool = False
     scratch_dir: Path = field(default_factory=_default_scratch_dir)
 
     @classmethod
@@ -70,8 +76,9 @@ class Settings:
         Reads exactly RUNNER_VARIABLES, with the fetcher's parsers, bounds and
         messages: FETCH_MAX_SECONDS 1..600, FETCH_MAX_BYTES 1 MiB..512 MiB,
         FETCH_TIMEOUT_SECONDS 1..600, the proxies through parse_proxies, the
-        override through the core's boolean words. Nothing is required, so an
-        empty environment is a valid configuration.
+        two overrides through the core's boolean words. Nothing is required,
+        so an empty environment is a valid configuration (as PID 1, the
+        entry adds, where the sweep can run).
         """
         # Each variable is looked up by name, never by walking the mapping,
         # so nothing else in the runner's environment can become a setting.
@@ -92,4 +99,7 @@ class Settings:
             # doesn't know is a configuration error, so a typo never turns
             # the start check off (docs/PLAN.md 6.1, S2).
             allow_default_route=_parse_bool(environ, "FETCH_ALLOW_DEFAULT_ROUTE", False),
+            # The same helper and the same rule: a typo is a configuration
+            # error, never permission to serve without the sweep.
+            allow_no_sweep=_parse_bool(environ, "FETCH_ALLOW_NO_SWEEP", False),
         )

@@ -9,9 +9,10 @@ container has a default route or its route tables can't be read, unless
 FETCH_ALLOW_DEFAULT_ROUTE=true; strange_ringtone_fetch.routes says why.
 On Linux it then makes itself non-dumpable (make_not_dumpable says why).
 As its container's PID 1, it also turns on the sweep that kills and reaps
-whatever a yt-dlp run leaves behind (strange_ringtone_runner.ytdlp), and it
-says on stderr whether the sweep is on, so an operator sees a runner that
-was started under an init.
+whatever a yt-dlp run leaves behind (strange_ringtone_runner.ytdlp). Where
+the sweep can't run (started under an init, say) it refuses to start (exit
+4) unless FETCH_ALLOW_NO_SWEEP=true, and with that override it says on
+stderr that it serves without the sweep.
 
 A mirror of strange_ringtone_fetch.__main__, line for line, under the
 runner's name, plus the non-dumpable step and the sweep decision: the
@@ -39,6 +40,10 @@ PROG = "strange_ringtone_runner"
 # Refused because of the route table: distinct from a configuration error (2)
 # and a failure to start (1), so an operator can tell the three apart.
 EXIT_ROUTE = 3
+# Refused because the sweep can't run here (not PID 1) and FETCH_ALLOW_NO_SWEEP
+# doesn't permit serving without it: distinct from 1, 2 and 3 for the same
+# reason.
+EXIT_NO_SWEEP = 4
 # prctl(2) options (linux/prctl.h).
 PR_GET_DUMPABLE = 3
 PR_SET_DUMPABLE = 4
@@ -95,7 +100,13 @@ def make_not_dumpable() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parse --bind, read the settings (exit 2), check the route table (exit 3), then serve on port 8080."""
+    """Serve on port 8080 once every start check passed, or return the exit code of the first that failed.
+
+    In this order: parse --bind, read the settings (exit 2), check the route
+    table (exit 3), turn non-dumpable (exit 1), check that the sweep can run
+    or that FETCH_ALLOW_NO_SWEEP waives it (exit 4), then build the server
+    (exit 1).
+    """
     parser = argparse.ArgumentParser(prog=PROG, description="Serve strange_ringtone's fetcher runner on port 8080.")
     parser.add_argument(
         "--bind",
@@ -145,15 +156,29 @@ def main(argv: list[str] | None = None) -> int:
     # boundary (kill(-1), then reap) only as PID 1 of its PID namespace, the
     # compose layout with no init. Anywhere else, a developer machine above
     # all, kill(-1) would kill every process of the user, so it stays off.
-    # Said either way: started under an init (a daemon whose default is
-    # init, a deployment's `init: true`, a shared PID namespace), the runner
-    # serves without the sweep, and this line is how an operator sees it.
+    # As PID 1 it always sweeps: FETCH_ALLOW_NO_SWEEP only permits serving
+    # where the sweep can't run, it never turns the sweep off.
     sweep = sweep_is_safe_here()
     if sweep:
         print(f"{PROG}: PID 1: killing and reaping a run's leftovers at each run boundary", file=sys.stderr)
-    else:
-        print(f"{PROG}: not PID 1: a run's leftovers are not killed and reaped (README, Runs with)",
+    elif not settings.allow_no_sweep:
+        # Fail closed (owner's decision Q4, 2026-11-05): started under an
+        # init (a daemon whose default is init, a deployment's `init: true`,
+        # a pod with a shared PID namespace), a runner that served anyway
+        # would quietly leave a child that called setsid() running between
+        # jobs and its zombies counting against pids_limit. After the
+        # non-dumpable step, so the order of the exit codes is the
+        # documented one: 2, 3, 1, then 4.
+        print(f"{PROG}: refusing to start: not PID 1 of its container (or no kill and waitpid here), so it can't "
+              "kill and reap what a yt-dlp run leaves behind; set FETCH_ALLOW_NO_SWEEP=true only for a local run "
+              "or a host that can't run the runner as PID 1, never for a deployment that can (README, Runs with)",
               file=sys.stderr)
+        return EXIT_NO_SWEEP
+    else:
+        # Said once, before the server listens, so an operator who set the
+        # override sees what it costs.
+        print(f"{PROG}: FETCH_ALLOW_NO_SWEEP is set and the sweep can't run here (not PID 1, or no kill and "
+              "waitpid): a run's leftovers are not killed and reaped (README, Runs with)", file=sys.stderr)
     try:
         server = RunnerServer((args.bind, PORT), settings, sweep_strays=sweep)
     except (OSError, RuntimeError, ValueError) as error:

@@ -1087,6 +1087,10 @@ class RunnerTest(unittest.TestCase):
         # No override: under --network none there is no default route, so
         # the start check must pass on its own.
         env.pop("FETCH_ALLOW_DEFAULT_ROUTE", None)
+        # The unittest process is this container's PID 1, so the runner is
+        # not and can't sweep: the override lets it serve without the sweep
+        # (Q4), which RealSweepTest proves on its own.
+        env["FETCH_ALLOW_NO_SWEEP"] = "true"
         env["FETCH_TIMEOUT_SECONDS"] = str(RUN_SECONDS)
         proc = subprocess.Popen(
             [*RUNNER_CMD, "--bind", "127.0.0.1"],
@@ -1136,6 +1140,8 @@ class RunnerTest(unittest.TestCase):
         log = err.decode("utf-8", "replace")
         self.assertNotIn("refusing to start", log)
         self.assertNotIn("FETCH_ALLOW_DEFAULT_ROUTE is set", log)
+        # Not PID 1 here: it served only because of the override, and said so.
+        self.assertIn("strange_ringtone_runner: FETCH_ALLOW_NO_SWEEP is set and the sweep can't run here", log)
         # Control: the job's request line is there, so the absences below
         # are read from a log that holds the run (R4's format: method, path,
         # status, duration).

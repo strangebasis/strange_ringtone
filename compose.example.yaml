@@ -9,9 +9,13 @@
 #
 # Four services. `docker compose -f compose.example.yaml up -d fetcher` also
 # starts `fetcher-runner`, which the fetcher depends on, and
-# `fetcher-forwarder`, which the runner depends on: the fetcher image's
-# second and third commands. The runner is the only container that runs
-# yt-dlp, and the forwarder is the only service with a route out.
+# `fetcher-forwarder`, which the runner depends on: the fetcher image's third
+# and second commands (its Dockerfile names the forwarder second and the
+# runner third). The runner is the only container that runs yt-dlp, and the
+# forwarder is the only service with a route out. `up -d fetcher` doesn't
+# create the `core` network, so a proxy project that declares
+# `strange_ringtone_core` external needs `up -d core`, or a plain `up -d`,
+# first.
 #
 # The services publish no ports. A reverse proxy that terminates TLS joins
 # the `core` network and forwards to core:8080. With the fetcher, the proxy
@@ -258,12 +262,15 @@ services:
       - /app/fetcher/runner.py
     # Stated, not left unset: an unset `init` takes the daemon's default,
     # and a daemon whose default is init (daemon.json "init": true) would
-    # start the runner under docker-init, not as PID 1, so it would serve
-    # without its sweep. The runner logs which of the two it is at startup.
+    # start the runner under docker-init, not as PID 1, where it can't
+    # sweep, so it would refuse to start (exit 4): this file never sets
+    # FETCH_ALLOW_NO_SWEEP. As PID 1 it says so on stderr at startup.
     init: false
     # The same .env: the runner reads FETCH_MAX_SECONDS, FETCH_MAX_BYTES,
-    # FETCH_TIMEOUT_SECONDS, FETCH_ALLOW_DEFAULT_ROUTE and the proxy
-    # variables, and nothing browser-facing.
+    # FETCH_TIMEOUT_SECONDS, FETCH_ALLOW_DEFAULT_ROUTE, FETCH_ALLOW_NO_SWEEP
+    # and the proxy variables, and nothing browser-facing. This layout runs
+    # the runner as PID 1, so it never needs FETCH_ALLOW_NO_SWEEP: leave it
+    # out of .env.
     env_file: .env
     environment:
       # Set here, not in .env (a service's environment wins over its
@@ -307,8 +314,10 @@ services:
     # with setsid() included) and it then reaps them, so none stays a zombie
     # that counts against this cap. That needs the runner to be PID 1: no
     # `init: true` and no wrapper in `command`. A `docker exec` or a health
-    # check running at that moment is killed too; the health check's retries
-    # absorb it.
+    # check running at that moment is killed too. The health check's retries
+    # absorb a coincidence, but a run can time its exit to the checks, or
+    # fill this cap, and make the runner read unhealthy: nothing here acts on
+    # its health status, and nothing should (don't restart it on it).
     pids_limit: 160
     # Forwarding off, on every interface. A new network namespace copies the
     # host's IPv4 forwarding, which dockerd turns on, so a container on two

@@ -179,7 +179,10 @@ class EntryNotDumpableTest(unittest.TestCase):
             order.append("not dumpable")
             helper()
 
-        with mock.patch.dict(os.environ, {"FETCH_ALLOW_DEFAULT_ROUTE": "true"}, clear=True), \
+        # Not PID 1 (the sweep decision is faked to False), so the override
+        # that lets the entry serve without the sweep (Q4).
+        environ = {"FETCH_ALLOW_DEFAULT_ROUTE": "true", "FETCH_ALLOW_NO_SWEEP": "true"}
+        with mock.patch.dict(os.environ, environ, clear=True), \
                 mock.patch.object(runner_entry, "RunnerServer", FakeServer), \
                 mock.patch.object(runner_entry, "make_not_dumpable", record), \
                 mock.patch.object(runner_entry, "sweep_is_safe_here", return_value=False), \

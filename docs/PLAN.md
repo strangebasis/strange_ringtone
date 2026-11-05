@@ -519,8 +519,9 @@ bullets below describe the image as of PR B, with yt-dlp in the runner.
   would be downloaded only for the phone to refuse it), `FETCH_MAX_BYTES`
   (40 MiB; 10 minutes of YouTube's AAC is about 10 MB),
   `FETCH_TIMEOUT_SECONDS` (120; the fetcher waits that long plus 15 s for
-  the runner's answer), `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` and
-  `FETCH_ALLOW_DEFAULT_ROUTE` (false), and nothing browser-facing. The
+  the runner's answer), `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`,
+  `FETCH_ALLOW_DEFAULT_ROUTE` (false) and `FETCH_ALLOW_NO_SWEEP` (false,
+  never set by the example), and nothing browser-facing. The
   forwarder reads no setting.
 - **Fetcher contract (the README gets a second table):** image
   `ghcr.io/<owner>/strange_ringtone-fetcher:<semver>`, linux/amd64, UID/GID
@@ -786,8 +787,13 @@ them routes between its networks, refuses ICMP redirects (`accept_redirects`
   stays a zombie that counts against `pids_limit`. Only the entry turns it
   on, and only as PID 1: anywhere else `kill(-1)` would kill every process
   of the user (owner, 2026-11-05). The example states `init: false`, since
-  an unset `init` takes the daemon's default, which may be an init, and the
-  runner says at startup whether it sweeps. Before it serves, it makes
+  an unset `init` takes the daemon's default, which may be an init. Where
+  the sweep can't run (not PID 1, as under an init, or no `kill` and
+  `waitpid`), the entry refuses to start (exit 4) unless
+  `FETCH_ALLOW_NO_SWEEP=true`, which is for a local run or a host that
+  can't run the runner as PID 1, never for a deployment that can; with it,
+  the runner serves without the sweep and says so on stderr. As PID 1 it
+  sweeps whatever the variable says (owner, 2026-11-05). Before it serves, it makes
   itself non-dumpable: yt-dlp runs as its UID and is not its ancestor, so
   where `ptrace_scope` is 0 it could otherwise attach to the runner and
   plant code there that `kill(-1)`, which spares the caller, never ends.
@@ -932,6 +938,9 @@ they are.
   - the runner as its container's PID 1 (`init: false`, stated, and no
     wrapper), which its kill-and-reap sweep needs; a `docker exec` or health
     check running at a run boundary is killed too
+  - `FETCH_ALLOW_NO_SWEEP` (runner only, default false): where the sweep
+    can't run, the runner refuses to start (exit 4) unless it is `true`
+    (owner, 2026-11-05)
   - the runner non-dumpable, so a `docker exec` as its UID can't read its
     `/proc/1/environ`, `maps` or `mem`
   - `TRUSTED_PROXIES: ""` on the fetcher service, which wins over `.env`
@@ -991,8 +1000,16 @@ the next job's files or hold a share of `pids_limit`; and the runner is
 non-dumpable, so such a child can't hide in it by ptrace either, whatever
 the host's `ptrace_scope`. The sweep's cost is
 accepted (owner, 2026-11-05): a `docker exec` or health check running in
-the runner's container at a run boundary is killed too, which the health
-check's retries absorb, and the runner must be that container's PID 1. The
+the runner's container at a run boundary is killed too, and the runner must
+be that container's PID 1. The health check's retries absorb a coincidence,
+not an adversary: a run can time its exit to the checks, or fill
+`pids_limit`, and make the runner read unhealthy, so nothing in the example
+acts on the runner's health status and nothing should restart the runner
+on it. A runner that can't sweep refuses to start; an operator who sets
+`FETCH_ALLOW_NO_SWEEP=true` accepts the residual the sweep removes (a child
+of a run that left its process group keeps running between jobs with the
+runner's reach in its container, and zombies hold a share of `pids_limit`)
+as the operator's own risk. The
 runner still opens every result `O_NOFOLLOW` and `O_NONBLOCK` and holds and
 serves only a regular file within `FETCH_MAX_BYTES`. The isolated gateway mode also means the
 host has no route to the internal networks, so the reverse proxy must be a
@@ -1020,6 +1037,7 @@ test to fail.
 | R4 | The runner's log holds method, path with the token masked, status and duration only; never a video ID, a title, a token, an address or yt-dlp's output | unit | PR B |
 | S1 | The fetcher sends the runner only the validated ID and a token it minted, never its job ID, and consults no proxy variable; it fails the job (nothing left behind, never retried) on any answer that is not status 200 with exactly one `Content-Type` and `Content-Length`, no `Transfer-Encoding`, JSON of at most 256 KiB of the shape `{status, info}` or `{status, error}`, or audio of 1 to `FETCH_MAX_BYTES` bytes of `audio/mp4` within the per-read and total deadlines; it re-validates the metadata with `parse_info` and follows no redirect | unit, with a fake runner; the fetcher's flow against a real runner with the stub yt-dlp | PR B |
 | S2 | The fetcher (PR A) and the runner (PR B) refuse to start with a default route, or an unreadable or unparsable route table, unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`), in-image and Compose topology tests | PR A (the fetcher), PR B (the runner) |
+| R5 | The runner's kill-and-reap sweep runs only as its container's PID 1, at both run boundaries, never while a `Popen` is in flight; where it can't run, the entry exits 4 before building the server unless `FETCH_ALLOW_NO_SWEEP=true` (parsed like `FETCH_ALLOW_DEFAULT_ROUTE`; a bad value exits 2), which never turns the sweep off as PID 1; the example runs the runner as PID 1 and never sets the override | unit (fake `kill`, `waitpid` and `getpid` that never pass -1 on); in-image as PID 1 (a real sweep of a run's leftovers); Compose topology tests (no init, the exact command, no override, `/proc/1/cmdline` in the running runner) | PR B |
 | I1 | The base interpreter's site-packages hold no third-party distribution and no `.pth` file, and its `sys.path` leaves out the venv; no build step after the wheels' install starts the venv's interpreter or compiles the venv with site enabled, and the venv's bytecode is current for the image's interpreter | in-image; unit (static read of `fetcher/Dockerfile`) | PR A |
 | I2 | The venv is filled by the base interpreter's `pip install --prefix /opt/yt-dlp`; no build step, the install included, runs pip under the venv's interpreter (`--python`) or starts it; no second install into the venv follows the first; the wheels' scripts land in `/opt/yt-dlp/bin`, none in the base prefix | unit (static read of `fetcher/Dockerfile`); in-image | PR B |
 | K1 | Every container of the fetcher image (fetcher, runner, forwarder) has `forwarding` 0 for `default`, `lo` and each attachment's interface, never the global switch, `accept_redirects` 0 for `all`, `default`, `lo` and each interface, no IPv6 sysctl, and a `pids_limit` of at least twice its worst case from the code's caps | Compose topology tests (static and running; a container with the forwarder's settings routes no datagram between two networks, against a control router that does) | PR A (the fetcher and the forwarder), PR B (the runner) |
@@ -1525,7 +1543,8 @@ docs/PLAN.md
      runner's start check (S2), the `jobs` network (`egress` moved from the
      fetcher to the runner), `FETCH_RUNNER_URL`, the venv filled with
      `pip install --prefix` (I2), the kernel settings and pids cap on the
-     runner (K1), the runner's kill-and-reap sweep as PID 1, the fetcher's
+     runner (K1), the runner's kill-and-reap sweep as PID 1 and its refusal
+     to start where it can't sweep (R5), the fetcher's
      empty `TRUSTED_PROXIES` in the example, T1 to T3 for the final layout,
      the dev stack with the runner in-process, and the same documentation.
 

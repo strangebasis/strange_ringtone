@@ -141,6 +141,7 @@ class RunnerDefaultsTest(unittest.TestCase):
         names = (
             "FETCH_MAX_SECONDS", "FETCH_MAX_BYTES", "FETCH_TIMEOUT_SECONDS", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
             "FETCH_ALLOW_DEFAULT_ROUTE",
+            "FETCH_ALLOW_NO_SWEEP",
         )
         self.assertEqual(from_env(**dict.fromkeys(names, "")), Settings())
 
@@ -167,6 +168,7 @@ class RunnerDefaultsTest(unittest.TestCase):
         self.assertEqual(RUNNER_VARIABLES, (
             "FETCH_MAX_SECONDS", "FETCH_MAX_BYTES", "FETCH_TIMEOUT_SECONDS", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
             "FETCH_ALLOW_DEFAULT_ROUTE",
+            "FETCH_ALLOW_NO_SWEEP",
         ))
 
         class NoIteration(ReadRecorder):
@@ -193,6 +195,7 @@ class RunnerDefaultsTest(unittest.TestCase):
         self.assertEqual(Settings.from_env({}), Settings())
         self.assertEqual({field.name for field in dataclasses.fields(Settings)}, {
             "fetch_max_seconds", "fetch_max_bytes", "fetch_timeout_seconds", "proxies", "allow_default_route",
+            "allow_no_sweep",
             "scratch_dir",
         })
 
@@ -1266,6 +1269,7 @@ class RunnerMainTest(unittest.TestCase):
                 mock.patch.object(runner_entry, "RunnerServer", server), \
                 mock.patch.object(runner_entry, "default_routes", check, create=True), \
                 mock.patch.object(runner_entry, "make_not_dumpable"), \
+                mock.patch.object(runner_entry, "sweep_is_safe_here", return_value=True), \
                 mock.patch("signal.signal"), \
                 contextlib.redirect_stderr(log):
             code = runner_entry.main(argv)

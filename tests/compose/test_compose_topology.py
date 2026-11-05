@@ -1024,11 +1024,31 @@ class LayoutTest(unittest.TestCase):
         """Q2: `init: false`, stated, because an unset key takes the daemon's default, which may be init."""
         # A daemon started with --init (daemon.json "init": true) runs every
         # container whose HostConfig.Init is unset under docker-init; the
-        # runner would then be PID 7, not 1, and serve without its sweep.
-        # Only an explicit false overrides that default.
+        # runner would then be PID 7, not 1, and could not sweep (since Q4 it
+        # then refuses to start). Only an explicit false overrides that default.
         runner = self._service("fetcher-runner")
         self.assertIn("init", runner, "the runner leaves init to the daemon's default")
         self.assertIs(runner["init"], False, f"the runner's init is {runner['init']!r}")
+
+    def test_the_runner_is_never_permitted_to_serve_without_its_sweep(self) -> None:
+        """Q4 (owner, 2026-11-05): the example never sets FETCH_ALLOW_NO_SWEEP, so a runner that can't sweep refuses."""
+        # The override is for a local run or a host that can't run the
+        # runner as PID 1, never for this layout, which can: set here, it
+        # would let a runner started under an init serve without its sweep.
+        runner = self._service("fetcher-runner")
+        environment = runner.get("environment") or {}
+        self.assertIsInstance(environment, dict, environment)
+        # Control: the resolved environment is the one compose builds (the
+        # forwarder's address is set there), so its absence is meaningful.
+        self.assertIn("HTTPS_PROXY", environment)
+        self.assertNotIn("FETCH_ALLOW_NO_SWEEP", environment)
+        for name, service in self._services().items():
+            with self.subTest(service=name):
+                self.assertNotIn("FETCH_ALLOW_NO_SWEEP", service.get("environment") or {})
+        text = COMPOSE_FILE.read_text(encoding="utf-8")
+        setting = [line for line in text.splitlines()
+                   if "FETCH_ALLOW_NO_SWEEP" in line and not line.lstrip().startswith("#")]
+        self.assertEqual(setting, [], "compose.example.yaml sets FETCH_ALLOW_NO_SWEEP")
 
     def test_no_service_has_a_volume_and_only_tmp_is_writable(self) -> None:
         """Stateless (CLAUDE.md): no volume, a read-only root, and /tmp's tmpfs the only writable mount."""

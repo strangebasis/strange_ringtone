@@ -90,6 +90,18 @@ class DevStackWiringTest(unittest.TestCase):
         modules = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
         self.assertFalse([module for module in modules if module and module.endswith("__main__")], modules)
 
+    def test_the_stack_needs_no_sweep_override_either(self) -> None:
+        # The runner's entry refuses to start where it can't sweep unless
+        # FETCH_ALLOW_NO_SWEEP is set (Q4); the stack builds RunnerServer
+        # itself, whose sweep is off by default, so it needs no setting.
+        source = STACK.read_text(encoding="utf-8")
+        self.assertNotIn("FETCH_ALLOW_NO_SWEEP", source)
+        self.assertNotIn("sweep_strays=True", source.replace(" ", ""))
+        tree = ast.parse(source, filename=str(STACK))
+        runner_servers = _calls(tree, "RunnerServer")
+        self.assertEqual(len(runner_servers), 1)
+        self.assertNotIn("sweep_strays", [keyword.arg for keyword in runner_servers[0].keywords])
+
 
 if __name__ == "__main__":
     unittest.main()
