@@ -602,12 +602,20 @@ class RunnerServer(http.server.ThreadingHTTPServer):
         settings: Settings,
         ytdlp: YtDlp | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sweep_strays: bool = False,
     ) -> None:
         """Bind, then prepare the scratch directory, the results and the sweeper.
 
         The default ytdlp is the image's yt-dlp under prlimit with the
         settings' limits and proxies; building it touches no file.
+        sweep_strays (off by default) gives it kill-and-reap at both run
+        boundaries (strange_ringtone_runner.ytdlp.kill_and_reap); only the
+        entry turns it on, and only as PID 1.
         """
+        # Refused before binding: a caller that asks for the sweep must not
+        # get a run that silently skips it.
+        if sweep_strays and ytdlp is not None and not ytdlp.sweep_strays:
+            raise ValueError("sweep_strays needs a ytdlp that sweeps")
         self.settings = settings
         # The image's yt-dlp from its venv, under prlimit on Linux, with the
         # operator's proxies as the only part of this environment its child
@@ -621,6 +629,7 @@ class RunnerServer(http.server.ThreadingHTTPServer):
                 settings.fetch_timeout_seconds,
                 prlimit=default_prlimit(),
                 proxies=settings.proxies,
+                sweep_strays=sweep_strays,
             )
         )
         # Held by a run or a stream: the one-job-at-a-time rule (R1, R3).
@@ -672,7 +681,8 @@ class RunnerServer(http.server.ThreadingHTTPServer):
             # Every path, success included: the audio was moved out above.
             # ignore_errors covers Windows development only, where a killed
             # run's children may still hold the directory for a moment; on
-            # Linux killpg ends the whole group first.
+            # Linux killpg ends the whole group first, and in the container
+            # the sweep ends anything that left it.
             shutil.rmtree(job_dir, ignore_errors=True)
 
     def _sweep_forever(self, interval: float) -> None:

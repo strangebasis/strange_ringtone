@@ -976,6 +976,50 @@ class LayoutTest(unittest.TestCase):
         runner = self._service("fetcher-runner")
         self.assertIn("jobs", self._networks_of(runner))
 
+    def test_the_fetcher_trusts_no_proxy_whatever_the_env_file_says(self) -> None:
+        """Q3 (owner, 2026-11-05): the fetcher's own TRUSTED_PROXIES is empty and wins over the shared .env."""
+        # The runner reaches the fetcher over `jobs`, whose subnet Docker may
+        # change when it recreates the network: a CIDR in the fetcher's
+        # TRUSTED_PROXIES could come to cover the runner and let it write
+        # its own X-Forwarded-For past the rate limit.
+        environment = self._service("fetcher").get("environment") or {}
+        self.assertIn("TRUSTED_PROXIES", environment, "the fetcher's environment doesn't set TRUSTED_PROXIES")
+        self.assertEqual(environment["TRUSTED_PROXIES"], "")
+        # With a CIDR in the env file, as an operator would set for the core:
+        # the fetcher still resolves to empty, and the core (control) gets
+        # the CIDR, so the file was read and the override is what wins.
+        stack = Stack()
+        try:
+            with open(stack.test_env, "a", encoding="ascii", newline="\n") as handle:
+                handle.write("TRUSTED_PROXIES=192.0.2.0/24\n")
+            result = stack.compose("config", "--format", "json")
+        finally:
+            stack.close()
+        self.assertEqual(result.returncode, 0, f"docker compose config: {result.stderr.strip()}")
+        services = json.loads(result.stdout).get("services") or {}
+        fetcher = (services.get("fetcher") or {}).get("environment") or {}
+        core = (services.get("core") or {}).get("environment") or {}
+        self.assertEqual(core.get("TRUSTED_PROXIES"), "192.0.2.0/24", core)
+        self.assertEqual(fetcher.get("TRUSTED_PROXIES"), "", fetcher)
+
+    def test_the_runner_stays_its_containers_pid_1(self) -> None:
+        """Q2 (owner, 2026-11-05): no init and no wrapper, so the runner is PID 1 and sweeps only its container."""
+        # The runner turns on its kill-and-reap sweep only as PID 1. Under an
+        # init it would never sweep, and the orphans of every run would be
+        # left to the init. StackTest's cmdline probe reads /proc/1 in the
+        # running container.
+        runner = self._service("fetcher-runner")
+        self.assertFalse(runner.get("init"), f"the runner runs under an init: {runner.get('init')!r}")
+        # `compose config` writes `entrypoint: null` when none is set.
+        entrypoint = runner.get("entrypoint")
+        self.assertIn(entrypoint, (None, []), f"the runner has an entrypoint: {entrypoint!r}")
+        self.assertEqual(runner.get("command"), RUNNER_COMMAND)
+        # The image adds no entrypoint in front of the command either.
+        result = _docker("image", "inspect", "--format", "{{json .Config.Entrypoint}}", IMAGE,
+                         timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        self.assertIn(json.loads(result.stdout), (None, []), "the image has an entrypoint")
+
     def test_no_service_has_a_volume_and_only_tmp_is_writable(self) -> None:
         """Stateless (CLAUDE.md): no volume, a read-only root, and /tmp's tmpfs the only writable mount."""
         config = self._config()

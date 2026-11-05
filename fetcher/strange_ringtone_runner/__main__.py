@@ -7,10 +7,12 @@ address can change, on the command line, so a local run can stay on
 loopback. Before it binds, the entry refuses to start (exit 3) when the
 container has a default route or its route tables can't be read, unless
 FETCH_ALLOW_DEFAULT_ROUTE=true; strange_ringtone_fetch.routes says why.
+As its container's PID 1, it also turns on the sweep that kills and reaps
+whatever a yt-dlp run leaves behind (strange_ringtone_runner.ytdlp).
 
 A mirror of strange_ringtone_fetch.__main__, line for line, under the
-runner's name: the runner may not import the fetcher's entry, which would
-load the fetcher's server into this process.
+runner's name, plus the sweep decision: the runner may not import the
+fetcher's entry, which would load the fetcher's server into this process.
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ from strange_ringtone_fetch.routes import RouteError, default_routes
 
 from strange_ringtone_runner.config import ConfigError, Settings
 from strange_ringtone_runner.server import RunnerServer
+from strange_ringtone_runner.ytdlp import sweep_is_safe_here
 
 PORT = 8080
 PROG = "strange_ringtone_runner"
@@ -90,8 +93,13 @@ def main(argv: list[str] | None = None) -> int:
                   "other than the forwarder could carry traffic out; set FETCH_ALLOW_DEFAULT_ROUTE=true only "
                   "where egress is filtered another way", file=sys.stderr)
             return EXIT_ROUTE
+    # Decided once, here: the runner sweeps its container clean at each run
+    # boundary (kill(-1), then reap) only as PID 1 of its PID namespace, the
+    # compose layout with no init. Anywhere else, a developer machine above
+    # all, kill(-1) would kill every process of the user, so it stays off.
+    sweep = sweep_is_safe_here()
     try:
-        server = RunnerServer((args.bind, PORT), settings)
+        server = RunnerServer((args.bind, PORT), settings, sweep_strays=sweep)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"{PROG}: cannot start: {error}", file=sys.stderr)
         return 1

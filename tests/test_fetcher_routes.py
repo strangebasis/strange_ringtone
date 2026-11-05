@@ -383,7 +383,9 @@ class FakeServer:
 
     started: list[tuple[str, int]]
 
-    def __init__(self, address: tuple[str, int], settings: Settings) -> None:
+    # sweep_strays: the runner's entry always passes its PID-1 decision
+    # (tests/test_fetcher_runner_sweep.py tests it); the fetcher's passes none.
+    def __init__(self, address: tuple[str, int], settings: Settings, sweep_strays: bool = False) -> None:
         FakeServer.started.append(address)
 
     def serve_forever(self) -> None:

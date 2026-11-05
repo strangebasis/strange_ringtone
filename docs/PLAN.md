@@ -367,8 +367,10 @@ The core has no secrets in v0.1.0, so `.env.example` holds only
 settings in a block of their own, all commented out; `compose.example.yaml`
 gives the core, the fetcher and its runner that one `.env` (the forwarder
 reads none), and each server reads only its own variables (`PUBLIC_ORIGIN`
-and `TRUSTED_PROXIES` are shared by the core and the fetcher; the runner
-reads neither).
+is shared by the core and the fetcher; both read `TRUSTED_PROXIES`, but the
+example sets the fetcher's to empty in its own `environment`, which wins
+over `.env`, so the value in `.env` is the core's (6.1); the runner reads
+neither).
 
 The fetcher image is a second, separate contract with its own table in the
 README (section 6, "Fetcher contract"). Nothing in it changes the core's: the
@@ -407,7 +409,8 @@ bullets below describe the image as of PR B, with yt-dlp in the runner.
 
   It runs in the runner container under `prlimit` and a wall-clock timeout
   (`communicate()`; on timeout the whole process group is killed and the
-  pipes drained), in its own session, one job at a time: the fetcher's queue
+  pipes drained), in its own session, with every leftover killed and reaped
+  at both run boundaries (6.1, the runner bullet), one job at a time: the fetcher's queue
   (`FETCH_CONCURRENCY=1`, with 4 more queued and 503 `busy` beyond, and its
   own per-IP rate limit) and the runner's own lock. The runner's `prlimit`
   set is CPU seconds, file size, open files and process count
@@ -692,6 +695,15 @@ source of abuse.
   21: the main thread, 16 request workers (`FetchServer.MAX_WORKERS`), the
   job worker and the sweeper, the health check, and the runner client's
   deadline timer.
+- A container's PID 1 inherits every orphan and must reap it. Measured as
+  PID 1 of a throwaway container of the fetcher image (2026-11-05): a
+  grandchild killed with its process group stays a zombie of PID 1; one
+  that called `setsid()` survives `killpg`; one that also forks to a new PID
+  every 10 ms left 49 zombies in half a second; then `kill(-1, SIGKILL)`
+  and `waitpid(-1, WNOHANG)` killed and reaped all 51 and left nothing.
+  The kernel sends `kill(-1)` to every process the caller may signal in its
+  PID namespace but PID 1 and the caller, under a lock `fork()` can't slip
+  past.
 - Python 3.12's `ipaddress` calls `64:ff9b::a9fe:a9fe` (NAT64 for
   169.254.169.254) and `::169.254.169.254` global.
 - A child with the same UID can read its parent's `/proc/<pid>/environ`, and
@@ -736,7 +748,13 @@ them routes between its networks, refuses ICMP redirects (`accept_redirects`
   limit and the result store of section 6. It sends the runner a validated
   video ID and treats everything that comes back as untrusted, with timeouts,
   size caps on the JSON and the audio, and the same metadata whitelist.
-  `TRUSTED_PROXIES` and the proxy's routing stay as they are. It finds the
+  The proxy's routing stays as it is. The fetcher trusts no proxy in the
+  example: `compose.example.yaml` sets its `TRUSTED_PROXIES` to empty, which
+  wins over the shared `.env`, so it keys its rate limit on the socket peer
+  and behind a reverse proxy every client shares one limit. The runner
+  reaches it over `jobs`, and `TRUSTED_PROXIES` must never cover `jobs`,
+  whose subnet Docker may change when it recreates the network (owner,
+  2026-11-05). It finds the
   runner at `FETCH_RUNNER_URL`, sends it the ID and a token of its own, and
   caps the answer: JSON ≤ 256 KiB of a fixed shape, audio of exactly the
   declared length up to `FETCH_MAX_BYTES`, 30 s per read and a total
@@ -749,6 +767,16 @@ them routes between its networks, refuses ICMP redirects (`accept_redirects`
   keeps an audio file only until it is collected, the next job starts, or
   60 s pass. It shares no network with the reverse proxy, never sees a
   browser's request and can't set a response header on the app's origin.
+  It is its container's PID 1 (no `init`, no wrapper), and under its lock,
+  before each run starts and after each run ends (before it answers the
+  `POST`), it sends `kill(-1, SIGKILL)`, which ends every other process of
+  UID 10001 in its container, a child that left yt-dlp's process group with
+  `setsid()` or one that keeps forking to a new PID included, then reaps
+  with `waitpid(-1, WNOHANG)` for about 2 s, never while a `Popen` is in
+  flight. So nothing of one run reaches the next one's files, and no orphan
+  stays a zombie that counts against `pids_limit`. Only the entry turns it
+  on, and only as PID 1: anywhere else `kill(-1)` would kill every process
+  of the user (owner, 2026-11-05).
 - **fetcher-forwarder** is the only container with a route out.
 - The core image doesn't change. Its example network becomes isolated from
   the host too (both isolated gateway modes, Engine 28.0), so the reverse
@@ -887,6 +915,10 @@ they are.
   - `pids_limit` 64 for the fetcher and 160 for the runner
   - the kernel settings (forwarding off per interface, ICMP redirects
     refused) on the runner
+  - the runner as its container's PID 1 (no `init`, no wrapper), which its
+    kill-and-reap sweep needs; a `docker exec` or health check running at a
+    run boundary is killed too
+  - `TRUSTED_PROXIES: ""` on the fetcher service, which wins over `.env`
 
 **Dropped, and why.**
 
@@ -926,25 +958,24 @@ where the runner answers only a well-formed job request and runs yt-dlp
 through the forwarder itself. A compromised runner shares `jobs` with the
 fetcher and can reach its port 8080 there: the Origin check needs only the
 public origin, which is no secret, the rate limit keys on the runner's
-address (so `TRUSTED_PROXIES` must never cover `jobs`, whose subnet Docker
-may change when it recreates the network, so the README tells operators to
-list only an address their deployment pins), and it never learns
-a job ID, so it can submit jobs that come back to itself and nothing more,
-which adds nothing to what the forwarder already gives it. Binding the
+address (so `TRUSTED_PROXIES` must never cover `jobs`; the example sets
+the fetcher's to empty, because Docker may give `jobs` another subnet when
+it recreates the network), and it learns the job IDs of its own
+submissions, never a browser's, so it can submit jobs that come back to
+itself and nothing more, which adds nothing to what the forwarder already
+gives it. Binding the
 fetcher to its `fetcher` address alone would need a fixed subnet and
 address in the example; the owner declined that on 2026-11-05 and accepts
-this path as a documented risk. The runner kills each yt-dlp run's process
-group when the run ends, success included, so nothing a run started
-outlives it; a child that calls `setsid()` leaves that group and survives
-the run, with the runner's reach (the forwarder, the fetcher's port 8080),
-write access to the next job's directory and `results/` (same UID), and a
-share of `pids_limit`. The runner opens every result `O_NOFOLLOW` and
-`O_NONBLOCK` and holds and serves only a regular file within
-`FETCH_MAX_BYTES`, so such a survivor can't wedge it with a FIFO or have it
-serve a link, but it could still replace a later job's audio with another
-regular file. The complete answer inside the container would be a sweep
-that kills every process of UID 10001 outside the runner's own tree before
-each run. The isolated gateway mode also means the
+this path as a documented risk. Nothing a yt-dlp run starts outlives it:
+the runner kills the run's process group when the run ends, and its
+kill-and-reap sweep at both run boundaries ends and reaps what left the
+group, so a run's child can't keep the runner's reach between jobs, touch
+the next job's files or hold a share of `pids_limit`. The sweep's cost is
+accepted (owner, 2026-11-05): a `docker exec` or health check running in
+the runner's container at a run boundary is killed too, which the health
+check's retries absorb, and the runner must be that container's PID 1. The
+runner still opens every result `O_NOFOLLOW` and `O_NONBLOCK` and holds and
+serves only a regular file within `FETCH_MAX_BYTES`. The isolated gateway mode also means the
 host has no route to the internal networks, so the reverse proxy must be a
 container on them.
 
@@ -1074,7 +1105,9 @@ going off-site.
   equal to `PUBLIC_ORIGIN` (no `Referer` fallback). Request bodies are
   `audio/wav` or `application/json` only.
 - **Client IP:** `X-Forwarded-For` is honoured only from `TRUSTED_PROXIES`, which
-  is empty by default.
+  is empty by default. The example sets the fetcher's to empty whatever
+  `.env` says, and it must never cover `jobs`, where the runner's requests
+  come from (6.1).
 - **Escaping:** server-rendered text is escaped, and the client uses
   `textContent` only.
 - **Decoder isolation:** see 5.2, 5.3 and 6. Downloads always carry
@@ -1473,8 +1506,9 @@ docs/PLAN.md
      runner's start check (S2), the `jobs` network (`egress` moved from the
      fetcher to the runner), `FETCH_RUNNER_URL`, the venv filled with
      `pip install --prefix` (I2), the kernel settings and pids cap on the
-     runner (K1), T1 to T3 for the final layout, the dev stack with the
-     runner in-process, and the same documentation.
+     runner (K1), the runner's kill-and-reap sweep as PID 1, the fetcher's
+     empty `TRUSTED_PROXIES` in the example, T1 to T3 for the final layout,
+     the dev stack with the runner in-process, and the same documentation.
 
    Each PR runs test first. A spec maps 6.1's check IDs to interfaces and test
    files. The tests are written, seen to fail for the right reason, reviewed

@@ -14,9 +14,15 @@ core's ffmpeg (strange_ringtone.render):
   startup and would die under RLIMIT_AS. The deployment's cgroup limit bounds
   memory instead;
 - its own session, so a wall-clock timeout kills the whole process group,
-  Deno included, and so does the end of every run, so no child it left
-  behind outlives it (one that starts a session of its own escapes the
-  group; docs/PLAN.md 6.1 records that residual);
+  Deno included, and so does the end of every run;
+- in the runner's container, where the runner is PID 1, a sweep at both run
+  boundaries: kill(-1, SIGKILL), which reaches every other process of the
+  runner's UID, a child that left the group with setsid() included, then a
+  bounded waitpid(-1) that reaps what the kill and the run left behind, so
+  nothing of one run reaches the next one's files or stays a zombie that
+  counts against pids_limit (docs/PLAN.md 6.1). Opt-in (YtDlp's
+  sweep_strays), and only where sweep_is_safe_here() says so: anywhere else
+  kill(-1) would kill every process of the user;
 - an environment built from scratch: the child sees fixed values and the
   proxy settings the runner's Settings read, never the server's own
   environment;
@@ -40,6 +46,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -80,6 +87,10 @@ SOCKET_TIMEOUT_SECONDS = 20
 # A real info JSON is a few hundred kB; this bounds what json.load reads.
 INFO_MAX_BYTES = 4 * 1024 * 1024
 _CHILD_PATH = "/usr/local/bin:/usr/bin:/bin"
+# How long a sweep waits for the processes it killed to exit so it can reap
+# them; one still dying after that is reaped at the next boundary.
+REAP_SECONDS = 2.0
+_REAP_POLL_SECONDS = 0.01
 
 
 @dataclass(frozen=True)
@@ -105,6 +116,65 @@ def default_prlimit() -> tuple[str, ...] | None:
     every fetch instead of silently running yt-dlp without limits.
     """
     return (PRLIMIT,) if sys.platform.startswith("linux") else None
+
+
+def sweep_is_safe_here() -> bool:
+    """Whether this process may sweep: PID 1 of its PID namespace, on a platform with kill, SIGKILL and waitpid.
+
+    The runner's entry asks this once at startup. PID 1 means the runner is
+    its container's first process (compose.example.yaml runs it with no init
+    and no wrapper), so kill(-1) stays inside the container. On a developer
+    machine the runner is never PID 1, and kill(-1) there would kill every
+    process of the user.
+    """
+    return (
+        callable(getattr(os, "kill", None))
+        and callable(getattr(os, "waitpid", None))
+        and hasattr(os, "WNOHANG")
+        and hasattr(signal, "SIGKILL")
+        and os.getpid() == 1
+    )
+
+
+def kill_and_reap(reap_seconds: float = REAP_SECONDS) -> int:
+    """SIGKILL every other process this one may signal, then reap its exited children; how many were reaped.
+
+    Only as PID 1 (RuntimeError otherwise, before any signal): the kernel
+    sends kill(-1) to every process the caller may signal in its PID
+    namespace except PID 1 and the caller, under one lock that fork() can't
+    slip past, so a child that left yt-dlp's group with setsid(), or one
+    that keeps forking to a new PID, is caught too. Everything such a
+    process leaves becomes a child of PID 1 when its parent exits, and PID 1
+    must reap it, or each one stays a zombie that counts against pids_limit
+    for good. The caller must have no subprocess.Popen in flight: waitpid(-1)
+    would steal that child's exit status, which subprocess then reports as 0.
+    """
+    # Checked here, at the one place that sends the signal, as well as by the
+    # entry: a flag set by mistake must never reach kill(-1) outside PID 1.
+    if os.getpid() != 1:
+        raise RuntimeError("only PID 1 of its own PID namespace may sweep")
+    try:
+        os.kill(-1, signal.SIGKILL)
+    except ProcessLookupError:
+        # Nothing to kill; earlier zombies may still wait to be reaped.
+        pass
+    reaped = 0
+    deadline = time.monotonic() + reap_seconds
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            # No child left at all, dead or alive.
+            return reaped
+        if pid != 0:
+            reaped += 1
+            continue
+        # Children exist but none has exited yet: killed processes take a
+        # moment to die. Bounded, so a stuck one can't hold the run lock; the
+        # next boundary reaps it.
+        if time.monotonic() >= deadline:
+            return reaped
+        time.sleep(_REAP_POLL_SECONDS)
 
 
 def watch_url(video_id: str) -> str:
@@ -222,9 +292,12 @@ class YtDlp:
         prlimit: tuple[str, ...] | None = None,
         limits: Limits | None = None,
         proxies: tuple[tuple[str, str], ...] = (),
+        sweep_strays: bool = False,
     ) -> None:
         # Nothing here touches the filesystem, so a checkout on Windows starts
-        # without yt-dlp or Deno and only a fetch fails.
+        # without yt-dlp or Deno and only a fetch fails. sweep_strays turns on
+        # kill_and_reap at both run boundaries; off by default, so only the
+        # runner's entry, as PID 1, ever turns it on (sweep_is_safe_here).
         if not command:
             raise ValueError("command must name a program")
         if max_seconds < 1 or max_bytes < 1 or timeout_seconds < 1:
@@ -240,8 +313,13 @@ class YtDlp:
             else Limits(cpu_seconds=timeout_seconds, file_size_bytes=max_bytes + 1024 * 1024)
         )
         self.proxies = tuple(proxies)
+        self.sweep_strays = bool(sweep_strays)
         self._lock = threading.Lock()
         self._running: set[subprocess.Popen[bytes]] = set()
+        # Held for a whole run while sweeping, so no sweep's waitpid(-1) runs
+        # while another thread's Popen is in flight. The runner's own lock
+        # already allows one run at a time; this keeps the rule in here too.
+        self._run_lock = threading.Lock()
 
     def full_command(self, args: list[str]) -> list[str]:
         """prlimit (when configured), then the yt-dlp command, then args."""
@@ -285,7 +363,29 @@ class YtDlp:
 
     def fetch(self, video_id: str, job_dir: Path) -> Download:
         """Download video_id's audio into job_dir, or raise FetchError. The caller removes job_dir."""
+        if not self.sweep_strays:
+            return self._fetch(video_id, job_dir)
+        with self._run_lock:
+            return self._fetch(video_id, job_dir)
+
+    def _sweep(self) -> bool:
+        """kill_and_reap when sweeping is on; False when the sweep could not run."""
+        if not self.sweep_strays:
+            return True
+        try:
+            kill_and_reap()
+        except (OSError, RuntimeError):
+            return False
+        return True
+
+    def _fetch(self, video_id: str, job_dir: Path) -> Download:
         command = self.full_command(ytdlp_args(video_id, job_dir, self.max_seconds, self.max_bytes))
+        # The boundary before the run: nothing a past run (or anything else of
+        # this UID) left running may watch this job's directory or results/
+        # while yt-dlp writes. No Popen is in flight here. A sweep that can't
+        # run fails the job rather than starting yt-dlp next to a stray.
+        if not self._sweep():
+            raise FetchError("failed")
         try:
             # Safe by construction: an argument list with no shell, a program
             # fixed in code (DEFAULT_COMMAND or PRLIMIT), arguments that are
@@ -344,13 +444,23 @@ class YtDlp:
             # group's ID from being reused, and the next run starts only
             # after this one, under the server's lock. The two paths above
             # that raise have killed it already, so every run's group is
-            # killed exactly once.
-            # A child that called setsid() has left the group and is not
-            # reached (docs/PLAN.md 6.1, "Accepted risks").
+            # killed exactly once. A child that called setsid() has left the
+            # group; the sweep below reaches it.
             _kill_group(proc)
         finally:
             with self._lock:
                 self._running.discard(proc)
+            # The boundary after the run, on every path, before read_result
+            # and so before the runner answers: kill(-1) reaches what left
+            # the group, and the reap clears the zombies of everything the
+            # kills ended. Only once Popen has reaped its own child
+            # (returncode set), so waitpid(-1) never steals yt-dlp's status;
+            # a run whose wait itself failed is swept at the next boundary.
+            swept = not self.sweep_strays or (proc.returncode is not None and self._sweep())
+        if not swept:
+            # A stray may still be running next to the files read_result
+            # would check: the result can't be trusted.
+            raise FetchError("failed")
         if proc.returncode != 0:
             raise FetchError(map_failure(proc.returncode, stderr))
         return read_result(job_dir, video_id, self.max_bytes)

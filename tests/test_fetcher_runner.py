@@ -1269,7 +1269,9 @@ class RunnerMainTest(unittest.TestCase):
         started: list[tuple[tuple[str, int], Any]] = []
 
         class FakeServer:
-            def __init__(self, address: tuple[str, int], settings: Any) -> None:
+            # sweep_strays: the entry always passes its PID-1 decision
+            # (tests/test_fetcher_runner_sweep.py tests it).
+            def __init__(self, address: tuple[str, int], settings: Any, sweep_strays: bool = False) -> None:
                 started.append((address, settings))
 
             def serve_forever(self) -> None:

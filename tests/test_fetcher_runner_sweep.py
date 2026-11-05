@@ -1,0 +1,531 @@
+"""The runner's kill-and-reap sweep at each run boundary (docs/PLAN.md 6.1; owner's decision of 2026-11-05).
+
+A yt-dlp child that calls setsid() leaves the run's process group and
+survives the run-end group kill, and the runner, as its container's PID 1,
+inherits every orphan a run leaves and must reap it, or each one stays a
+zombie that counts against pids_limit for good. So the runner, and only as
+PID 1, sends kill(-1, SIGKILL) and then reaps with waitpid(-1, WNOHANG) for a
+bounded time, before each run and after it, under the run lock, never while a
+Popen is in flight.
+
+kill(-1) outside a throwaway container would kill every process of the user
+running the tests. So every test here but one replaces os.kill, os.waitpid
+and os.getpid with fakes that never pass -1 on (Syscalls below); the one real
+sweep (RealSweepTest) runs only as PID 1 inside the fetcher image's test
+container, where the in-image suite's unittest process is PID 1.
+"""
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+from unittest import mock
+
+import helpers
+from strange_ringtone_fetch.metadata import FetchError
+from strange_ringtone_runner import __main__ as runner_entry
+from strange_ringtone_runner import ytdlp
+from strange_ringtone_runner.config import Settings
+from strange_ringtone_runner.server import RunnerServer
+from strange_ringtone_runner.ytdlp import YtDlp, kill_and_reap, sweep_is_safe_here
+from test_fetcher_runner import _TestRunnerServer, job_body, token
+from test_fetcher_server import LogCapture, build_request, exchange
+from test_fetcher_ytdlp import STUB_COMMAND, VIDEO_ID, StubYtDlp
+
+MIB = 1024 * 1024
+SIGKILL = getattr(signal, "SIGKILL", 9)
+WNOHANG = getattr(os, "WNOHANG", 1)
+LEFTOVER_STUB = helpers.ROOT / "tests" / "stubs" / "leftover_stub.py"
+# The real sweep runs only where it can harm nothing but a throwaway
+# container: PID 1 on Linux, in the fetcher image's test run, which sets this.
+IN_IMAGE_AS_PID_1 = (
+    sys.platform.startswith("linux")
+    and os.getpid() == 1
+    and os.environ.get("STRANGE_RINGTONE_FETCHER_IMAGE_TESTS") == "1"
+)
+
+
+@contextlib.contextmanager
+def without(module: Any, name: str) -> Iterator[None]:
+    """module.name removed for the duration, as on a platform that lacks it."""
+    saved = getattr(module, name)
+    delattr(module, name)
+    try:
+        yield
+    finally:
+        setattr(module, name, saved)
+
+
+class Syscalls:
+    """Fakes for os.kill, os.waitpid and os.getpid that record the sweep's calls and never pass -1 on.
+
+    A positive PID goes to the real call (Popen kills and waits for its own
+    child by PID, and the tests check processes that way). kill(pid <= 0) is
+    recorded and never sent; waitpid(-1) is recorded and answered from
+    `reaps`, then ChildProcessError. `in_flight` is set when a sweep call
+    arrives while a Popen the test recorded has no returncode yet.
+    """
+
+    def __init__(self, pid: int = 1) -> None:
+        self.pid = pid
+        self.calls: list[tuple[str, int, int]] = []
+        self.reaps: list[tuple[int, int] | BaseException] = []
+        self.kill_errors: list[BaseException | None] = []
+        self.kill_delays: list[float] = []
+        self.popens: list[subprocess.Popen[bytes]] = []
+        # Called with each Popen the test records, before fetch sees it.
+        self.popen_hook: Any = None
+        self.events: list[str] = []
+        self.in_flight = False
+        self._real_kill = os.kill
+        self._real_waitpid = getattr(os, "waitpid", None)
+        self._lock = threading.Lock()
+
+    def _note_in_flight(self) -> None:
+        if any(proc.returncode is None for proc in self.popens):
+            self.in_flight = True
+
+    def kill(self, pid: int, sig: int) -> None:
+        if pid > 0:
+            self._real_kill(pid, sig)
+            return
+        with self._lock:
+            self._note_in_flight()
+            self.calls.append(("kill", pid, sig))
+            self.events.append("sweep")
+            error = self.kill_errors.pop(0) if self.kill_errors else None
+            delay = self.kill_delays.pop(0) if self.kill_delays else 0.0
+        if delay:
+            time.sleep(delay)
+        if error is not None:
+            raise error
+
+    def waitpid(self, pid: int, options: int) -> tuple[int, int]:
+        if pid > 0:
+            assert self._real_waitpid is not None
+            return self._real_waitpid(pid, options)
+        with self._lock:
+            self._note_in_flight()
+            self.calls.append(("waitpid", pid, options))
+            answer = self.reaps.pop(0) if self.reaps else ChildProcessError()
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    def getpid(self) -> int:
+        return self.pid
+
+    def sweeps(self) -> list[tuple[str, int, int]]:
+        return [call for call in self.calls if call[0] == "kill"]
+
+    @contextlib.contextmanager
+    def installed(self, record_popen: bool = False) -> Iterator[Syscalls]:
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(os, "kill", self.kill))
+            stack.enter_context(mock.patch.object(os, "waitpid", self.waitpid, create=True))
+            stack.enter_context(mock.patch.object(os, "getpid", self.getpid))
+            # Windows has neither; the sweep's code names them at call time.
+            stack.enter_context(mock.patch.object(signal, "SIGKILL", SIGKILL, create=True))
+            stack.enter_context(mock.patch.object(os, "WNOHANG", WNOHANG, create=True))
+            if record_popen:
+                real_popen = subprocess.Popen
+
+                def recording(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+                    proc = real_popen(*args, **kwargs)
+                    with self._lock:
+                        self.popens.append(proc)
+                        self.events.append("popen")
+                    if self.popen_hook is not None:
+                        self.popen_hook(proc)
+                    return proc
+
+                stack.enter_context(mock.patch.object(ytdlp.subprocess, "Popen", recording))
+            yield self
+
+
+class KillAndReapTest(unittest.TestCase):
+    """kill_and_reap itself: one kill(-1, SIGKILL), then waitpid(-1, WNOHANG) until no child is left, bounded."""
+
+    def test_as_pid_1_it_kills_everything_once_then_reaps_until_no_child_is_left(self) -> None:
+        fake = Syscalls(pid=1)
+        fake.reaps = [(41, 9), (42, 9), (43, 0)]
+        with fake.installed():
+            reaped = kill_and_reap()
+        self.assertEqual(reaped, 3)
+        self.assertEqual(fake.calls[0], ("kill", -1, SIGKILL))
+        self.assertEqual(fake.sweeps(), [("kill", -1, SIGKILL)])
+        # Reaped until ChildProcessError: three children, then the fourth
+        # call finds none.
+        self.assertEqual(fake.calls[1:], [("waitpid", -1, WNOHANG)] * 4)
+
+    def test_nothing_to_kill_still_reaps_old_zombies(self) -> None:
+        fake = Syscalls(pid=1)
+        fake.kill_errors = [ProcessLookupError()]
+        fake.reaps = [(77, 0)]
+        with fake.installed():
+            self.assertEqual(kill_and_reap(), 1)
+        self.assertEqual(len(fake.calls), 3)
+
+    def test_it_never_signals_anything_unless_it_is_pid_1(self) -> None:
+        # The guard at the one place that sends the signal: a flag set by
+        # mistake on a developer machine must never reach kill(-1).
+        for pid in (2, 4242):
+            with self.subTest(pid=pid):
+                fake = Syscalls(pid=pid)
+                with fake.installed(), self.assertRaises(RuntimeError):
+                    kill_and_reap()
+                self.assertEqual(fake.calls, [])
+
+    def test_the_reap_is_bounded_when_killed_children_have_not_exited(self) -> None:
+        # (0, 0): children exist but none has exited. The sweep waits for
+        # them, polling, and gives up after reap_seconds; the next boundary
+        # reaps what is left.
+        fake = Syscalls(pid=1)
+        fake.reaps = [(0, 0)] * 100000
+        with fake.installed():
+            started = time.monotonic()
+            self.assertEqual(kill_and_reap(reap_seconds=0.3), 0)
+            elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.3)
+        self.assertLess(elapsed, 2.0)
+        polls = [call for call in fake.calls if call[0] == "waitpid"]
+        self.assertGreater(len(polls), 2, "it gave up without waiting")
+
+    def test_it_waits_for_a_killed_child_that_exits_late(self) -> None:
+        fake = Syscalls(pid=1)
+        fake.reaps = [(0, 0), (0, 0), (0, 0), (55, 9)]
+        with fake.installed():
+            self.assertEqual(kill_and_reap(reap_seconds=5.0), 1)
+
+    def test_the_default_wait_is_short(self) -> None:
+        # About 2 s: long enough for SIGKILLed processes to exit, short
+        # enough that the run lock is never held long for a stuck one.
+        self.assertEqual(ytdlp.REAP_SECONDS, 2.0)
+
+
+class SweepDecisionTest(unittest.TestCase):
+    """sweep_is_safe_here and the entry: on only as PID 1, with kill, SIGKILL and waitpid."""
+
+    def test_only_pid_1_may_sweep(self) -> None:
+        for pid, expected in ((1, True), (2, False), (4242, False)):
+            with self.subTest(pid=pid), Syscalls(pid=pid).installed():
+                self.assertIs(sweep_is_safe_here(), expected)
+
+    def test_not_without_sigkill_or_waitpid(self) -> None:
+        with Syscalls(pid=1).installed():
+            # Control: with all of them, PID 1 may sweep.
+            self.assertIs(sweep_is_safe_here(), True)
+            for module, name in ((signal, "SIGKILL"), (os, "waitpid"), (os, "WNOHANG"), (os, "kill")):
+                with self.subTest(missing=name), without(module, name):
+                    self.assertIs(sweep_is_safe_here(), False)
+
+    def run_main(self, pid: int) -> list[dict[str, Any]]:
+        started: list[dict[str, Any]] = []
+
+        class FakeServer:
+            def __init__(self, address: tuple[str, int], settings: Any, **options: Any) -> None:
+                started.append(options)
+
+            def serve_forever(self) -> None:
+                raise KeyboardInterrupt
+
+            def server_close(self) -> None:
+                pass
+
+        with Syscalls(pid=pid).installed(), \
+                mock.patch.dict(os.environ, {"FETCH_ALLOW_DEFAULT_ROUTE": "true"}, clear=True), \
+                mock.patch.object(runner_entry, "RunnerServer", FakeServer), \
+                mock.patch("signal.signal"), \
+                contextlib.redirect_stderr(LogCapture()):
+            self.assertEqual(runner_entry.main(["--bind", "127.0.0.1"]), 0)
+        return started
+
+    def test_the_entry_turns_the_sweep_on_only_as_pid_1(self) -> None:
+        self.assertEqual(self.run_main(1), [{"sweep_strays": True}])
+        self.assertEqual(self.run_main(4242), [{"sweep_strays": False}])
+
+    def test_the_flag_defaults_to_off_everywhere_else(self) -> None:
+        # Tests and tools that build the server or YtDlp themselves never
+        # sweep, the in-image suite included, whose process is PID 1.
+        self.assertIs(YtDlp(600, MIB, 7).sweep_strays, False)
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        server = RunnerServer(("127.0.0.1", 0), Settings(scratch_dir=Path(temp.name) / "scratch"))
+        self.addCleanup(server.server_close)
+        self.assertIs(server.ytdlp.sweep_strays, False)
+
+    def test_the_server_passes_the_flag_to_its_yt_dlp(self) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        settings = Settings(scratch_dir=Path(temp.name) / "scratch")
+        server = RunnerServer(("127.0.0.1", 0), settings, sweep_strays=True)
+        self.addCleanup(server.server_close)
+        self.assertIs(server.ytdlp.sweep_strays, True)
+
+    def test_a_server_asked_to_sweep_refuses_a_yt_dlp_that_does_not(self) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        settings = Settings(scratch_dir=Path(temp.name) / "scratch")
+        with self.assertRaises(ValueError):
+            RunnerServer(("127.0.0.1", 0), settings, ytdlp=StubYtDlp(600, MIB, 30), sweep_strays=True)
+        # Refused before binding or touching the scratch directory.
+        self.assertFalse((Path(temp.name) / "scratch").exists())
+
+
+class YtDlpSweepTest(unittest.TestCase):
+    """YtDlp.fetch with the stub yt-dlp: the sweep at both boundaries when on, and never when off."""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        self.temp = Path(temp.name)
+        patcher = mock.patch.object(ytdlp, "DRAIN_SECONDS", 0.5)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def job(self) -> Path:
+        return Path(tempfile.mkdtemp(prefix="job-", dir=self.temp))
+
+    def fetch(self, runner: YtDlp, video_id: str) -> str:
+        try:
+            runner.fetch(video_id, self.job())
+        except FetchError as error:
+            return error.code
+        return "done"
+
+    def test_off_it_never_signals_minus_one_even_as_pid_1(self) -> None:
+        fake = Syscalls(pid=1)
+        with fake.installed(record_popen=True):
+            runner = StubYtDlp(600, MIB, 1)
+            outcomes = [self.fetch(runner, video_id) for video_id in (VIDEO_ID, "failing____", "hanging____")]
+        self.assertEqual(outcomes, ["done", "failed", "timeout"])
+        self.assertEqual(fake.calls, [])
+        # Control: the runs did happen.
+        self.assertEqual(fake.events, ["popen"] * 3)
+
+    def test_on_it_sweeps_before_and_after_every_run_with_no_popen_in_flight(self) -> None:
+        cases = ((VIDEO_ID, "done"), ("failing____", "failed"), ("tooLong____", "too_long"), ("hanging____", "timeout"))
+        for video_id, outcome in cases:
+            with self.subTest(video_id=video_id):
+                fake = Syscalls(pid=1)
+                with fake.installed(record_popen=True):
+                    self.assertEqual(self.fetch(StubYtDlp(600, MIB, 1, sweep_strays=True), video_id), outcome)
+                self.assertEqual(fake.events, ["sweep", "popen", "sweep"])
+                self.assertEqual(fake.sweeps(), [("kill", -1, SIGKILL)] * 2)
+                self.assertFalse(fake.in_flight, "a sweep ran while yt-dlp's Popen was in flight")
+                self.assertTrue(all(proc.returncode is not None for proc in fake.popens))
+
+    def test_a_run_that_cannot_start_was_still_swept_before(self) -> None:
+        fake = Syscalls(pid=1)
+        with fake.installed(record_popen=True):
+            runner = YtDlp(600, MIB, 30, command=(str(self.temp / "missing-python"),), sweep_strays=True)
+            self.assertEqual(self.fetch(runner, VIDEO_ID), "failed")
+        self.assertEqual(fake.events, ["sweep"])
+
+    def test_on_but_not_pid_1_it_fails_the_job_and_signals_nothing(self) -> None:
+        fake = Syscalls(pid=4242)
+        with fake.installed(record_popen=True):
+            self.assertEqual(self.fetch(StubYtDlp(600, MIB, 30, sweep_strays=True), VIDEO_ID), "failed")
+        self.assertEqual(fake.calls, [])
+        # Failed before yt-dlp starts: no run next to a stray.
+        self.assertEqual(fake.popens, [])
+
+    def test_a_sweep_that_fails_before_the_run_starts_no_run(self) -> None:
+        fake = Syscalls(pid=1)
+        fake.kill_errors = [PermissionError()]
+        with fake.installed(record_popen=True):
+            self.assertEqual(self.fetch(StubYtDlp(600, MIB, 30, sweep_strays=True), VIDEO_ID), "failed")
+        self.assertEqual(fake.popens, [])
+
+    def test_a_sweep_that_fails_after_the_run_fails_the_job(self) -> None:
+        # A stray may still be running next to the files read_result would
+        # check, so even a good run is not trusted.
+        fake = Syscalls(pid=1)
+        fake.kill_errors = [None, PermissionError()]
+        with fake.installed(record_popen=True):
+            self.assertEqual(self.fetch(StubYtDlp(600, MIB, 30, sweep_strays=True), VIDEO_ID), "failed")
+        self.assertEqual(fake.events, ["sweep", "popen", "sweep"])
+
+    def test_no_sweep_while_yt_dlps_own_wait_has_not_reaped_it(self) -> None:
+        # If the wait for yt-dlp itself fails (an exception inside
+        # communicate() and wait()), Popen has not reaped its child: a
+        # waitpid(-1) now would take that exit status from under it. The
+        # closing sweep is skipped, the error propagates, and the next
+        # run's opening sweep collects what is left.
+        fake = Syscalls(pid=1)
+
+        class Broken(RuntimeError):
+            pass
+
+        def broken(*args: Any, **kwargs: Any) -> Any:
+            raise Broken()
+
+        def break_waits(proc: subprocess.Popen[bytes]) -> None:
+            proc.communicate = broken  # type: ignore[method-assign]
+            proc.wait = broken  # type: ignore[method-assign]
+
+        fake.popen_hook = break_waits
+        with fake.installed(record_popen=True):
+            with self.assertRaises(Broken):
+                StubYtDlp(600, MIB, 30, sweep_strays=True).fetch(VIDEO_ID, self.job())
+        self.assertEqual(fake.events, ["sweep", "popen"])
+        # Clean up the stub run with the real methods (its group was killed).
+        for proc in fake.popens:
+            del proc.communicate, proc.wait
+            with contextlib.suppress(OSError):
+                proc.kill()
+            proc.communicate(timeout=30)
+
+    def test_concurrent_fetches_never_sweep_while_another_run_is_in_flight(self) -> None:
+        # The runner's lock allows one run at a time; YtDlp keeps the rule
+        # itself while sweeping, so waitpid(-1) never steals a child's exit
+        # status. Two threads on one YtDlp: the second starts while the
+        # first (a hung run, timed out after 1 s) is in flight.
+        fake = Syscalls(pid=1)
+        outcomes: dict[str, str] = {}
+        with fake.installed(record_popen=True):
+            runner = StubYtDlp(600, MIB, 1, sweep_strays=True)
+
+            def run(video_id: str) -> None:
+                outcomes[video_id] = self.fetch(runner, video_id)
+
+            first = threading.Thread(target=run, args=("hanging____",))
+            first.start()
+            deadline = time.monotonic() + 10
+            while not fake.popens and time.monotonic() < deadline:
+                time.sleep(0.01)
+            second = threading.Thread(target=run, args=(VIDEO_ID,))
+            second.start()
+            first.join(30)
+            second.join(30)
+        self.assertEqual(outcomes, {"hanging____": "timeout", VIDEO_ID: "done"})
+        self.assertFalse(fake.in_flight, "a sweep ran while another run's Popen was in flight")
+        self.assertEqual(fake.events, ["sweep", "popen", "sweep", "sweep", "popen", "sweep"])
+
+
+class RunnerServerSweepTest(unittest.TestCase):
+    """The runner answers a POST only after the run's closing sweep, under its lock."""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        self.scratch = Path(temp.name) / "scratch"
+        self.log = LogCapture()
+        redirect = contextlib.redirect_stderr(self.log)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    def test_both_boundaries_sweep_before_the_post_is_answered(self) -> None:
+        fake = Syscalls(pid=1)
+        # The closing sweep is slow: an answer written before it would reach
+        # the client with one sweep recorded, not two.
+        fake.kill_delays = [0.0, 0.5]
+        with fake.installed(record_popen=True):
+            settings = Settings(scratch_dir=self.scratch)
+            server = _TestRunnerServer(
+                ("127.0.0.1", 0), settings, ytdlp=StubYtDlp(600, MIB, 30, sweep_strays=True), sweep_strays=True,
+            )
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                body = job_body(VIDEO_ID, token())
+                headers = [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+                request = build_request("POST", "/jobs", headers, body)
+                response = exchange(port, request)
+                sweeps_at_answer = list(fake.events)
+                # While the run held the lock, nothing else ran; it is free now.
+                self.assertTrue(server.busy.acquire(blocking=False))
+                server.busy.release()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(10)
+        self.assertEqual(response.status, 200, response.body)
+        self.assertEqual(json.loads(response.body)["status"], "done")
+        self.assertEqual(sweeps_at_answer, ["sweep", "popen", "sweep"])
+        self.assertFalse(fake.in_flight)
+
+
+@unittest.skipUnless(IN_IMAGE_AS_PID_1, "the real sweep runs only as PID 1 of the fetcher image's test container")
+class RealSweepTest(unittest.TestCase):
+    """In the image, as PID 1: a run's same-group, setsid and PID-hopping leftovers are killed and reaped."""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        self.temp = Path(temp.name)
+        # Whatever happens below, nothing this test started outlives it.
+        self.addCleanup(kill_and_reap)
+
+    def job(self) -> Path:
+        return Path(tempfile.mkdtemp(prefix="job-", dir=self.temp))
+
+    @staticmethod
+    def others() -> list[tuple[int, str]]:
+        """(pid, state) of every process in this PID namespace but PID 1; Z is a zombie."""
+        rows = []
+        for name in os.listdir("/proc"):
+            if not name.isdigit() or name == "1":
+                continue
+            try:
+                with open(f"/proc/{name}/stat", encoding="ascii") as handle:
+                    text = handle.read()
+            except OSError:
+                continue
+            rows.append((int(name), text.rsplit(")", 1)[1].split()[0]))
+        return sorted(rows)
+
+    def leftover_runner(self, sweep: bool) -> StubYtDlp:
+        return StubYtDlp(600, MIB, 30, command=(sys.executable, "-I", str(LEFTOVER_STUB)), sweep_strays=sweep)
+
+    def test_a_run_leaves_nothing_behind_and_the_next_run_works(self) -> None:
+        # Start from a clean namespace: earlier tests' leftovers are not ours.
+        kill_and_reap()
+        self.assertEqual(self.others(), [])
+
+        # Control: without the sweep, the run succeeds and leaves processes
+        # the group kill can't reach (the setsid sleeper and the hopper)
+        # plus zombies for PID 1.
+        download = self.leftover_runner(sweep=False).fetch(VIDEO_ID, self.job())
+        self.assertTrue(download.audio.is_file())
+        time.sleep(0.5)
+        left = self.others()
+        live = [row for row in left if row[1] != "Z"]
+        zombies = [row for row in left if row[1] == "Z"]
+        self.assertGreaterEqual(len(live), 2, f"the stub left too little to prove anything: {left}")
+        self.assertGreaterEqual(len(zombies), 1, f"no zombie for PID 1 to reap: {left}")
+        print(f"\nRealSweepTest control (no sweep): {len(live)} live, {len(zombies)} zombies left",
+              file=sys.stderr)
+        kill_and_reap()
+        self.assertEqual(self.others(), [])
+
+        # The sweep on: the same run ends with nothing else in /proc, no
+        # zombie either, and its result intact.
+        download = self.leftover_runner(sweep=True).fetch(VIDEO_ID, self.job())
+        self.assertEqual(download.audio.read_bytes(), b"STUB-M4A\n" + VIDEO_ID.encode("ascii"))
+        self.assertEqual(self.others(), [], "a run left a process or a zombie behind")
+        # And again after the hopper had time to run: nothing came back.
+        time.sleep(0.3)
+        self.assertEqual(self.others(), [])
+
+        # The next run still works (plain stub, sweep on).
+        runner = StubYtDlp(600, MIB, 30, command=STUB_COMMAND, sweep_strays=True)
+        download = runner.fetch(VIDEO_ID, self.job())
+        self.assertEqual(download.metadata.duration, 215.5)
+        self.assertEqual(self.others(), [])
+        print("RealSweepTest: as PID 1, the sweep killed and reaped every leftover", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

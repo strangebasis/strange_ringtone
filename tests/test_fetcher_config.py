@@ -110,6 +110,20 @@ class SharedParsersTest(unittest.TestCase):
             with self.subTest(origin=origin), self.assertRaisesRegex(ConfigError, "PUBLIC_ORIGIN"):
                 from_env(PUBLIC_ORIGIN=origin)
 
+    def test_an_empty_trusted_proxies_trusts_no_proxy(self) -> None:
+        # compose.example.yaml sets TRUSTED_PROXIES: "" on the fetcher (owner,
+        # 2026-11-05): empty must mean "trust none", never an error and never
+        # a catch-all, so the rate limit keys on the socket peer, the runner's
+        # address included, whatever X-Forwarded-For says.
+        from strange_ringtone.http_guard import client_address
+
+        trusted = from_env(TRUSTED_PROXIES="").trusted_proxies
+        self.assertEqual(trusted, ())
+        self.assertEqual(client_address("192.0.2.10", ["198.51.100.1"], trusted), "192.0.2.10")
+        # Control: a listed proxy's X-Forwarded-For is read.
+        listed = from_env(TRUSTED_PROXIES="192.0.2.0/24").trusted_proxies
+        self.assertEqual(client_address("192.0.2.10", ["198.51.100.1"], listed), "198.51.100.1")
+
     def test_trusted_proxies(self) -> None:
         self.assertEqual([str(n) for n in from_env(TRUSTED_PROXIES="10.0.0.0/8, ::1").trusted_proxies],
                          ["10.0.0.0/8", "::1/128"])
