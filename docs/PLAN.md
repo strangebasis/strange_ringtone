@@ -1,9 +1,10 @@
 # strange_ringtone: research and v0.1.0 plan
 
 Status: design agreed on 2026-10-24 (decisions in section 3). Milestones 0
-to 5 are merged; the owner's phone tests of the share sheet and the Shortcut
-are still open (section 12). Before the release (milestone 6), the fetcher's
-egress confinement (section 6.1, decided on 2026-11-03) lands in two PRs.
+to 5 are merged, and so is the fetcher's egress confinement (section 6.1,
+decided on 2026-11-03), built in two PRs. The owner's phone tests of the
+share sheet and the Shortcut are still open (section 12). The release
+(milestone 6) is next.
 This file is the design record; the README's "Deployment contract" becomes the
 source of truth for operators once v0.1.0 ships.
 
@@ -1499,11 +1500,11 @@ docs/PLAN.md
    The product check runs offline: the UI is driven in a browser against
    `tools/dev_fetch_stack.py`, which serves the core and the fetcher with the
    stubbed yt-dlp on one loopback origin, so no YouTube traffic leaves the
-   development machine. Still open: the owner's decision on one real fetch
-   from a throwaway container before v0.1.0, to confirm that
-   `bestaudio[ext=m4a]` is still served without a PO token; without it the
-   first real fetch happens in a deployment. Also open: the owner's phone test
-   of the Shortcut.
+   development machine. The one real fetch from throwaway containers before
+   v0.1.0, to confirm that `bestaudio[ext=m4a]` is still served without a PO
+   token, was made by 6.1's product checks with the owner's approval: on
+   2026-11-05, through the fetcher, the runner and the forwarder, it was.
+   Still open: the owner's phone test of the Shortcut.
 
    **Follow-up: egress confinement (section 6.1, decided on 2026-11-03).** Two
    PRs before the release, one after the other, because their files overlap:
@@ -1534,10 +1535,12 @@ docs/PLAN.md
      - the README contract, `.env.example`, CLAUDE.md and section 6
 
      With PR A alone the fetcher still ran yt-dlp itself, through the
-     forwarder. If the owner agrees, a product check makes the one real
-     fetch still open above, through the fetcher, the runner and the
-     forwarder, and sizes the budgets from it; until then the forwarder's
-     limits are provisional.
+     forwarder. PR B's product check made the real fetch through the
+     fetcher, the runner and the forwarder on 2026-11-05: six tunnels, one
+     at a time, all to allowed names, none refused or cut, and every
+     forwarder limit held with headroom (at most 975,753 bytes down in one
+     tunnel against 16 MiB). The limits stay provisional until the release
+     fixes the contract.
    - **PR B**, branch `feat/fetcher-runner`, delivered: the runner command
      and its protocol (R1 to R4), the fetcher's runner client (S1), the
      runner's start check (S2), the `jobs` network (`egress` moved from the

@@ -9,9 +9,8 @@
 #
 # Four services. `docker compose -f compose.example.yaml up -d fetcher` also
 # starts `fetcher-runner`, which the fetcher depends on, and
-# `fetcher-forwarder`, which the runner depends on: the fetcher image's third
-# and second commands (its Dockerfile names the forwarder second and the
-# runner third). The runner is the only container that runs yt-dlp, and the
+# `fetcher-forwarder`, which the runner depends on: the fetcher image's other
+# two commands. The runner is the only container that runs yt-dlp, and the
 # forwarder is the only service with a route out. `up -d fetcher` doesn't
 # create the `core` network, so a proxy project that declares
 # `strange_ringtone_core` external needs `up -d core`, or a plain `up -d`,
@@ -264,7 +263,8 @@ services:
     # and a daemon whose default is init (daemon.json "init": true) would
     # start the runner under docker-init, not as PID 1, where it can't
     # sweep, so it would refuse to start (exit 4): this file never sets
-    # FETCH_ALLOW_NO_SWEEP. As PID 1 it says so on stderr at startup.
+    # FETCH_ALLOW_NO_SWEEP. As PID 1 it says on stderr at startup that it
+    # sweeps.
     init: false
     # The same .env: the runner reads FETCH_MAX_SECONDS, FETCH_MAX_BYTES,
     # FETCH_TIMEOUT_SECONDS, FETCH_ALLOW_DEFAULT_ROUTE, FETCH_ALLOW_NO_SWEEP

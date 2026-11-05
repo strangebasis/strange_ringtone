@@ -37,27 +37,48 @@ is authoritative.
   The bundled ffmpeg is a minimal source build (WAV in, AAC/MP4 out, `file`
   protocol only), and a test fails if its build configuration grows.
 - **Fetcher image** (opt-in, the owner's explicit exception for YouTube): it
-  accepts only an 11-character video ID and builds the URL itself. It never
-  reaches the core. The browser is the only bridge. Its **forwarder** command
-  (`python -I /app/fetcher/forwarder.py`, port 3128) is the only component
-  with egress: a stdlib `CONNECT` gate that allows port 443 to `youtube.com`,
-  its subdomains and the subdomains of `googlevideo.com`, decides everything
-  before DNS, resolves IPv4 only and connects only to global unicast addresses
-  it checked, within fixed byte, time and tunnel budgets. The fetcher itself
-  runs on internal networks only, which Docker's isolated gateway modes (IPv4
-  and IPv6) keep off the host, reaches YouTube through `HTTPS_PROXY` pointing
-  at the forwarder, and refuses to start with a default route unless
-  `FETCH_ALLOW_DEFAULT_ROUTE=true`. Both containers turn forwarding off on
-  every interface and refuse ICMP redirects (never by writing
+  accepts only an 11-character video ID and runs as three containers of one
+  image. The **fetcher** (CMD, port 8080) is the API behind the reverse
+  proxy. It never runs yt-dlp: it sends the **runner**
+  (`python -I /app/fetcher/runner.py`, port 8080, at `FETCH_RUNNER_URL`) only
+  the validated ID and a token of its own, and trusts nothing that comes
+  back: capped JSON of a fixed shape, audio of exactly the declared length up
+  to `FETCH_MAX_BYTES`, per-read and total deadlines, the metadata
+  re-validated, no retry. The runner is the only container that runs yt-dlp
+  (from the venv, as a subprocess) and Deno. It builds the URL itself, takes
+  one job at a time, deletes its job directory in `finally` and the audio
+  once collected, when the next job starts or after 60 s, and shares no
+  network with the reverse proxy. Neither reaches the core. The browser is
+  the only bridge. The **forwarder** (`python -I /app/fetcher/forwarder.py`,
+  port 3128) is the only component with egress: a stdlib `CONNECT` gate that
+  allows port 443 to `youtube.com`, its subdomains and the subdomains of
+  `googlevideo.com`, decides everything before DNS, resolves IPv4 only and
+  connects only to global unicast addresses it checked, within fixed byte,
+  time and tunnel budgets. The fetcher (on `fetcher` and `jobs`) and the
+  runner (on `jobs` and `egress`) run on internal networks only, which
+  Docker's isolated gateway modes (IPv4 and IPv6) keep off the host, and the
+  runner reaches YouTube through `HTTPS_PROXY` pointing at the forwarder.
+  Both refuse to start with a default route unless
+  `FETCH_ALLOW_DEFAULT_ROUTE=true`. The runner is its container's PID 1
+  (`init: false`, stated) and makes itself non-dumpable. Before and after
+  each yt-dlp run it kills every other process in its container
+  (`kill(-1, SIGKILL)`) and reaps them. Where it can't (anywhere but PID 1)
+  it refuses to start (exit 4) unless `FETCH_ALLOW_NO_SWEEP=true`, which is
+  for a local run or a host that can't run it as PID 1, never for one that
+  can. No test ever sends the real `kill(-1)` outside a throwaway container.
+  Every container of the fetcher image turns forwarding off on every
+  interface and refuses ICMP redirects (never by writing
   `net.ipv4.ip_forward`, which resets the redirect setting), and each has a
   `pids_limit` of at least twice its worst case (docs/PLAN.md 6.1).
 - **Container contract:** a fixed non-root UID/GID, `read_only`, `cap_drop: [ALL]`,
   `no-new-privileges`, and one plain-HTTP port per container (8080 for the
-  servers, 3128 for the forwarder command). **Stateless:** it writes only to
-  `/tmp` (tmpfs), and the forwarder writes nothing; results expire after a
-  short TTL. There is no database, data directory or volume, and adding one
-  needs the owner's decision (the library was dropped on 2026-10-25). Tone
-  names stay out of URLs and logs. `GET /healthz` returns 200 and reveals
+  core, the fetcher and the runner, 3128 for the forwarder command).
+  **Stateless:** it writes only to `/tmp` (tmpfs), and the forwarder writes
+  nothing; results expire after a short TTL, and the runner keeps an audio
+  file only until the fetcher collects it. There is no database, data
+  directory or volume, and adding one needs the owner's decision (the library
+  was dropped on 2026-10-25). Tone names stay out of URLs and logs.
+  `GET /healthz` (the fetcher's is `/fetch/healthz`) returns 200 and reveals
   nothing (the forwarder serves no path; its health check is a TCP connect).
   A change to the env vars, limits, UID/GID, port or writable paths needs a
   breaking-change commit, so the CHANGELOG marks it BREAKING.
@@ -65,18 +86,23 @@ is authoritative.
   `DENY` framing, and `Referrer-Policy: same-origin`. Every state change is a
   POST that requires exactly one `Origin` equal to `PUBLIC_ORIGIN`, failing
   closed. Escape all rendered text; the client uses `textContent` only.
-  `X-Forwarded-For` is trusted only from `TRUSTED_PROXIES` (empty by default).
+  `X-Forwarded-For` is trusted only from `TRUSTED_PROXIES` (empty by default;
+  the compose example pins the fetcher's to empty, and it never covers the
+  `jobs` network).
 - **Subprocesses** (ffmpeg, yt-dlp): an argument list, never a shell. Each gets
   a wall-clock timeout, `prlimit` resource limits, a fresh per-job directory, and
-  server-generated names only. Clean up in `finally`. yt-dlp runs from the
-  image's venv (`/opt/yt-dlp/bin/python -I -m yt_dlp`), never from the
-  server's interpreter, whose site-packages hold nothing.
+  server-generated names only. Clean up in `finally`. yt-dlp runs only in the
+  runner container, from the image's venv
+  (`/opt/yt-dlp/bin/python -I -m yt_dlp`), never from a server's
+  interpreter, whose site-packages hold nothing; the build fills the venv
+  with the base interpreter's `pip install --prefix`, never `pip --python`.
 
 ## Code and tests
 
 - Python 3.12 with no newer language features, type hints, and
-  `from __future__ import annotations`. The core, the fetcher server and the
-  forwarder are **stdlib-only**. yt-dlp and yt-dlp-ejs come from a hashed
+  `from __future__ import annotations`. The core, the fetcher server, the
+  runner server and the forwarder are **stdlib-only**. yt-dlp and yt-dlp-ejs
+  come from a hashed
   pip-tools lock (`--require-hashes --no-deps --only-binary :all:`) into the
   image's venv, never into the base interpreter's site-packages, and nobody
   hand-edits `requirements.txt`.
