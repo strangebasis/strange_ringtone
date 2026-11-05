@@ -267,16 +267,28 @@ class RunnerClient:
 
     def _collect(self, job: str, path: Path, generation: int) -> Path:
         """GET the audio of job into path, a file this client creates, or raise."""
-        with self._exchange(self.audio_deadline, self._read_timeout, generation) as (conn, exchange):
-            # The path is built from the client's own token: no value the
-            # runner sent ever enters a URL.
-            conn.request("GET", f"{JOBS_PATH}/{job}/audio", headers={"Connection": "close"})
-            response = conn.getresponse()
-            try:
-                length = self._check_head(response, exchange, AUDIO_TYPE, self.max_bytes)
-                self._write_audio(response, exchange, length, path)
-            finally:
-                response.close()
+        written = False
+        try:
+            with self._exchange(self.audio_deadline, self._read_timeout, generation) as (conn, exchange):
+                # The path is built from the client's own token: no value the
+                # runner sent ever enters a URL.
+                conn.request("GET", f"{JOBS_PATH}/{job}/audio", headers={"Connection": "close"})
+                response = conn.getresponse()
+                try:
+                    length = self._check_head(response, exchange, AUDIO_TYPE, self.max_bytes)
+                    self._write_audio(response, exchange, length, path)
+                    written = True
+                finally:
+                    response.close()
+        except BaseException:
+            # A complete file whose exchange still failed (the deadline or
+            # cancel() shut it down after the last byte): the fetch fails,
+            # so the file this client made goes too. _write_audio removes a
+            # partial one itself.
+            if written:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+            raise
         return path
 
     @contextlib.contextmanager
