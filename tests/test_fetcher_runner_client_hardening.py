@@ -11,8 +11,10 @@ The same scripted runner on loopback; no network. All of it is S1
 from __future__ import annotations
 
 import json
+import socket
 import time
 import unittest
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -27,6 +29,9 @@ from test_fetcher_runner_client import (
     SETTLE_SECONDS,
     VIDEO_ID,
     ClientTestCase,
+    Request,
+    ScriptedRunner,
+    ScriptEntry,
     audio_response,
     drip,
     head_of,
@@ -271,6 +276,88 @@ class ClientUrlTest(unittest.TestCase):
             with self.subTest(url=url):
                 client = RunnerClient(url, MIB, 1)
                 self.assertEqual((client.host, client.port), ("fetcher-runner", 8080))
+
+
+class _TimedRunner(ScriptedRunner):
+    """The scripted runner, noting when each request arrived and when each connection was closed."""
+
+    def __init__(self, script: Iterable[ScriptEntry]) -> None:
+        self.arrived: list[float] = []
+        self.closed: list[float] = []
+        super().__init__(script)
+
+    def _record(self, request: Request) -> Any:
+        self.arrived.append(time.monotonic())
+        return super()._record(request)
+
+    def _finish(self, sock: socket.socket) -> None:
+        # Noted before the FIN goes out, so a client can see the close only
+        # after this time.
+        self.closed.append(time.monotonic())
+        super()._finish(sock)
+
+
+class ClientWaitsForCloseTest(ClientTestCase):
+    """S1: an exchange ends when the runner closes the connection, which it does only after freeing its job lock.
+
+    The runner writes its answer, then frees its one-job lock (and, after a
+    stream, deletes the audio), and only then closes the connection. A client
+    that went on as soon as it had the declared length could send its next
+    request, the audio GET or the next job's POST, while the lock was still
+    held, and get 503 busy: a fetch failed for nothing.
+    """
+
+    HOLD = 0.4
+
+    def timed(self, *script: ScriptEntry) -> _TimedRunner:
+        runner = _TimedRunner(script)
+        self.addCleanup(runner.stop)
+        self.runner = runner
+        return runner
+
+    def test_the_next_request_waits_until_the_runner_closed_the_last_one(self) -> None:
+        # Each answer is complete at once; its connection closes HOLD later.
+        runner = self.timed([(0.0, json_response(DONE)), (self.HOLD, b"")],
+                            [(0.0, audio_response(AUDIO)), (self.HOLD, b"")])
+        download = self.client(timeout_seconds=5, post_grace=1.0, read_timeout=2.0, audio_deadline=5.0).fetch(
+            VIDEO_ID, self.job_dir)
+        returned = time.monotonic()
+        self.assertEqual(download.audio.read_bytes(), AUDIO)
+        self.assertRequests(runner, ["POST", "GET"])
+        self.assertEqual(len(runner.closed), 2)
+        # The GET went out only once the POST's connection was closed, and
+        # the fetch returned only once the GET's was.
+        self.assertGreaterEqual(runner.arrived[1], runner.closed[0])
+        self.assertGreaterEqual(returned, runner.closed[1])
+
+    def test_a_runner_that_never_closes_fails_the_fetch_and_leaves_nothing(self) -> None:
+        # The deadline, not the (long) read timeout, ends the wait. After a
+        # complete POST answer no GET is sent.
+        runner = self.use([(0.0, json_response(DONE)), (0.0, None)])
+        started = time.monotonic()
+        self.assertFailed(self.client(timeout_seconds=1, post_grace=0.5, read_timeout=5.0))
+        self.assertLess(time.monotonic() - started, 1.5 + 1.0)
+        self.assertRequests(runner, ["POST"])
+        self.assertJobDirEmpty()
+        # After a complete audio answer, the file the client wrote goes again.
+        runner = self.use(json_response(DONE), [(0.0, audio_response(AUDIO)), (0.0, None)])
+        started = time.monotonic()
+        self.assertFailed(self.client(audio_deadline=1.0, read_timeout=5.0))
+        self.assertLess(time.monotonic() - started, 1.0 + 1.5)
+        self.assertRequests(runner, ["POST", "GET"])
+        self.assertJobDirEmpty()
+
+    def test_bytes_after_the_declared_length_fail_the_fetch(self) -> None:
+        # The runner writes exactly the length it declares. More, sent after
+        # the answer, is no answer of the runner's.
+        runner = self.use([(0.0, json_response(DONE)), (0.2, b"X")])
+        self.assertFailed(self.client(read_timeout=2.0))
+        self.assertRequests(runner, ["POST"])
+        self.assertJobDirEmpty()
+        runner = self.use(json_response(DONE), [(0.0, audio_response(AUDIO)), (0.2, b"X")])
+        self.assertFailed(self.client(read_timeout=2.0))
+        self.assertRequests(runner, ["POST", "GET"])
+        self.assertJobDirEmpty()
 
 
 if __name__ == "__main__":

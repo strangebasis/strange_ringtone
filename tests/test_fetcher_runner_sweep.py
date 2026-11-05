@@ -41,7 +41,7 @@ from strange_ringtone_runner.config import Settings
 from strange_ringtone_runner.server import RunnerServer
 from strange_ringtone_runner.ytdlp import YtDlp, kill_and_reap, sweep_is_safe_here
 from test_fetcher_runner import _TestRunnerServer, job_body, token
-from test_fetcher_server import LogCapture, build_request, exchange
+from test_fetcher_server import LogCapture, build_request, exchange, wait_for
 from test_fetcher_ytdlp import STUB_COMMAND, VIDEO_ID, StubYtDlp
 
 MIB = 1024 * 1024
@@ -622,8 +622,12 @@ class RunnerServerSweepTest(unittest.TestCase):
                 body = job_body(VIDEO_ID, token())
                 headers = [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
                 request = build_request("POST", "/jobs", headers, body)
+                # exchange() returns at the answer's last byte, which is when
+                # the sweeps are counted; the runner lets go of the lock just
+                # after that (before it closes), so that is waited for, bounded.
                 response = exchange(port, request)
                 sweeps_at_answer = list(fake.events)
+                wait_for(lambda: not server.busy.locked(), "the runner to let go of its lock")
                 # While the run held the lock, nothing else ran; it is free now.
                 self.assertTrue(server.busy.acquire(blocking=False))
                 server.busy.release()

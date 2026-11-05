@@ -18,6 +18,14 @@ bounds the reads http.client makes inside getresponse() (a 100 Continue loop,
 a status or header line that never ends), which the socket timeout alone
 can't, because each of their recvs returns in time.
 
+An exchange ends when the runner closes the connection, not when the
+declared length has been read. The runner closes it only once its handler
+has returned, after it freed its one-job lock (and, after a stream, deleted
+the audio); a client that went on at the last byte could send its next
+request, the audio GET or the next job's POST, while the lock was still
+held, and the runner would answer 503 busy. A runner that sends more than it
+declared, or never closes, fails the fetch within the same bounds.
+
 No magic-byte or codec check on the audio: the browser decodes by content
 and refuses what it can't, the page receives the bytes only as a no-store
 attachment with nosniff, and a check on the first bytes would not make a
@@ -94,44 +102,75 @@ class _Exchange:
     while the owner may still be about to read from that number, which could
     by then belong to another connection in this process. A shut-down socket
     wakes a blocked read with EOF or an error, which is all that is needed.
+
+    It also keeps a handle of its own on the connection (a dup of the
+    socket): http.client closes its descriptor as soon as it has read the
+    declared length, and the exchange ends only at the runner's close
+    (wait_for_close). A shutdown through either handle ends the connection
+    for both.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
+        self._watch: socket.socket | None = None
         self.aborted = False
 
     def attach(self, sock: socket.socket) -> None:
         """Hand over the connected socket; FetchError if the exchange was aborted meanwhile."""
+        watch = sock.dup()
         with self._lock:
             self._sock = sock
+            self._watch = watch
             aborted = self.aborted
         if aborted:
             # The deadline or cancel() fired while connect() ran, when there
             # was no socket to shut down yet.
-            _shut_down(sock)
+            _shut_down(watch)
             raise FetchError("failed")
 
     def abort(self) -> None:
-        """Shut the socket down (now, or as soon as it exists), so a blocked read returns."""
+        """Shut the connection down (now, or as soon as it exists), so a blocked read returns."""
         with self._lock:
             self.aborted = True
-            sock = self._sock
-        if sock is not None:
-            _shut_down(sock)
+            watch = self._watch
+        if watch is not None:
+            # Through this exchange's own handle, which stays open until
+            # close(): http.client may already have closed its descriptor.
+            _shut_down(watch)
 
     def settimeout(self, seconds: float) -> None:
-        # Through the socket this exchange kept: http.client drops its own
+        # Through the sockets this exchange kept: http.client drops its own
         # reference (conn.sock) once a Connection: close answer has begun.
+        # The timeout is per socket object, so the dup gets it too.
         with self._lock:
-            sock = self._sock
-        if sock is not None:
+            socks = [sock for sock in (self._sock, self._watch) if sock is not None]
+        for sock in socks:
             sock.settimeout(seconds)
+
+    def wait_for_close(self) -> None:
+        """Return once the runner has closed the connection; FetchError if it sends more or the wait is cut short."""
+        with self._lock:
+            watch = self._watch
+        if watch is None:
+            raise FetchError("failed")
+        try:
+            data = watch.recv(1)
+        except OSError:
+            # The read timeout, a reset, or the deadline's or cancel()'s
+            # shutdown where it shows as an error.
+            raise FetchError("failed") from None
+        # A byte past the declared length is an answer the runner never
+        # writes; an EOF made by the deadline's or cancel()'s shutdown is no
+        # close of the runner's.
+        if data or self.aborted:
+            raise FetchError("failed")
 
     def close(self) -> None:
         with self._lock:
-            sock, self._sock = self._sock, None
-        if sock is not None:
+            socks = [sock for sock in (self._sock, self._watch) if sock is not None]
+            self._sock = self._watch = None
+        for sock in socks:
             sock.close()
 
 
@@ -319,6 +358,11 @@ class RunnerClient:
             exchange.attach(sock)
             exchange.settimeout(head_timeout)
             yield conn, exchange
+            # The whole answer is in, but the runner may not have freed its
+            # job lock yet: it does so before it closes the connection, so the
+            # exchange ends at that close, within the same timeout and
+            # deadline (the module docstring says why).
+            exchange.wait_for_close()
             # Anything the timer cut short has already failed a check; this
             # makes sure a shutdown that raced a complete read fails too.
             if exchange.aborted:

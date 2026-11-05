@@ -570,9 +570,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload = server._run(video_id, job)
             self.send_json(200, payload)
         finally:
-            # After the answer is written: the fetcher's GET for the audio
-            # can't arrive before the run's lock is free, and no other run
-            # can start before this one's files are settled.
+            # After the answer is written, so no other run can start before
+            # this one's files are settled; before the connection is closed,
+            # and the fetcher's client waits for that close before its GET for
+            # the audio, so the GET never finds the lock held.
             server.busy.release()
 
     def _receive_body(self, length: int) -> bytes:

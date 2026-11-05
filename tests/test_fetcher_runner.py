@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import dataclasses
+import http.client
 import io
 import json
 import os
@@ -93,6 +94,34 @@ def token() -> str:
 
 def job_body(video_id: str, job: str) -> bytes:
     return json.dumps({"video_id": video_id, "job": job}).encode("ascii")
+
+
+def exchange_to_close(port: int, data: bytes, half_close: bool = False) -> Response:
+    """exchange(), returning only once the runner has closed the connection.
+
+    The runner frees its one-job lock (and, after a stream, deletes the
+    audio) before it closes the connection, but a client has the answer's
+    last byte before that, so a next request sent at once could find the
+    runner busy. The fetcher's client waits for the close
+    (strange_ringtone_fetch.runner_client); so do these tests.
+    """
+    method = data.split(b" ", 1)[0].decode("latin-1")
+    with socket.create_connection(("127.0.0.1", port), timeout=DEADLINE) as sock:
+        sock.sendall(data)
+        if half_close:
+            sock.shutdown(socket.SHUT_WR)
+        response = http.client.HTTPResponse(sock, method=method)
+        try:
+            response.begin()
+            body = response.read()
+        finally:
+            response.close()
+        # Until the runner's close. A reset is a close too: Windows turns a
+        # close over unread request bytes into one.
+        with contextlib.suppress(ConnectionError):
+            while sock.recv(65536):
+                pass
+    return Response(response.status, response.headers, body)
 
 
 def child_env(**values: str) -> dict[str, str]:
@@ -469,7 +498,7 @@ class RunnerServerTestCase(unittest.TestCase):
 
     def request(self, method: str, path: str, headers: list[tuple[str, str]] | None = None,
                 body: bytes = b"", **options: Any) -> Response:
-        return exchange(self.port, build_request(method, path, headers, body), **options)
+        return exchange_to_close(self.port, build_request(method, path, headers, body), **options)
 
     def post_body(self, body: bytes, content_type: str = JSON_TYPE) -> Response:
         headers = [("Content-Type", content_type), ("Content-Length", str(len(body)))]
@@ -487,7 +516,7 @@ class RunnerServerTestCase(unittest.TestCase):
 
         def run() -> None:
             try:
-                outcome.append(exchange(port, data))
+                outcome.append(exchange_to_close(port, data))
             except Exception as error:  # the connection may drop when the server closes
                 outcome.append(error)
 
@@ -750,8 +779,13 @@ class RunnerFlowTest(RunnerServerTestCase):
         results.release = held_release  # type: ignore[method-assign]
         outcome: list[Response] = []
         port = self.port
+        # The stream's client returns only at the runner's close, which comes
+        # after release() and after busy is let go (busy covers the whole
+        # stream, by design), so once it is joined the stream is over on the
+        # server's side too.
         thread = threading.Thread(
-            target=lambda: outcome.append(exchange(port, build_request("GET", f"/jobs/{job}/audio"))), daemon=True)
+            target=lambda: outcome.append(exchange_to_close(port, build_request("GET", f"/jobs/{job}/audio"))),
+            daemon=True)
         thread.start()
         self.assertTrue(entered.wait(DEADLINE), "the stream never released its file")
         self.assertBusy(self.post(OTHER_ID))
@@ -760,11 +794,6 @@ class RunnerFlowTest(RunnerServerTestCase):
         thread.join(DEADLINE)
         self.assertEqual([response.status for response in outcome], [200])
         self.assertEqual(outcome[0].body, b"STUB-M4A\n" + VIDEO_ID.encode("ascii"))
-        # The client has the stream's last byte before the handler returns
-        # from release() and lets go of busy (busy covers the whole stream,
-        # by design), so wait, bounded, for the stream to be over on the
-        # server's side too. locked() only reads the lock; it never takes it.
-        wait_for(lambda: not self.server.busy.locked(), "the stream's handler to let go of busy")
         # Acceptance: once the stream is over, the next job runs.
         self.done(OTHER_ID)
         self.assertEqual(len(self.runs()), 2)
@@ -1039,7 +1068,15 @@ class RunnerProtocolTest(RunnerServerTestCase):
             idle.close()
 
         def healthy() -> bool:
-            return exchange(self.port, build_request("GET", "/healthz")).status == 200
+            # While the slot is still taken, the runner answers this poll
+            # with the hand-written 503 and closes without reading the
+            # request; Windows then resets the connection before the 503 can
+            # be read (Linux delivers it first). Either way the slot isn't
+            # back yet, and the wait still needs a 200 within its deadline.
+            try:
+                return exchange(self.port, build_request("GET", "/healthz")).status == 200
+            except ConnectionError:
+                return False
 
         wait_for(healthy, "the worker to be released")
 
