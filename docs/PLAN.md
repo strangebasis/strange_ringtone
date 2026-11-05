@@ -73,7 +73,7 @@ you care about, for example in Files.
 | 7 | Licence | **AGPL-3.0-or-later.** The full text, with the "how to apply" lines naming this project. | Section 13 of the licence: the UI must offer users the source (section 7.5). |
 | 8 | Releases | **release-please** opens release PRs from conventional commits | The release-please job needs `contents` and `pull-requests` write, and commit prefixes are mandatory (section 9.3). |
 | 9 | Tone names (2026-10-25) | **Readable Unicode.** iOS shows the download's filename as the tone name (section 5.6). | A bigger sanitiser and test set. Look-alike characters are possible, which is harmless for names on your own phone. |
-| 10 | Fetcher egress (2026-11-03) | **The fetcher image confines itself.** yt-dlp runs in a runner container on internal networks only, and its one way out is the image's own CONNECT forwarder, which allows YouTube's hosts on port 443 within budgets (section 6.1). No TLS interception. | Two more containers from the fetcher image. The gate confines the fetcher to Google's front ends, not to YouTube alone. Docker Engine 26.0 or newer. |
+| 10 | Fetcher egress (2026-11-03) | **The fetcher image confines itself.** yt-dlp runs in a runner container on internal networks only, and its one way out is the image's own CONNECT forwarder, which allows YouTube's hosts on port 443 within budgets (section 6.1). No TLS interception. | Two more containers from the fetcher image. The gate confines the fetcher to Google's front ends, not to YouTube alone. Docker Engine 28.0 or newer, the first with the isolated gateway mode that keeps the host off internal networks. |
 
 Phase 0 confirmed decision 2: the share sheet accepts `.m4a`, `.m4r` and
 `.mp3` up to 30.0 s. A `MAX_CLIP_SECONDS` above 30 only helps people who
@@ -342,7 +342,7 @@ the user types becomes the filename. Decision 9 keeps it readable:
 | Image | `ghcr.io/<owner>/strange_ringtone:<semver>`, consumed by digest, linux/amd64 |
 | User | UID 10001, GID 10001 (fixed, non-root) |
 | Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
-| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). |
+| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). In `compose.example.yaml` (from 6.1's PR A) that network is also isolated from the Docker host (`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`, both, so the host stays off it if IPv6 is ever turned on for it; they need Docker Engine 28.0 or newer, the release that added those modes), so the reverse proxy must be a container on it, not a process on the host, and the log rotates (json-file, `max-size: 10m`, `max-file: 3`). |
 | Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `(MAX_RESULTS + RENDER_CONCURRENCY) × MAX_CLIP_SECONDS × 33 kB + RENDER_CONCURRENCY × MAX_BODY_BYTES`: a result is 256 kbit/s AAC, at most 33 kB per second of clip with the MP4 overhead, and each running render also holds its upload. That is 63 MB with the defaults (use 64 MB) and 84 MB with `MAX_CLIP_SECONDS=40`. |
 | Health | `GET /healthz` returns 200 with an empty body |
 
@@ -365,8 +365,9 @@ The core has no secrets in v0.1.0, so `.env.example` holds only
 `PUBLIC_ORIGIN=` and commented optional settings. Any later secret arrives as
 `*_FILE`, with no usable default. The same file carries the optional fetcher's
 settings in a block of their own, all commented out; `compose.example.yaml`
-gives both services that one `.env`, and each server reads only its own
-variables (`PUBLIC_ORIGIN` and `TRUSTED_PROXIES` are shared).
+gives the core and the fetcher that one `.env` (the forwarder reads none),
+and each server reads only its own variables (`PUBLIC_ORIGIN` and
+`TRUSTED_PROXIES` are shared).
 
 The fetcher image is a second, separate contract with its own table in the
 README (section 6, "Fetcher contract"). Nothing in it changes the core's: the
@@ -375,16 +376,18 @@ core still needs no egress, and `FETCH_ENABLED` only shows the YouTube box.
 ## 6. Fetcher image (opt-in)
 
 Section 6.1, decided on 2026-11-03, moves yt-dlp into a container of its own
-and gives the image its own egress gate. The bullets below describe the
-fetcher as merged in milestone 5; the follow-up PRs (section 12) update them as
-they land.
+and gives the image its own egress gate. Its first PR (PR A, section 12) has
+landed: the bullets below describe the fetcher as of PR A, which still runs
+yt-dlp itself, from a venv, and reaches YouTube only through the image's
+forwarder. PR B will move yt-dlp into the runner and update them again.
 
 - **Input:** JSON `{video_id}` only. The ID must match `^[A-Za-z0-9_-]{11}$`, and
   the server builds `https://www.youtube.com/watch?v=<id>` itself. No URL a user
   typed ever reaches yt-dlp, which removes the SSRF path (yt-dlp's generic
   extractor would otherwise fetch anything).
-- **Invocation:** `python -I -m yt_dlp`, run as a subprocess with an argument
-  list. The flags were checked against the pinned yt-dlp 2026.10.26, and an
+- **Invocation:** `/opt/yt-dlp/bin/python -I -m yt_dlp`, the interpreter of
+  the image's venv (never the server's own, see Runtime), run as a subprocess
+  with an argument list. The flags were checked against the pinned yt-dlp 2026.10.26, and an
   in-image test runs the real yt-dlp with the exact list (offline, so it can
   only fail at name resolution) to prove that version accepts every one:
   - `--ignore-config --no-playlist --use-extractors youtube`
@@ -415,7 +418,8 @@ they land.
   is built from scratch: fixed values, `HOME` and `DENO_DIR` inside the job
   directory under `/tmp` (the root filesystem is read-only, and nothing
   carries over between jobs), and `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`
-  when the operator set them, never the server's own environment. yt-dlp
+  when set (`compose.example.yaml` points `HTTPS_PROXY` at the forwarder),
+  never the server's own environment. yt-dlp
   hands that environment to Deno, which it runs with `--no-remote
   --cached-only`.
 - **Success** is judged by exactly `<id>.m4a` (a regular file of at most
@@ -460,39 +464,64 @@ they land.
   holds exactly those two distributions: yt-dlp declares no required
   dependencies, and yt-dlp-ejs must equal the version yt-dlp's own `default`
   extra pins (an in-image test checks both, and Dependabot bumps them as one
-  group). Without `requests`, yt-dlp talks to a proxy through urllib, so only
-  `http://` proxies work. The fetcher shares the core's
-  `strange_ringtone.config` and `strange_ringtone.http_guard` (the Origin,
-  length, `X-Forwarded-For` and rate-limit rules): `fetcher/__main__.py` puts
-  `../core` first on `sys.path`, and the image copies exactly those modules
-  to `/app/core`.
-- **Contract:** the same UID, read-only and capability rules as the core. It
-  needs **internet egress** to YouTube's hosts and no access to any private
-  network. Restricting egress (an allowlisting proxy, firewall rules for private
-  ranges) is documented as the deployment's job. It honours `HTTPS_PROXY`.
-  Settings: `PUBLIC_ORIGIN` (required), `TRUSTED_PROXIES`, `FETCH_MAX_SECONDS`
-  (600, at most 600: `decode.js` refuses input over 10 minutes, so a longer
-  video would be downloaded only for the phone to refuse it), `FETCH_MAX_BYTES`
-  (40 MiB; 10 minutes of YouTube's AAC is about 10 MB),
-  `FETCH_TIMEOUT_SECONDS` (120), `RATE_LIMIT_FETCHES_PER_MINUTE` (5),
-  `FETCH_RESULT_TTL_SECONDS` (600).
+  group). They install into a venv of their own at `/opt/yt-dlp`, root-owned,
+  created `--without-pip` and filled by the base image's pip through its
+  `--python` option; the base pip is then uninstalled. So the base
+  interpreter, which runs the fetcher and the forwarder, holds no installed
+  distribution at all and no `.pth` file, and its `sys.path` leaves out the
+  venv (I1 in 6.1, checked in the image). Without `requests`, yt-dlp talks
+  to a proxy through urllib, so only `http://` proxies work. The fetcher
+  shares the core's `strange_ringtone.config` and
+  `strange_ringtone.http_guard` (the Origin, length, `X-Forwarded-For` and
+  rate-limit rules): `fetcher/__main__.py` puts `../core` first on
+  `sys.path`, and the image copies exactly those modules to `/app/core`. The
+  forwarder is the stdlib package `strange_ringtone_forwarder`, started by
+  `/app/fetcher/forwarder.py`, which puts only its own directory on
+  `sys.path`, so its process loads neither the core nor the fetcher.
+- **Contract:** the same UID, read-only and capability rules as the core. The
+  fetcher needs YouTube's hosts and no access to any private network, and
+  it gets them **only through the forwarder** (6.1): it sits on internal
+  networks only, `compose.example.yaml` sets its `HTTPS_PROXY` to
+  `http://fetcher-forwarder:3128`, and it refuses to start (exit 3) when its
+  container has a default route, IPv4 or IPv6, or when it can't read or
+  parse its route tables, unless `FETCH_ALLOW_DEFAULT_ROUTE=true` says egress is filtered
+  another way. Docker Engine 28.0 or newer: engines before 26.0 forward DNS
+  from internal networks, and the internal networks' `isolated` gateway
+  modes, which keep the Docker host off them, arrived in 28.0
+  (moby/moby#49262). With Compose, Docker Compose 2.27.1 or newer, for the
+  per-network `driver_opts` that turn forwarding off and refuse ICMP
+  redirects on each interface (6.1).
+  Settings: `PUBLIC_ORIGIN` (required), `TRUSTED_PROXIES`,
+  `FETCH_MAX_SECONDS` (600, at most 600: `decode.js`
+  refuses input over 10 minutes, so a longer video would be downloaded only
+  for the phone to refuse it), `FETCH_MAX_BYTES` (40 MiB; 10 minutes of
+  YouTube's AAC is about 10 MB), `FETCH_TIMEOUT_SECONDS` (120),
+  `RATE_LIMIT_FETCHES_PER_MINUTE` (5), `FETCH_RESULT_TTL_SECONDS` (600),
+  `FETCH_ALLOW_DEFAULT_ROUTE` (false). The forwarder reads no setting.
 - **Fetcher contract (the README gets a second table):** image
   `ghcr.io/<owner>/strange_ringtone-fetcher:<semver>`, linux/amd64, UID/GID
-  10001, port 8080/tcp plain HTTP. The fetcher serves the `/fetch/` prefix
+  10001, two commands: the CMD `python -I /app/fetcher`, the fetcher on port
+  8080/tcp plain HTTP, and `python -I /app/fetcher/forwarder.py`, the
+  forwarder on port 3128/tcp. The fetcher serves the `/fetch/` prefix
   itself (`GET /fetch/healthz`, `POST /fetch/api/jobs`,
   `GET /fetch/api/jobs/<id>` and `…/audio`), and the proxy forwards those
-  paths unchanged, so no rewriting is needed. Writable: `/tmp` (tmpfs) only,
-  sized at `2 × FETCH_MAX_BYTES + 16 MB` for one download in flight, one
-  finished result, the info JSON and Deno's cache: 96 MB with the defaults.
-  Health: `GET /fetch/healthz` answers 200 `ok`. The in-image tests live in
-  `tests/image_fetcher/` (not `tests/image/`, which is the core's), gated by
-  `STRANGE_RINGTONE_FETCHER_IMAGE_TESTS=1`.
+  paths unchanged, so no rewriting is needed. Writable: for the fetcher
+  `/tmp` (tmpfs) only, sized at `2 × FETCH_MAX_BYTES + 16 MB` for one
+  download in flight, one finished result, the info JSON and Deno's cache:
+  96 MB with the defaults; for the forwarder nothing. Health: the fetcher's
+  `GET /fetch/healthz` answers 200 `ok`; the forwarder accepts a TCP
+  connection on 3128. The forwarder's limits are named with their values in
+  the README. The in-image tests live in `tests/image_fetcher/` (not
+  `tests/image/`, which is the core's), gated by
+  `STRANGE_RINGTONE_FETCHER_IMAGE_TESTS=1`; the compose topology tests live
+  in `tests/compose/`, gated by `STRANGE_RINGTONE_COMPOSE_TESTS=1`.
 
 ### 6.1 Egress confinement (decided 2026-11-03)
 
 The owner chose this design on 2026-11-03, after a review of five options.
-Milestone 5's follow-up builds it in two PRs (section 12). Until they land,
-the bullets above describe the fetcher as merged.
+Milestone 5's follow-up builds it in two PRs (section 12). PR A landed; until
+PR B lands the fetcher runs yt-dlp itself, through the forwarder, and the
+bullets above describe it that way.
 
 **Threat.** The likeliest compromise is a malicious yt-dlp, yt-dlp-ejs or
 Deno release that arrives through a Dependabot bump and runs as the fetcher's
@@ -515,17 +544,149 @@ source of abuse.
 - `python -I` still runs `.pth` lines from its site-packages (`-S` doesn't),
   and pip writes a wheel's scripts and data files into the interpreter's
   prefix. A wheel installed for the server's interpreter is code in the
-  server.
+  server. The same holds at build time: any interpreter that starts with
+  site enabled on the venv (the venv's own `python`, for one) after its
+  wheels are in runs their `.pth` lines as root, where they could rewrite
+  the base interpreter. pip's `--python` re-runs pip under the venv's
+  interpreter, but that interpreter starts while the venv is empty, and
+  site reads `.pth` files only at startup.
 - A container on an `internal: true` network has no default route. From
   Docker Engine 26.0 it also has no external DNS (CVE-2024-29018 stopped DNS
   forwarding from internal networks).
+- `internal: true` alone does not keep the host out: the bridge still has a
+  host address, and a container on it reaches every service the host listens
+  on at that address or on all addresses (SSH, a TCP Docker API, admin
+  ports). The bridge driver's `gateway_mode_ipv4: isolated` leaves the
+  bridge without an IPv4 address, and `gateway_mode_ipv6: isolated` without
+  an IPv6 one. Engine 28.0.0 added both modes, accepted only on an internal
+  network (its release notes, moby/moby#49262). Connections to the host
+  then fail, while container-to-container traffic and the embedded DNS keep
+  working (checked on Engine 29.8 by the refute stage, 2026-11-03).
+- The modes are per address family. On an internal network with IPv6
+  turned on (`enable_ipv6: true`, or a daemon `default-network-opts` that
+  turns it on for every new network) and the IPv4 mode alone, the host
+  gets an IPv6 address on the bridge again, and a container there reaches
+  the host's services on `::`. With both modes the bridge holds no IPv6
+  address at all. The IPv6 mode is accepted on a network without IPv6, where
+  the bridge keeps at most a link-local `fe80::` address and Docker turns
+  IPv6 off on the containers' interfaces (checked on Engine 29.8 by the
+  refute stage, 2026-11-04).
+- Inside every container of the stack `net.ipv4.ip_forward` is 1 (a new
+  network namespace copies it from the host's, where dockerd turns it on),
+  so the forwarder, with an interface on `egress` and on `outside`, would
+  route a packet that reached it for an off-link destination, and the
+  fetcher would route between `fetcher` and `egress`. Nothing can hand them
+  one today (the fetcher's only routes are its on-link subnets, it has no
+  capability to add a route or craft a frame, and the host has no address
+  on the isolated networks), but that is one capability or one route away
+  from a path around the gate. So the fetcher and the forwarder turn
+  forwarding off (owner, 2026-11-04), on every interface rather than with
+  the global switch (owner, 2026-11-04, after the race below).
+- The kernel forwards a packet only when the interface it arrived on has
+  forwarding on (`Documentation/networking/ip-sysctl.rst`,
+  `conf/interface/forwarding`). So the fetcher and the forwarder set
+  `net.ipv4.conf.default.forwarding` (every interface created later) and
+  `net.ipv4.conf.lo.forwarding` to 0 in `sysctls`, and each interface
+  Docker attaches through its endpoint sysctl on every network attachment
+  (`driver_opts: {com.docker.network.endpoint.sysctls:
+  "net.ipv4.conf.IFNAME.forwarding=0,net.ipv4.conf.IFNAME.accept_redirects=0"}`;
+  Docker replaces `IFNAME` with the interface it creates, whose name follows
+  the attach order). With every interface at 0 nothing is forwarded, while
+  the global switch, `net.ipv4.ip_forward` (the same value as
+  `conf/all/forwarding`), still reads 1 inside, by design. A compose test
+  routes datagrams from a helper on a stand-in for `egress` through a
+  container with the forwarder's settings toward a listener on a stand-in
+  for `outside`: none arrive, the router's own counters show it received
+  them and forwarded none, and a control router with forwarding on delivers
+  them (checked on Engine 29.8 by the fix stage, 2026-11-04). Docker writes
+  these namespaced sysctls as it creates the container, so they need no
+  capability; they work under `read_only` and `cap_drop: [ALL]`, and UID
+  10001 can't change them back, because `/proc/sys` is read-only inside
+  (EROFS). IPv6 forwarding already reads 0 in these containers, on the
+  example's networks and on an internal network with IPv6 turned on, so no
+  IPv6 sysctl is set: it would stop a container from starting on a kernel
+  without IPv6.
+- Why the global switch is left alone: writing `net.ipv4.ip_forward` (or
+  `conf/all/forwarding`) runs the kernel's forwarding change, which sets
+  `net.ipv4.conf.all.accept_redirects` to 1 (RFC 1122's host defaults), and
+  Docker passes a container's sysctls as a map and writes them in no fixed
+  order. With `ip_forward` 0 beside `all.accept_redirects` 0, `all` read 1
+  in 10 of 12 `docker run` starts and in 5 of 6 fetcher and 1 of 6
+  forwarder Compose starts on Engine 29.8. With forwarding off per
+  interface and `ip_forward` never written, every `accept_redirects` and
+  every interface's `forwarding` read 0 in 12 of 12 `docker run` and 6 of 6
+  Compose starts, both services healthy (redirects stage, 2026-11-04), and
+  the stack test passed 5 of 5 runs (fix stage). Anyone who checks only
+  `ip_forward` sees 1: read the per-interface values instead.
+- A namespace whose interfaces don't forward is a host, and a host follows
+  its router's ICMP redirects (RFC 1122); the kernel takes a redirect when
+  `all` or the receiving interface says 1, and only from a route's current
+  gateway: the fetcher has none, and the forwarder's is the Docker host on
+  `outside`. Both refuse them anyway (owner, 2026-11-04): `all`, `default`
+  and `lo` at 0 in `sysctls`, and each attached interface through the same
+  endpoint sysctl. Engine 29.8 attaches the interfaces after it writes the
+  container's sysctls, so they take `default`'s 0 anyway (with a network's
+  option removed, its interface still read 0); the per-attachment option
+  sets each one whatever the engine's order. `lo` exists before `default`
+  is written, so it needs its own sysctls. An endpoint sysctl must name
+  `IFNAME` (the engine refuses `all`, `default`, `lo` and
+  `net.ipv4.ip_forward` there), and the engine refuses an interface's
+  sysctl through `--sysctl` (`eth0`) but not `lo`'s. Nothing for IPv6, as
+  for forwarding. Checked on Engine 29.8 and Compose 5.5 (redirects stage,
+  2026-11-04).
+- Versions, from Docker's documentation (checked 2026-11-04): endpoint
+  sysctls (`com.docker.network.endpoint.sysctls`) first appear in the
+  Docker Engine 27.0.1 release notes (2024-06-24), below the 28.0 floor,
+  and the same notes say that a per-interface `--sysctl` such as
+  `net.ipv4.conf.eth0.*` will be rejected in a future release (Engine 29.8
+  does reject it), which is why the per-attachment option is the way to set
+  an interface. The Compose Specification gives Docker Compose v2.27.1 for
+  `driver_opts` on a service's network (compose-spec commit d04baf3,
+  2024-07-18), so 2.27.1 is the Compose floor.
+- On an internal network, Docker's own host rules drop a packet whose
+  destination is off the network's subnet before it reaches any container
+  on the bridge: a router container with forwarding on received none of the
+  datagrams sent through it (Engine 29.8, fix stage, 2026-11-04). That is a
+  second layer on `egress` today, not one the layout relies on: it depends
+  on the engine's firewall rules, and the per-interface settings hold
+  without it.
+- prlimit's `--nproc` for yt-dlp is `RLIMIT_NPROC`, which the kernel counts
+  per UID across every container that runs as 10001 (without user-namespace
+  remapping), so it is no per-container bound. The cgroup's pids controller
+  is: `pids_limit` caps a container's processes and threads, and a thread
+  that can't start then fails its request or connection closed. Deno, as
+  yt-dlp runs it, starts its main thread, 2 tokio threads and one V8 worker
+  per usable CPU up to 4 (7 threads with 4 CPUs or more, measured offline in
+  the image), and yt-dlp's Python 1 thread. The fetcher's `pids_limit: 200`
+  is at least twice its worst case of 87: the main thread, 16 request
+  workers (`FetchServer.MAX_WORKERS`), the job worker and the sweeper, the
+  health check, and one yt-dlp run counted as 67 (V8's workers as 63, for a
+  host that reports 64 CPUs, in case the cap of 4 doesn't hold there). It
+  also leaves the one real fetch more than four times the measured 8
+  threads of yt-dlp and Deno on top of the server's 20.
 - Python 3.12's `ipaddress` calls `64:ff9b::a9fe:a9fe` (NAT64 for
   169.254.169.254) and `::169.254.169.254` global.
 - A child with the same UID can read its parent's `/proc/<pid>/environ`, and
   it can ptrace the parent where Yama's `ptrace_scope` is 0.
+- glibc's resolver retries a relative name under each `search` domain of
+  `/etc/resolv.conf`, which Docker copies from the host, after an NXDOMAIN,
+  so `nosuch.youtube.com` can become `nosuch.youtube.com.<search domain>`.
+  A trailing dot makes the name absolute and stops that (checked in the
+  fetcher image with a loopback fake DNS by the refute stage, 2026-11-03).
 
 **Layout.** The fetcher image runs as three containers. Every network but
-`outside` is `internal: true`.
+`outside` is `internal: true` and isolated from the host
+(`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`, so turning
+IPv6 on for them doesn't bring the host back); `outside` keeps its gateway,
+the forwarder's route out. Every service rotates its log (json-file, `max-size` and
+`max-file`), so a flood of refusals can't fill the host's disk. Every
+container of the fetcher image (the fetcher and the forwarder in PR A, the
+runner too from PR B) turns forwarding off on every interface (`forwarding`
+0 for `default`, `lo` and, on each network attachment, its interface, and
+never the global `ip_forward`, which reads 1 inside by design), so none of
+them routes between its networks, refuses ICMP redirects (`accept_redirects`
+0 for `all`, `default`, `lo` and each attachment's interface), and sets a
+`pids_limit` of at least twice its worst case.
 
 ```
  reverse proxy
@@ -554,10 +715,19 @@ source of abuse.
   reverse proxy, never sees a browser's request and can't set a response
   header on the app's origin.
 - **fetcher-forwarder** is the only container with a route out.
-- The core doesn't change.
+- The core image doesn't change. Its example network becomes isolated from
+  the host too (both isolated gateway modes, Engine 28.0), so the reverse
+  proxy must be a container on it, not a process on the host, and its log
+  rotates. A proxy kept in another Compose project joins the networks as
+  external ones under their project-scoped names (`strange_ringtone_core`,
+  `strange_ringtone_fetcher`) and is told to use the fetcher's address on
+  `fetcher`, not on `egress`.
 
-**The forwarder.** Stdlib Python on one plain port. It reads one request head
-per connection and never parses anything after it. In order:
+PR A's interim layout has two containers: the fetcher on `fetcher` and
+`egress`, and the forwarder on `egress` and `outside`.
+
+**The forwarder.** Stdlib Python on one plain port, 3128. It reads one
+request head per connection and never parses anything after it. In order:
 
 1. Read the head within a size cap and a deadline. Accept only
    `CONNECT <name>:443`. Refuse plain-HTTP proxying, other methods, other
@@ -567,46 +737,115 @@ per connection and never parses anything after it. In order:
    Suffixes cost nothing here, because every allowed name reaches the same
    front ends, and they keep churn low. Piped's proxy allowlists the same way.
 3. Check the budgets: concurrent tunnels and new tunnels per minute.
-4. Only then resolve the name, IPv4 only and within a deadline. Refuse unless
-   every address is global unicast. IPv4 only sidesteps the NAT64 and
-   IPv4-compatible forms above.
+4. Only then resolve the name, IPv4 only and within a deadline, as an
+   absolute name (a trailing dot), so no `search` domain is ever tried.
+   Refuse unless every address is global unicast. IPv4 only sidesteps the
+   NAT64 and IPv4-compatible forms above.
 5. Connect to an address that passed, without resolving again, and answer
-   `200`. Then copy bytes both ways within caps: upload bytes per tunnel and
+   `200`. The attempts stop at the tunnel's lifetime, since the tunnel's
+   slot is already held. Then copy bytes both ways within caps: upload bytes per tunnel and
    per minute (yt-dlp sends requests, never large bodies), download bytes per
    tunnel, an idle timeout and a lifetime.
 6. Log refusals and cut tunnels with the name and the reason only, never
-   payload.
+   payload, at most `log_lines_per_minute` lines per minute: refusals cost a
+   client no budget, so the log has its own, and one
+   `forwarder log suppressed <n>` line, itself within that budget, counts
+   what it dropped.
 
 Steps 1 to 3 refuse before any DNS lookup, so a refused name can't leak
-through DNS. The budgets are sized with headroom from one measured fetch, or
-set generously if the owner declines that fetch, and they become contract
-limits.
+through DNS. A hard cap on open connections before the head comes on top, so
+a flood of half-open connections can't exhaust threads before step 3's
+budgets apply.
 
-**Fail closed.** The fetcher and the runner refuse to start when their
-container has a default route, IPv4 or IPv6, because something other than the
-forwarder could then carry traffic out. `FETCH_ALLOW_DEFAULT_ROUTE=true` turns
-the check off where egress is filtered some other way (a Kubernetes
-NetworkPolicy, for example), and the offline dev stack sets it. The check
-replaces requiring `HTTPS_PROXY`, which a malicious yt-dlp would ignore.
+The forwarder's container has the contract's flags, nothing writable, a
+128 MB memory limit, IP forwarding off on every interface (it relays in
+user space, so its kernel never routes from `egress` to `outside`; the
+global `ip_forward` is left at 1, see What it rests on), ICMP redirects
+refused on every interface (with its interfaces not forwarding, its one
+gateway, the Docker host on `outside`, could otherwise redirect its routes),
+and `pids_limit: 320`. That
+is at least twice its worst case of 156 threads: the main thread, one per
+open connection (`connections_max`, 64), the lookups (each in a thread that
+lives until glibc gives up, at most 10 s with the `resolv.conf` Docker
+writes for these networks, 5 s timeout and 2 attempts, measured at 10.0 s;
+each started by a tunnel in that time, so `tunnels_per_minute`, 90, bounds
+them), and the health check. Measured with `--pids-limit 320`: 64 idle
+connections make 65 threads, and the next connection is closed by the
+connection gate (`forwarder refused connections -`), not by a failed thread
+start; 16 clients hammering an allowed name against a DNS server that never
+answers peak at 29 threads. With a limit too small, a thread that can't
+start costs one `forwarder error RuntimeError` line and a closed
+connection, gives back its slots, and the forwarder serves the next
+request. The budgets are sized with headroom from one measured fetch,
+or set generously if the owner declines that fetch, and they become contract
+limits. PR A ships provisional values, named with their meaning in the
+README's "Forwarder limits" table, which a test compares with the code. The
+per-tunnel download cap is a fixed 16 MiB, one 10 MiB yt-dlp range plus
+headroom, never sized from `FETCH_MAX_BYTES` (owner, 2026-11-03); an in-image
+test fails when the pinned yt-dlp's range no longer fits it.
+
+**Fail closed.** The fetcher (from PR A) and the runner (from PR B) refuse to
+start when their container has a default route, IPv4 or IPv6, or when the
+route tables can't be read or parsed (a missing `ipv6_route` alone means a
+kernel without IPv6), because something other than the forwarder could then
+carry traffic out. `/proc/net/route` lists the IPv4 main table only, so a
+default route in a table that an `ip rule` selects passes unseen; Docker's
+bridge driver sets up no such rule, and `cap_drop: [ALL]` keeps the container
+from adding one. The check looks for a `/0` route only: routes that together
+cover every address without one (a VPN client's `0.0.0.0/1` and
+`128.0.0.0/1`) pass it, and an IPv4 `unreachable default` counts as a
+default route while IPv6 skips reject routes. Neither is reachable by the
+attacker in scope, who can't add routes and runs only after the check. `FETCH_ALLOW_DEFAULT_ROUTE=true` turns the check off
+where egress is filtered some other way (a Kubernetes NetworkPolicy, for
+example). The offline dev stack starts the fetcher without its entry point's
+check, so it needs nothing. The check replaces requiring `HTTPS_PROXY`, which
+a malicious yt-dlp would ignore.
 
 **Image.** yt-dlp and yt-dlp-ejs install into a venv from the same hashed
-lock, and only the runner starts yt-dlp from it. The fetcher and the forwarder
-run the base interpreter, whose site-packages hold no third-party
-distribution, so a wheel's `.pth`, scripts and data files can't reach them.
+lock, and only yt-dlp runs from it: in the fetcher's process tree in PR A,
+in the runner from PR B. The fetcher and the forwarder run the base
+interpreter, whose site-packages hold no third-party distribution, so a
+wheel's `.pth`, scripts and data files can't reach them. Once the wheels
+are in, no build step starts the venv's interpreter: the base interpreter
+compiles the venv's bytecode with `-I -S`, so no `.pth` line runs as root
+during the build either.
 Keeping one image leaves CI, Trivy, publishing, provenance and Dependabot as
 they are.
 
 **Contract changes**, none of which needs a breaking marker before v0.1.0:
 
-- the runner and forwarder commands, and the `jobs`, `egress` and `outside`
-  networks
-- `FETCH_ALLOW_DEFAULT_ROUTE`, how the fetcher finds the runner (an address
-  that defaults to the compose service) and how the runner finds the
-  forwarder (`HTTPS_PROXY`)
-- the forwarder's limits
-- `/tmp` per container (expected: the runner `FETCH_MAX_BYTES + 16 MB`, the
-  fetcher `2 × FETCH_MAX_BYTES`)
-- Docker Engine 26.0 or newer
+- shipped in PR A:
+  - the forwarder command (`python -I /app/fetcher/forwarder.py`, port 3128,
+    nothing writable)
+  - the `egress` network, which now joins the fetcher to the forwarder
+    (internal), and the `outside` network, the forwarder's only way out
+  - `FETCH_ALLOW_DEFAULT_ROUTE`
+  - `HTTPS_PROXY` pointing at the forwarder (set on the fetcher service by
+    `compose.example.yaml`)
+  - the forwarder's limits, named in the README (its log budget included)
+  - `gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated` on the
+    internal networks, and log rotation on every service
+  - IP forwarding off per interface and ICMP redirects refused on the
+    fetcher and the forwarder: `net.ipv4.conf.{default,lo}.forwarding: "0"`
+    and `net.ipv4.conf.{all,default,lo}.accept_redirects: "0"` in `sysctls`,
+    and `com.docker.network.endpoint.sysctls:
+    "net.ipv4.conf.IFNAME.forwarding=0,net.ipv4.conf.IFNAME.accept_redirects=0"`
+    in the `driver_opts` of each of their network attachments, with
+    `net.ipv4.ip_forward` and `conf/all/forwarding` never set (so
+    `ip_forward` reads 1 inside by design), no capability needed (owner,
+    2026-11-04)
+  - a `pids_limit` on the fetcher (200) and the forwarder (320), no
+    capability needed (owner, 2026-11-04)
+  - Docker Engine 28.0 or newer (the first release with the isolated gateway
+    modes; endpoint sysctls date from 27.0.1), and Docker Compose 2.27.1 or
+    newer for a service network's `driver_opts`
+- planned for PR B:
+  - the runner command and the `jobs` network (`egress` moves from the
+    fetcher to the runner)
+  - how the fetcher finds the runner (an address that defaults to the compose
+    service), with `HTTPS_PROXY` moving to the runner
+  - `/tmp` per container (expected: the runner `FETCH_MAX_BYTES + 16 MB`, the
+    fetcher `2 × FETCH_MAX_BYTES`)
 
 **Dropped, and why.**
 
@@ -630,39 +869,56 @@ they are.
   critical header-parsing bug and no address check after DNS; warnings about
   confused-deputy attacks from untrusted clients; and a large dependency tree.
 - **An environment variable that extends the allowlist.** A new YouTube host
-  means a release. This is a default the owner can overrule before PR A.
+  means a release. PR A ships this default; the owner can still overrule it.
 
 **Accepted risks.** A compromised runner can still reach other Google
 services through the shared front ends, within the forwarder's budgets.
 YouTube stays a command channel. Docker Engine before 26.0 leaks DNS from
-internal networks, which is why the contract requires 26.0. The forwarder is
-our own code at the boundary, so it stays small.
+internal networks, and before 28.0 has no way to keep the host off them
+(28.0 added the isolated gateway mode), which is why the contract requires
+28.0. The forwarder is our own code at the boundary, so it stays small. It
+listens on all its interfaces, `outside` included, where the Docker host can
+reach port 3128 (Engine 28 and newer drop direct routing to unpublished
+ports from elsewhere); nothing else may join `outside`. Until PR B, a
+compromised forwarder shares `egress` with the fetcher and can reach its port
+8080 there, where the fetcher's Origin and rate checks still apply. Binding the forwarder to its `egress` address alone
+would need a fixed subnet in the example, which is the owner's call.
+
+Until PR B, yt-dlp, yt-dlp-ejs and Deno run inside the fetcher container: on
+the `fetcher` network beside the reverse proxy (they can reach every port it
+listens on there, and through it the app's origin and the core), as the UID
+that owns the fetcher's `/tmp` job directories and results, and able to read
+the server's environment. PR A alone does not meet the threat paragraph's
+reverse-proxy and request/response goals; the runner split in PR B does, and
+a release without PR B must first make the server non-dumpable (see
+**Dropped**). The isolated gateway mode also means the host has no route to
+the internal networks, so the reverse proxy must be a container on them.
 
 **Checks and their tests.** Every check gets its failing test before its code
 (section 12), and the verification panel removes each check and expects a
 test to fail.
 
-| ID | Check | Tested by |
-| --- | --- | --- |
-| G1 | Only `CONNECT` to port 443; plain-HTTP proxying, other methods and other ports are refused | unit |
-| G2 | IP literals and malformed, over-long or non-ASCII names are refused | unit |
-| G3 | The name matches the allowlist by whole labels (`youtube.com.example.net` and `notyoutube.com` are refused) | unit |
-| G4 | G1 to G3 and the budgets are decided before any DNS lookup | unit, with a resolver that records its calls |
-| G5 | IPv4 only, and every resolved address is global unicast | unit, with fake answers: private, loopback, link-local, CGNAT, multicast, mixed |
-| G6 | The connection goes to an address that passed, without a second lookup | unit |
-| G7 | The request head has a size cap and a read deadline | unit |
-| G8 | Concurrent tunnels and new tunnels per minute are capped | unit |
-| G9 | Upload and download bytes are capped, with an idle timeout and a lifetime | unit |
-| G10 | Logs hold the name and the reason only | unit |
-| R1 | The runner accepts only a valid video ID, and one job at a time | unit |
-| R2 | The runner builds yt-dlp's environment from scratch, with the proxy settings | unit (today's tests move) |
-| R3 | The runner deletes its job directory in `finally`, and the audio once collected or after a deadline | unit |
-| S1 | The fetcher caps, times out and re-validates everything the runner returns | unit, with a fake runner |
-| S2 | The fetcher and the runner refuse to start with a default route unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`) and in-image |
-| I1 | The base interpreter's site-packages hold no third-party distribution and no `.pth` file, and its `sys.path` leaves out the venv | in-image |
-| T1 | In the compose layout, the fetcher and the runner have no default route and resolve no external name | Compose topology tests |
-| T2 | The runner reaches the forwarder and nothing on the `fetcher` network; the fetcher can't reach the forwarder | Compose topology tests |
-| T3 | The running forwarder refuses an unlisted name, an IP literal and port 80 | Compose topology tests |
+| ID | Check | Tested by | Shipped |
+| --- | --- | --- | --- |
+| G1 | Only `CONNECT` to port 443; plain-HTTP proxying, other methods and other ports are refused | unit | PR A |
+| G2 | IP literals and malformed, over-long or non-ASCII names are refused | unit | PR A |
+| G3 | The name matches the allowlist by whole labels (`youtube.com.example.net` and `notyoutube.com` are refused) | unit | PR A |
+| G4 | G1 to G3 and the budgets are decided before any DNS lookup | unit, with a resolver that records its calls | PR A |
+| G5 | IPv4 only, the name looked up as an absolute name, and every resolved address is global unicast | unit, with fake answers: private, loopback, link-local, CGNAT, multicast, mixed; a getaddrinfo spy for the trailing dot; compose tests: a loopback fake DNS in the image proves no `search` domain is asked | PR A |
+| G6 | The connection goes to an address that passed, without a second lookup | unit | PR A |
+| G7 | The request head has a size cap and a read deadline | unit | PR A |
+| G8 | Concurrent tunnels and new tunnels per minute are capped | unit | PR A |
+| G9 | Upload and download bytes are capped, with an idle timeout and a lifetime | unit; in-image for the download cap against the pinned yt-dlp's range size | PR A |
+| G10 | Logs hold the name and the reason only | unit | PR A |
+| R1 | The runner accepts only a valid video ID, and one job at a time | unit | PR B |
+| R2 | The runner builds yt-dlp's environment from scratch, with the proxy settings | unit (today's tests move) | PR B |
+| R3 | The runner deletes its job directory in `finally`, and the audio once collected or after a deadline | unit | PR B |
+| S1 | The fetcher caps, times out and re-validates everything the runner returns | unit, with a fake runner | PR B |
+| S2 | The fetcher (PR A) and the runner (PR B) refuse to start with a default route, or an unreadable or unparsable route table, unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`), in-image and Compose topology tests | PR A (the fetcher), PR B (the runner) |
+| I1 | The base interpreter's site-packages hold no third-party distribution and no `.pth` file, and its `sys.path` leaves out the venv; no build step after the wheels' install starts the venv's interpreter or compiles the venv with site enabled, and the venv's bytecode is current for the image's interpreter | in-image; unit (static read of `fetcher/Dockerfile`) | PR A |
+| T1 | In the compose layout, the fetcher (PR A) and the runner (PR B) have no default route and resolve no external name, and the host has no IPv4 or IPv6 address on their internal networks (also with IPv6 turned on for such a network); the forwarder has the only default route, and the fetcher image refuses to start on `outside` unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | Compose topology tests | PR A, extended in PR B |
+| T2 | PR A: the fetcher reaches the forwarder over `egress`, the forwarder reaches nothing on the `fetcher` network and nothing there reaches it, and the fetcher and the forwarder have forwarding 0 on every interface and every `accept_redirects` 0 (a container with the forwarder's settings routes no datagram between two networks, against a control router that does). PR B: the runner reaches the forwarder and nothing on the `fetcher` network, and the fetcher can't reach the forwarder | Compose topology tests | PR A, reworded in PR B |
+| T3 | The running forwarder refuses an unlisted name, an IP literal, port 80 and other methods before DNS, and logs the name and the reason only | Compose topology tests | PR A |
 
 ## 7. Web app
 
@@ -774,8 +1030,8 @@ going off-site.
   a slot indefinitely. The proxy handles slow-client defence beyond that.
 - **Egress (fetcher):** the fetcher image's own forwarder is the only way
   out: one CONNECT allowlist to YouTube's hosts on port 443, within budgets.
-  yt-dlp runs in a container that shares no network with the reverse proxy
-  (6.1).
+  From PR B, yt-dlp runs in a container that shares no network with the
+  reverse proxy (6.1).
 
 ## 9. Supply chain, CI and releases
 
@@ -818,15 +1074,24 @@ Local jobs run with `permissions: contents: read`:
   allowlist, `--network none` and `read_only`.
 - **Fetcher image tests** (from milestone 5 on): the fetcher image built the
   same way (in its own cache scope), then `tests/image_fetcher` in it under
-  the same flags with a 96 MB tmpfs: the container contract, the installed
-  yt-dlp and yt-dlp-ejs against the lock and each other, Deno under the
-  fetcher's `prlimit` set, the real yt-dlp accepting the exact argument list
-  (offline), the CMD answering `/fetch/healthz`, and the fetcher's unit tests
-  again under the image's Python 3.12, with the yt-dlp stub.
+  the same flags with a 96 MB tmpfs: the container contract, the venv's
+  yt-dlp and yt-dlp-ejs against the lock and each other, the base
+  interpreter holding no distribution (I1), one yt-dlp range plus headroom
+  fitting the forwarder's download cap, Deno under the fetcher's `prlimit`
+  set, the real yt-dlp accepting the exact argument list (offline), the CMD
+  answering `/fetch/healthz` with no default route, the forwarder command
+  answering refusals without DNS, and the fetcher's and the forwarder's unit
+  tests again under the image's Python 3.12, with the yt-dlp stub.
 - **Compose topology tests** (from the egress follow-up's PR A on): the job
-  builds the fetcher image, brings up `compose.example.yaml` without any
-  YouTube traffic, and checks T1 to T3 of section 6.1. It is the only test
-  that proves the layout.
+  builds the fetcher image as `strange_ringtone-fetcher:ci`, reading the
+  fetcher job's cache scope without writing it so the two jobs never race on
+  one scope, brings up `compose.example.yaml` without any YouTube traffic,
+  and checks T1 to T3 of section 6.1. It runs `tests/compose/`, which is
+  skipped unless `STRANGE_RINGTONE_COMPOSE_TESTS=1`, with the image tag
+  passed in `STRANGE_RINGTONE_COMPOSE_IMAGE` (default
+  `strange_ringtone-fetcher:local`), under a unique project name, a
+  temporary env file and no published port. It is the only test that proves
+  the layout.
 - A **PR-title check** (conventional commits, so release-please works). It is a
   stdlib script that reads the title from an `env:` variable, never from inline
   `${{ }}`.
@@ -989,10 +1254,12 @@ core/
   static/audio/{decode,wav,loudness,suggest,fades,request}.js   # pure audio code, unit-tested under Node
   static/package.json       # {"type": "module"} for the Node tests only: not served, not in the image
 fetcher/
-  Dockerfile  requirements.in  requirements.txt   # yt-dlp and yt-dlp-ejs, hashed lock
+  Dockerfile  requirements.in  requirements.txt   # yt-dlp and yt-dlp-ejs, hashed lock, installed into the /opt/yt-dlp venv
   __main__.py               # checkout entry point: python -I fetcher; puts ../core on sys.path
-  strange_ringtone_fetch/{__init__,__main__,config,server,jobs,ytdlp}.py   # imports only config and http_guard from core
-tests/  tests/corpus/  tests/image/  tests/image_fetcher/  tests/stubs/{ffmpeg_stub,ytdlp_stub}.py  tests/js/
+  forwarder.py              # the forwarder's entry point: python -I fetcher/forwarder.py; puts only fetcher/ on sys.path
+  strange_ringtone_fetch/{__init__,__main__,config,server,jobs,routes,ytdlp}.py   # imports only config and http_guard from core
+  strange_ringtone_forwarder/{__init__,__main__,policy,server}.py   # the CONNECT gate: stdlib only, imports nothing from core or the fetcher
+tests/  tests/corpus/  tests/image/  tests/image_fetcher/  tests/compose/  tests/stubs/{ffmpeg_stub,ytdlp_stub}.py  tests/js/
 scripts/{check_pr_title.py,check_contract_change.py,check_ffmpeg_release.py}   # stdlib checks CI runs
 tools/spike/phase0.py       # regenerates the iOS test tones into spike-out/
 tools/dev_fetch_stack.py    # loopback dev stack: core, stubbed fetcher and one origin, for the offline product check
@@ -1107,13 +1374,35 @@ docs/PLAN.md
    **Follow-up: egress confinement (section 6.1, decided on 2026-11-03).** Two
    PRs before the release, one after the other, because their files overlap:
 
-   - **PR A**, branch `feat/fetcher-forwarder`: the venv, the route check, the
-     forwarder command, and `compose.example.yaml` with the fetcher on
-     internal networks only. The fetcher still runs yt-dlp itself, through the
-     forwarder. PR A also adds the **Compose topology tests** job and updates
-     the README contract, `.env.example`, CLAUDE.md and section 6. If the
+   - **PR A**, branch `feat/fetcher-forwarder`, delivered:
+     - yt-dlp and yt-dlp-ejs in a venv at `/opt/yt-dlp`, from the same
+       hashed lock, with pip removed from the base interpreter (I1)
+     - the default-route start check in the fetcher's entry point, exit 3,
+       and `FETCH_ALLOW_DEFAULT_ROUTE` (S2)
+     - the forwarder, `python -I /app/fetcher/forwarder.py` on port 3128,
+       with its limits named in the README (G1 to G10)
+     - `compose.example.yaml` with the fetcher on internal networks only
+       (`fetcher`, `egress`), `HTTPS_PROXY` pointing at the forwarder, and
+       the forwarder alone on `outside`
+     - the internal networks isolated from the Docker host
+       (`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`,
+       Docker Engine 28.0 or newer), log rotation on every service, the
+       forwarder's log budget and its absolute-name lookups
+     - IP forwarding off on every interface (`forwarding` 0 for `default`,
+       `lo` and each network attachment's interface, never the global
+       `ip_forward`, which reads 1 inside by design) and a `pids_limit` on
+       the fetcher (200) and the forwarder (320), each at least twice its
+       worst case from its own caps (owner, 2026-11-04)
+     - ICMP redirects refused on both (`accept_redirects` 0 for `all`,
+       `default`, `lo` and each network attachment's interface, Docker
+       Compose 2.27.1 or newer; owner, 2026-11-04)
+     - the **Compose topology tests** job (T1 to T3, in PR A's wording)
+     - the README contract, `.env.example`, CLAUDE.md and section 6
+
+     The fetcher still runs yt-dlp itself, through the forwarder. If the
      owner agrees, its product check makes the one real fetch still open
-     above, through the forwarder, and sizes the budgets from it.
+     above, through the forwarder, and sizes the budgets from it; until
+     then the forwarder's limits are provisional.
    - **PR B**, branch `feat/fetcher-runner`, from `main` after PR A merges:
      the runner command and its protocol, the fetcher's runner client, the
      `jobs` network (`egress` moves from the fetcher to the runner), the dev
@@ -1179,6 +1468,7 @@ docs/PLAN.md
 - [Tailscale Serve (identity headers)](https://tailscale.com/kb/1312/serve)
 - [SSD Nodes: Tailscale free plan limits](https://www.ssdnodes.com/learn/tailscale-pricing-explained)
 - [Docker Engine 26.0 release notes (CVE-2024-29018, DNS from internal networks)](https://docs.docker.com/engine/release-notes/26.0/)
+- [Docker Engine 28 release notes (28.0.0: the `isolated` gateway mode for internal bridge networks, moby/moby#49262)](https://docs.docker.com/engine/release-notes/28/)
 - [OSV MAL-2026-4770: a PyPI package that runs code through a `.pth` file](https://osv.dev/vulnerability/MAL-2026-4770)
 - [Smokescreen, Stripe's egress proxy](https://github.com/stripe/smokescreen)
 - [Zulip: outgoing proxies with Docker Compose](https://zulip.readthedocs.io/projects/docker/en/latest/how-to/compose-outgoing-proxy.html)

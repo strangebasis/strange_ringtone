@@ -29,7 +29,7 @@ from strange_ringtone_fetch import server as server_module
 from strange_ringtone_fetch.config import Settings
 from strange_ringtone_fetch.jobs import Jobs, QueueFull
 from strange_ringtone_fetch.server import FetchServer, Handler, parse_job_request, prepare_scratch
-from strange_ringtone_fetch.ytdlp import FetchError, YtDlp, default_prlimit
+from strange_ringtone_fetch.ytdlp import YTDLP_PYTHON, FetchError, YtDlp, default_prlimit
 from test_fetcher_jobs import FakeClock, FakeRunner
 from test_fetcher_ytdlp import StubYtDlp, stub_title
 
@@ -1081,6 +1081,66 @@ class WorkerCapTest(ServerTestCase):
         wait_for(healthy, "the workers to be released")
 
 
+# What CPython's Thread.start raises when the kernel refuses a new thread, as
+# it does once the container reaches its pids limit (compose.example.yaml).
+NO_THREAD = "can't start new thread"
+
+
+class WorkerThreadStartFailureTest(ServerTestCase):
+    """Under a pids limit a request's thread may not start: the request fails closed and its worker slot comes back."""
+
+    server_class = _CappedServer
+
+    def test_a_request_thread_that_cannot_start_gives_its_worker_back(self) -> None:
+        server = self.server
+        real_start = threading.Thread.start
+        left = [_CappedServer.MAX_WORKERS + 1]
+        lock = threading.Lock()
+
+        def start(thread: threading.Thread) -> None:
+            # Only the threads socketserver starts for a request, whose
+            # target is this server's process_request_thread.
+            with lock:
+                fail = left[0] > 0 and getattr(getattr(thread, "_target", None), "__self__", None) is server
+                if fail:
+                    left[0] -= 1
+            if fail:
+                raise RuntimeError(NO_THREAD)
+            real_start(thread)
+
+        failures = left[0]
+        body = job_body()
+        request = build_request("POST", JOBS, self.job_headers(len(body)), body)
+        with mock.patch.object(threading.Thread, "start", start):
+            for _ in range(failures):
+                with socket.create_connection(("127.0.0.1", self.port), timeout=DEADLINE) as sock:
+                    with contextlib.suppress(OSError):
+                        sock.sendall(request)
+                    received = b""
+                    with contextlib.suppress(OSError):
+                        while chunk := sock.recv(65536):
+                            received += chunk
+                # Closed without a response: nothing was read or decided.
+                self.assertEqual(received, b"")
+            self.assertEqual(left[0], 0, "not every request met a failing thread start")
+        wait_for(lambda: self.log.getvalue().count("error while handling a request: ") >= failures, "the error lines")
+        time.sleep(0.2)
+        self.assertEqual(
+            self.log.lines(), ["error while handling a request: RuntimeError"] * failures,
+            "only the exception's type is logged, once per failed start",
+        )
+        self.assertNotIn(NO_THREAD, self.log.getvalue())
+        # Nothing reached the queue or yt-dlp.
+        self.assertEqual(len(self.server.jobs), 0)
+        self.assertEqual(self.runner.calls, [])
+        # Acceptance: both worker slots came back. One idle connection holds
+        # a worker, and a request on the other is still served.
+        idle = socket.create_connection(("127.0.0.1", self.port), timeout=DEADLINE)
+        self.addCleanup(idle.close)
+        response = self.request("GET", "/fetch/healthz")
+        self.assertEqual(response.status, 200)
+
+
 class ScratchTest(ServerTestCase):
     def test_startup_creates_and_empties_the_scratch_directory(self) -> None:
         (self.scratch / "job-old").mkdir()
@@ -1137,7 +1197,8 @@ class ScratchTest(ServerTestCase):
         server = self.server_class(("127.0.0.1", 0), self.settings)
         try:
             runner = server.runner
-            self.assertEqual(runner.command, (sys.executable, "-I", "-m", "yt_dlp"))  # type: ignore[attr-defined]
+            # I1: the venv's interpreter, never the server's own (sys.executable).
+            self.assertEqual(runner.command, (YTDLP_PYTHON, "-I", "-m", "yt_dlp"))  # type: ignore[attr-defined]
             expected = ("/usr/bin/prlimit",) if sys.platform.startswith("linux") else None
             self.assertEqual(runner.prlimit, expected)  # type: ignore[attr-defined]
             self.assertEqual(runner.timeout_seconds, self.settings.fetch_timeout_seconds)  # type: ignore[attr-defined]
