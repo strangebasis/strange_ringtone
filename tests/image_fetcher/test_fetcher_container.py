@@ -276,28 +276,44 @@ _INT_OPERATORS: dict[type[ast.operator], Callable[[int, int], int]] = {
     ast.Sub: operator.sub,
     ast.Pow: operator.pow,
 }
+# Every constant and every intermediate value of the range-size expression
+# must fit in this many bits. A range is a few MiB, so 64 bits is far more
+# than a real one needs, and with operands that small and shift counts and
+# exponents of at most 64, no single step can grow large. Bounding the shift
+# count and the exponent alone let nested powers grow 64-fold at every level
+# (Copilot's review of 96b7db0).
+_INT_EXPRESSION_BITS = 64
 
 
 def _int_expression(text: str) -> int:
     """The value of a plain integer expression (ints combined by <<, *, +, - and **), or ValueError.
 
-    Never eval: the text comes from a third-party file. Shift counts and
-    exponents are bounded so a hostile line can't make the test hang.
+    Never eval: the text comes from a third-party file. Every constant and
+    every intermediate value must fit in _INT_EXPRESSION_BITS bits, and shift
+    counts and exponents in 0 to 64, so a hostile line can't make the test
+    hang or exhaust memory.
     """
     try:
         tree = ast.parse(text, mode="eval")
     except SyntaxError as error:
         raise ValueError(f"not an integer expression: {text!r}") from error
 
+    def bounded(number: int) -> int:
+        if number.bit_length() > _INT_EXPRESSION_BITS:
+            raise ValueError(f"a value wider than {_INT_EXPRESSION_BITS} bits in {text!r}")
+        return number
+
     def value(node: ast.AST) -> int:
         # type() is int, not isinstance: True and False are ints too.
         if isinstance(node, ast.Constant) and type(node.value) is int:
-            return node.value
+            return bounded(node.value)
         if isinstance(node, ast.BinOp) and type(node.op) in _INT_OPERATORS:
             left, right = value(node.left), value(node.right)
             if isinstance(node.op, (ast.LShift, ast.Pow)) and not 0 <= right <= 64:
                 raise ValueError(f"shift or exponent out of range in {text!r}")
-            return _INT_OPERATORS[type(node.op)](left, right)
+            # Both operands fit in 64 bits, so even a step whose result is
+            # too wide, and is refused, costs next to nothing.
+            return bounded(_INT_OPERATORS[type(node.op)](left, right))
         raise ValueError(f"not a plain integer expression: {text!r}")
 
     return value(tree.body)
@@ -623,6 +639,20 @@ class IntExpressionTest(unittest.TestCase):
                      "__import__('os')", "x.y", "", "10 <<"):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 _int_expression(text)
+
+    def test_refuses_values_wider_than_64_bits(self) -> None:
+        # Copilot's review of 96b7db0: bounding shift counts and exponents
+        # alone let nested powers grow without limit ((2 ** 63) ** 64 is
+        # already 4,033 bits, and every further ** 64 multiplies that by 64),
+        # so a hostile CHUNK_SIZE line could exhaust memory or stall the job.
+        # Every constant and every intermediate value must fit in 64 bits:
+        # the last case ends at 2 ** 64 - 1 but passes 2 ** 64 on the way.
+        for text in ("(2 ** 63) ** 64", "((2 ** 63) ** 64) ** 64", "(1 << 63) * (1 << 63)", "(1 << 63) << 2",
+                     "18446744073709551616", "0x100000000000000000", "(1 << 63) + (1 << 63) - 1"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                _int_expression(text)
+        # Acceptance: the widest value within the bound still evaluates.
+        self.assertEqual(_int_expression("(1 << 63) + ((1 << 63) - 1)"), (1 << 64) - 1)
 
 
 class DenoTest(unittest.TestCase):
