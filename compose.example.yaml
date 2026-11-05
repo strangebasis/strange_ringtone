@@ -256,6 +256,11 @@ services:
       - python
       - -I
       - /app/fetcher/runner.py
+    # Stated, not left unset: an unset `init` takes the daemon's default,
+    # and a daemon whose default is init (daemon.json "init": true) would
+    # start the runner under docker-init, not as PID 1, so it would serve
+    # without its sweep. The runner logs which of the two it is at startup.
+    init: false
     # The same .env: the runner reads FETCH_MAX_SECONDS, FETCH_MAX_BYTES,
     # FETCH_TIMEOUT_SECONDS, FETCH_ALLOW_DEFAULT_ROUTE and the proxy
     # variables, and nothing browser-facing.

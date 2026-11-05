@@ -512,10 +512,11 @@ class RunnerEntryRouteCheckTest(unittest.TestCase):
         FakeServer.started = []
         log = io.StringIO()
         # signal.signal itself: the entry must not leave a SIGTERM handler in
-        # the test process.
+        # the test process; nor, on Linux, a non-dumpable test process.
         with mock.patch.dict(os.environ, environ, clear=True), \
                 mock.patch.object(runner_entry, "default_routes", create=True, **check) as patched, \
                 mock.patch.object(runner_entry, "RunnerServer", FakeServer), \
+                mock.patch.object(runner_entry, "make_not_dumpable"), \
                 mock.patch("signal.signal"), \
                 contextlib.redirect_stderr(log):
             code = runner_entry.main(["--bind", "127.0.0.1"])

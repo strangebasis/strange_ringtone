@@ -707,7 +707,16 @@ source of abuse.
 - Python 3.12's `ipaddress` calls `64:ff9b::a9fe:a9fe` (NAT64 for
   169.254.169.254) and `::169.254.169.254` global.
 - A child with the same UID can read its parent's `/proc/<pid>/environ`, and
-  it can ptrace the parent where Yama's `ptrace_scope` is 0.
+  it can ptrace the parent where Yama's `ptrace_scope` is 0 (the kernel's
+  default; Docker's default seccomp profile allows `ptrace` on kernels 4.8
+  and newer).
+- A non-dumpable process (`prctl(PR_SET_DUMPABLE, 0)`) can't be ptraced,
+  and its `/proc/<pid>/environ`, `maps` and `mem` can't be read, by a
+  process without `CAP_SYS_PTRACE`, whatever `ptrace_scope` says; `execve`
+  makes a process dumpable again. Measured as PID 1 of a throwaway container
+  of the fetcher image under the contract flags (2026-11-05): before the
+  call, a same-UID child read `/proc/1/environ` and `/proc/1/maps`; after
+  it, both, `process_vm_readv` and `PTRACE_ATTACH` were refused.
 - glibc's resolver retries a relative name under each `search` domain of
   `/etc/resolv.conf`, which Docker copies from the host, after an NXDOMAIN,
   so `nosuch.youtube.com` can become `nosuch.youtube.com.<search domain>`.
@@ -776,7 +785,12 @@ them routes between its networks, refuses ICMP redirects (`accept_redirects`
   flight. So nothing of one run reaches the next one's files, and no orphan
   stays a zombie that counts against `pids_limit`. Only the entry turns it
   on, and only as PID 1: anywhere else `kill(-1)` would kill every process
-  of the user (owner, 2026-11-05).
+  of the user (owner, 2026-11-05). The example states `init: false`, since
+  an unset `init` takes the daemon's default, which may be an init, and the
+  runner says at startup whether it sweeps. Before it serves, it makes
+  itself non-dumpable: yt-dlp runs as its UID and is not its ancestor, so
+  where `ptrace_scope` is 0 it could otherwise attach to the runner and
+  plant code there that `kill(-1)`, which spares the caller, never ends.
 - **fetcher-forwarder** is the only container with a route out.
 - The core image doesn't change. Its example network becomes isolated from
   the host too (both isolated gateway modes, Engine 28.0), so the reverse
@@ -915,9 +929,11 @@ they are.
   - `pids_limit` 64 for the fetcher and 160 for the runner
   - the kernel settings (forwarding off per interface, ICMP redirects
     refused) on the runner
-  - the runner as its container's PID 1 (no `init`, no wrapper), which its
-    kill-and-reap sweep needs; a `docker exec` or health check running at a
-    run boundary is killed too
+  - the runner as its container's PID 1 (`init: false`, stated, and no
+    wrapper), which its kill-and-reap sweep needs; a `docker exec` or health
+    check running at a run boundary is killed too
+  - the runner non-dumpable, so a `docker exec` as its UID can't read its
+    `/proc/1/environ`, `maps` or `mem`
   - `TRUSTED_PROXIES: ""` on the fetcher service, which wins over `.env`
 
 **Dropped, and why.**
@@ -933,8 +949,9 @@ they are.
   third-party code off the reverse proxy's network without a new image or a
   second `X-Forwarded-For` hop.
 - **Requiring `HTTPS_PROXY` at startup.** The route check replaces it.
-- **Making the server non-dumpable.** Moot: yt-dlp runs in another
-  container.
+- **Making the fetcher's server non-dumpable.** Moot: yt-dlp runs in
+  another container. The runner, PID 1 of yt-dlp's container, does make
+  itself non-dumpable (see fetcher-runner above).
 - **An off-the-shelf gate.** Smokescreen (Stripe's egress proxy) came closest,
   but it has no port rule or byte budgets, accepts clients without
   certificates only through a YAML setting, and its release tags are years
@@ -970,7 +987,9 @@ this path as a documented risk. Nothing a yt-dlp run starts outlives it:
 the runner kills the run's process group when the run ends, and its
 kill-and-reap sweep at both run boundaries ends and reaps what left the
 group, so a run's child can't keep the runner's reach between jobs, touch
-the next job's files or hold a share of `pids_limit`. The sweep's cost is
+the next job's files or hold a share of `pids_limit`; and the runner is
+non-dumpable, so such a child can't hide in it by ptrace either, whatever
+the host's `ptrace_scope`. The sweep's cost is
 accepted (owner, 2026-11-05): a `docker exec` or health check running in
 the runner's container at a run boundary is killed too, which the health
 check's retries absorb, and the runner must be that container's PID 1. The

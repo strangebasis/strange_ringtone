@@ -230,7 +230,11 @@ class SweepDecisionTest(unittest.TestCase):
                     self.assertIs(sweep_is_safe_here(), False)
 
     def run_main(self, pid: int) -> list[dict[str, Any]]:
+        return self.run_main_logged(pid)[0]
+
+    def run_main_logged(self, pid: int) -> tuple[list[dict[str, Any]], str]:
         started: list[dict[str, Any]] = []
+        log = LogCapture()
 
         class FakeServer:
             def __init__(self, address: tuple[str, int], settings: Any, **options: Any) -> None:
@@ -245,14 +249,32 @@ class SweepDecisionTest(unittest.TestCase):
         with Syscalls(pid=pid).installed(), \
                 mock.patch.dict(os.environ, {"FETCH_ALLOW_DEFAULT_ROUTE": "true"}, clear=True), \
                 mock.patch.object(runner_entry, "RunnerServer", FakeServer), \
+                mock.patch.object(runner_entry, "make_not_dumpable"), \
                 mock.patch("signal.signal"), \
-                contextlib.redirect_stderr(LogCapture()):
+                contextlib.redirect_stderr(log):
             self.assertEqual(runner_entry.main(["--bind", "127.0.0.1"]), 0)
-        return started
+        return started, log.getvalue()
 
     def test_the_entry_turns_the_sweep_on_only_as_pid_1(self) -> None:
         self.assertEqual(self.run_main(1), [{"sweep_strays": True}])
         self.assertEqual(self.run_main(4242), [{"sweep_strays": False}])
+
+    def test_the_entry_says_whether_it_sweeps(self) -> None:
+        # Under an init (a daemon whose default is init, a deployment's
+        # `init: true`, a shared PID namespace) the runner is not PID 1 and
+        # serves without the sweep; one stderr line is how an operator sees
+        # that, and the PID-1 line is distinct from it.
+        on = "strange_ringtone_runner: PID 1: killing and reaping a run's leftovers at each run boundary"
+        off = "strange_ringtone_runner: not PID 1: a run's leftovers are not killed and reaped (README, Runs with)"
+        for pid, expected, other in ((1, on, off), (4242, off, on), (7, off, on)):
+            with self.subTest(pid=pid):
+                _started, stderr = self.run_main_logged(pid)
+                lines = stderr.splitlines()
+                self.assertEqual(lines.count(expected), 1, stderr)
+                self.assertNotIn(other, lines)
+                # Said before the server listens, so it heads the log.
+                self.assertLess(lines.index(expected),
+                                lines.index("strange_ringtone_runner listening on 127.0.0.1:8080"))
 
     def test_the_flag_defaults_to_off_everywhere_else(self) -> None:
         # Tests and tools that build the server or YtDlp themselves never

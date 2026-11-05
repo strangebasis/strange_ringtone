@@ -1260,6 +1260,7 @@ class RunnerMainTest(unittest.TestCase):
         with mock.patch.dict(os.environ, environ, clear=True), \
                 mock.patch.object(runner_entry, "RunnerServer", server), \
                 mock.patch.object(runner_entry, "default_routes", check, create=True), \
+                mock.patch.object(runner_entry, "make_not_dumpable"), \
                 mock.patch("signal.signal"), \
                 contextlib.redirect_stderr(log):
             code = runner_entry.main(argv)

@@ -1020,6 +1020,16 @@ class LayoutTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr.strip())
         self.assertIn(json.loads(result.stdout), (None, []), "the image has an entrypoint")
 
+    def test_the_runner_pins_init_off_against_the_daemons_default(self) -> None:
+        """Q2: `init: false`, stated, because an unset key takes the daemon's default, which may be init."""
+        # A daemon started with --init (daemon.json "init": true) runs every
+        # container whose HostConfig.Init is unset under docker-init; the
+        # runner would then be PID 7, not 1, and serve without its sweep.
+        # Only an explicit false overrides that default.
+        runner = self._service("fetcher-runner")
+        self.assertIn("init", runner, "the runner leaves init to the daemon's default")
+        self.assertIs(runner["init"], False, f"the runner's init is {runner['init']!r}")
+
     def test_no_service_has_a_volume_and_only_tmp_is_writable(self) -> None:
         """Stateless (CLAUDE.md): no volume, a read-only root, and /tmp's tmpfs the only writable mount."""
         config = self._config()
@@ -1450,6 +1460,33 @@ class StackTest(unittest.TestCase):
             with self.subTest(service=service):
                 running = self._probe_output(self._stack.exec_in(service, _CMDLINE_PROBE), f"{service} cmdline")
                 self.assertEqual(running, expected)
+
+    def test_the_running_runner_is_pid_1_sweeps_and_is_not_dumpable(self) -> None:
+        """Q2: the engine got init false, the runner says it sweeps, and a same-UID process can't read PID 1."""
+        ids = self._stack.container_ids("fetcher-runner")
+        self.assertEqual(len(ids), 1, ids)
+        result = _docker("inspect", "--format", "{{json .HostConfig.Init}}", ids[0], timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        self.assertIs(json.loads(result.stdout), False, "the runner's container leaves init to the daemon")
+        logs = self._stack.logs("fetcher-runner")
+        self.assertEqual(logs.returncode, 0, logs.stderr.strip())
+        self.assertIn("strange_ringtone_runner: PID 1: killing and reaping", logs.stdout + logs.stderr)
+        # `compose exec` runs as the service's user, 10001, like yt-dlp. The
+        # runner made itself non-dumpable, so its environ is closed to it;
+        # cmdline (control) stays world-readable.
+        probe = (
+            "import json\n"
+            "out = {}\n"
+            "for name in ('cmdline', 'environ'):\n"
+            "    try:\n"
+            "        with open('/proc/1/' + name, 'rb') as handle:\n"
+            "            out[name] = 'read' if handle.read() else 'empty'\n"
+            "    except OSError as error:\n"
+            "        out[name] = type(error).__name__\n"
+            "print(json.dumps(out))\n"
+        )
+        state = self._probe_output(self._stack.exec_in("fetcher-runner", probe), "runner /proc/1 probe")
+        self.assertEqual(state, {"cmdline": "read", "environ": "PermissionError"})
 
     def test_t2_the_running_services_forward_nothing_and_have_the_examples_pids_cap(self) -> None:
         """K1/T2: in the three running services, IPv4 and IPv6 forwarding read 0, and pids.max is the example's."""
