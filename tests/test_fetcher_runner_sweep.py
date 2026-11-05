@@ -57,11 +57,12 @@ NO_SWEEP_LINE = (
     "strange_ringtone_runner: FETCH_ALLOW_NO_SWEEP is set and the sweep can't run here (not PID 1, or no "
     "kill and waitpid): a run's leftovers are not killed and reaped (README, Runs with)"
 )
-IN_IMAGE_AS_PID_1 = (
-    sys.platform.startswith("linux")
-    and os.getpid() == 1
-    and os.environ.get("STRANGE_RINGTONE_FETCHER_IMAGE_TESTS") == "1"
-)
+# The fetcher image's test run on Linux. RealSweepTest runs there and needs
+# to be PID 1, which it asserts rather than skips on: it is the sweep's only
+# end-to-end proof, and a container started with an init (`docker run
+# --init`, or a daemon whose default is init) would otherwise drop it from a
+# green run without a word.
+IN_IMAGE = sys.platform.startswith("linux") and os.environ.get("STRANGE_RINGTONE_FETCHER_IMAGE_TESTS") == "1"
 
 
 @contextlib.contextmanager
@@ -556,11 +557,14 @@ class YtDlpSweepTest(unittest.TestCase):
                 StubYtDlp(600, MIB, 30, sweep_strays=True).fetch(VIDEO_ID, self.job())
         self.assertEqual(fake.events, ["sweep", "popen"])
         # Clean up the stub run with the real methods (its group was killed).
+        # wait(), not communicate(): the failed run already closed the pipes,
+        # and communicate() would start reader threads on them that fail with
+        # "read of closed file" on Windows.
         for proc in fake.popens:
             del proc.communicate, proc.wait
             with contextlib.suppress(OSError):
                 proc.kill()
-            proc.communicate(timeout=30)
+            proc.wait(timeout=30)
 
     def test_concurrent_fetches_never_sweep_while_another_run_is_in_flight(self) -> None:
         # The runner's lock allows one run at a time; YtDlp keeps the rule
@@ -633,11 +637,15 @@ class RunnerServerSweepTest(unittest.TestCase):
         self.assertFalse(fake.in_flight)
 
 
-@unittest.skipUnless(IN_IMAGE_AS_PID_1, "the real sweep runs only as PID 1 of the fetcher image's test container")
+@unittest.skipUnless(IN_IMAGE, "the real sweep runs only in the fetcher image's test container")
 class RealSweepTest(unittest.TestCase):
     """In the image, as PID 1: a run's same-group, setsid and PID-hopping leftovers are killed and reaped."""
 
     def setUp(self) -> None:
+        # First, before anything that could sweep: a failure, not a skip
+        # (see IN_IMAGE). kill_and_reap checks the PID again on its own.
+        self.assertEqual(os.getpid(), 1, "the in-image suite must run as its container's PID 1, with no init "
+                         "(no `docker run --init`, no daemon default of init): RealSweepTest proves the sweep there")
         temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(temp.cleanup)
         self.temp = Path(temp.name)
