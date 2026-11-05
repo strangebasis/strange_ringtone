@@ -235,7 +235,9 @@ FETCH_ALLOW_DEFAULT_ROUTE=true FETCH_ALLOW_NO_SWEEP=true python -I fetcher/runne
 
 Without the image's venv it fails every job with `failed`; its tests use the
 stub. As for the core, `--bind` takes an IP address only, and without it the
-runner listens on `0.0.0.0`, which is meant for the container.
+runner listens on `0.0.0.0`, which is meant for the container. On Linux it
+makes itself non-dumpable before it serves (see Runs with), so attaching a
+debugger or profiler to a local runner needs root.
 
 The forwarder, the runner's only way out in a deployment, runs from a
 checkout too, on the fixed port 3128:
