@@ -166,6 +166,12 @@ def prepare_scratch(directory: Path) -> None:
 
 def _unlink(path: Path) -> None:
     try:
+        if path.is_dir() and not path.is_symlink():
+            # Only something planted there (a child the run left behind, same
+            # UID) puts a directory at a result's name; it goes all the same,
+            # so nothing outlives its entry.
+            shutil.rmtree(path, ignore_errors=True)
+            return
         path.unlink(missing_ok=True)
     except OSError:
         # Windows only (development): a file still open elsewhere can't be
@@ -214,7 +220,7 @@ class Results:
             _unlink(self._path(job))
 
     def hold(self, job: str, source: Path) -> None:
-        """discard_all(), then move source to directory/<job>.m4a and record clock()."""
+        """discard_all(), then move source (a regular file, never followed) to directory/<job>.m4a; record clock()."""
         # The token becomes a file name: its exact shape keeps it inside the
         # results directory, whoever calls this.
         if not isinstance(job, str) or not JOB_RE.fullmatch(job):
@@ -226,6 +232,12 @@ class Results:
                 raise RuntimeError("the runner is stopping")
             if job in self._claimed:
                 raise RuntimeError("that token's audio is being collected")
+            # Only a regular file is ever held: a FIFO, a symlink or a
+            # directory at the source is not audio, and a FIFO in results/
+            # would make the stream's open wait for a writer. The stream
+            # checks again when it opens the file (_stream).
+            if not stat.S_ISREG(os.lstat(source).st_mode):
+                raise ValueError("not a regular file")
             # The rule "at most one audio file" is kept here too, not only by
             # the server discarding before each run.
             self._discard_held()
@@ -491,7 +503,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             server.busy.release()
 
     def _stream(self, path: Path) -> None:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        # O_NONBLOCK: a FIFO planted at the path (by a yt-dlp child that
+        # outlived its run, say) would otherwise block this open until a
+        # writer appears, holding busy for good while /healthz still answers.
+        # Non-blocking, it opens at once and the S_ISREG check below refuses
+        # it; a regular file ignores the flag.
+        flags = (
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+        )
         try:
             # Never through a symlink, and only a regular file within the
             # cap: whatever yt-dlp left behind, the runner serves its own
@@ -500,13 +519,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             self.send_json_error(404, "not_found")
             return
+        # Checked on the descriptor before it becomes a file object: open()
+        # refuses a directory's descriptor with IsADirectoryError and leaves
+        # it open, and the refusal must still be an answer.
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            os.close(fd)
+            self.send_json_error(404, "not_found")
+            return
+        size = info.st_size
+        if not stat.S_ISREG(info.st_mode) or not 1 <= size <= self.server.settings.fetch_max_bytes:
+            os.close(fd)
+            self.send_json_error(404, "not_found")
+            return
         try:
             with open(fd, "rb") as handle:
-                info = os.fstat(handle.fileno())
-                size = info.st_size
-                if not stat.S_ISREG(info.st_mode) or not 1 <= size <= self.server.settings.fetch_max_bytes:
-                    self.send_json_error(404, "not_found")
-                    return
                 self.send_head(200, size, AUDIO_TYPE)
                 remaining = size
                 while remaining > 0:

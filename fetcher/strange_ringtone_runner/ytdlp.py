@@ -14,7 +14,9 @@ core's ffmpeg (strange_ringtone.render):
   startup and would die under RLIMIT_AS. The deployment's cgroup limit bounds
   memory instead;
 - its own session, so a wall-clock timeout kills the whole process group,
-  Deno included;
+  Deno included, and so does the end of every run, so no child it left
+  behind outlives it (one that starts a session of its own escapes the
+  group; docs/PLAN.md 6.1 records that residual);
 - an environment built from scratch: the child sees fixed values and the
   proxy settings the runner's Settings read, never the server's own
   environment;
@@ -161,7 +163,11 @@ def map_failure(returncode: int, stderr: bytes) -> str:
 
 def _open_regular(path: Path, max_bytes: int) -> tuple[int, int] | None:
     """(fd, size) for a regular file of 1..max_bytes at path, never through a symlink; or None."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    # O_NONBLOCK: a FIFO swapped in between the lstat and the open would
+    # otherwise block the open until a writer appears, and with it the run
+    # and the runner's lock. Non-blocking, it opens at once and the fstat
+    # check refuses it; a regular file ignores the flag.
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     try:
         # lstat first for Windows, which has no O_NOFOLLOW.
         if not stat.S_ISREG(os.lstat(path).st_mode):
@@ -327,6 +333,21 @@ class YtDlp:
                 finally:
                     _close_pipes(proc)
                 raise
+            # A run that ended by itself, success included, may have left a
+            # child behind that closed its pipes (so communicate() returned):
+            # it would keep the runner's reach between jobs, could edit the
+            # next job's directory or results/ (same UID), and would count
+            # against pids_limit. The group is killed before the result is
+            # read, so nothing of the run can touch the files read_result
+            # checks. killpg on the reaped leader's PID still reaches the
+            # group's other members: Linux keeps a PID that is a live
+            # group's ID from being reused, and the next run starts only
+            # after this one, under the server's lock. The two paths above
+            # that raise have killed it already, so every run's group is
+            # killed exactly once.
+            # A child that called setsid() has left the group and is not
+            # reached (docs/PLAN.md 6.1, "Accepted risks").
+            _kill_group(proc)
         finally:
             with self._lock:
                 self._running.discard(proc)

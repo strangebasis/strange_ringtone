@@ -283,7 +283,10 @@ services:
     # which is yt-dlp's Python (1 thread) and Deno (its main thread, 2 tokio
     # threads and V8's workers: 4 at most as measured, counted here as 63 for
     # a host that reports 64 CPUs), so 1 + 4 + 1 + 1 + 67 = 74. 160 is more
-    # than twice that.
+    # than twice that. Nothing of a run is left over to add to it: the
+    # runner kills each run's process group when the run ends, successful
+    # runs included (only a child that starts a session of its own escapes
+    # that; docs/PLAN.md 6.1, "Accepted risks").
     pids_limit: 160
     # Forwarding off, on every interface. A new network namespace copies the
     # host's IPv4 forwarding, which dockerd turns on, so a container on two

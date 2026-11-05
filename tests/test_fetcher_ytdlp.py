@@ -907,6 +907,76 @@ class TimeoutTest(StubTestCase):
         self.assertReaped()
 
 
+@unittest.skipUnless(hasattr(os, "killpg"), "process groups are POSIX")
+class RunEndKillTest(StubTestCase):
+    """R3: nothing a run started outlives it, even when the run succeeds."""
+
+    def test_a_child_left_behind_by_a_successful_run_is_killed(self) -> None:
+        # A child that closed its streams lets communicate() return at once;
+        # without the group kill at the end of every run it would keep the
+        # runner's reach between jobs and could edit the next job's files.
+        download = self.runner().fetch("survivor___", self.job)
+        # Acceptance: the run itself is a normal success.
+        self.assertEqual(download.audio, self.job / "survivor___.m4a")
+        self.assertEqual(download.metadata.title, stub_title("survivor___"))
+        survivor = read_pid(self.job / "survivor.pid", timeout=5)
+        self.assertIsNotNone(survivor, "the stub never started its survivor")
+        assert survivor is not None
+        self.addCleanup(kill_quietly, survivor)
+        deadline = time.monotonic() + 2
+        while alive(survivor) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(alive(survivor), "a child of a successful run outlived it")
+
+    def test_the_group_is_killed_once_per_run(self) -> None:
+        # One kill on success as on the other paths (TimeoutTest pins those),
+        # and with the whole group's signal, not the leader's alone.
+        with mock.patch.object(ytdlp.os, "killpg", wraps=os.killpg) as killpg:
+            self.runner().fetch(VIDEO_ID, self.job)
+            with self.assertRaises(FetchError):
+                self.runner().fetch("failing____", self.job)
+        self.assertEqual(killpg.call_count, 2)
+        for call in killpg.call_args_list:
+            self.assertEqual(call[0][1], signal.SIGKILL)
+
+
+@unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs are POSIX")
+class FifoResultTest(StubTestCase):
+    """R3: a FIFO where the audio should be is refused at once, never waited on."""
+
+    def test_open_regular_never_blocks_on_a_fifo(self) -> None:
+        # As if the FIFO replaced the file between the lstat and the open:
+        # without O_NONBLOCK the open would wait for a writer, holding the
+        # run, and with it the runner's lock, for good.
+        regular_file = self.temp / "regular"
+        regular_file.write_bytes(b"x")
+        regular = os.lstat(regular_file)
+        fifo = self.job / "fifo.m4a"
+        os.mkfifo(fifo)
+        outcome: list[Any] = []
+
+        def run() -> None:
+            outcome.append(ytdlp._open_regular(fifo, MIB))
+
+        with mock.patch.object(ytdlp.os, "lstat", return_value=regular):
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            thread.join(1.0)
+        if thread.is_alive():
+            # Free the blocked open, so the thread ends and the directory can go.
+            writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer)
+            thread.join(5.0)
+            self.fail("_open_regular blocked on a FIFO")
+        self.assertEqual(outcome, [None])
+        # Acceptance: the same call opens the regular file.
+        opened = ytdlp._open_regular(regular_file, MIB)
+        self.assertIsNotNone(opened)
+        assert opened is not None
+        os.close(opened[0])
+        self.assertEqual(opened[1], 1)
+
+
 @unittest.skipUnless(sys.platform.startswith("linux") and os.path.exists(PRLIMIT), "util-linux prlimit")
 class PrlimitTest(StubTestCase):
     def test_the_run_has_the_limits(self) -> None:
