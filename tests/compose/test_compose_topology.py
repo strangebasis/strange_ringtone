@@ -964,6 +964,36 @@ class LayoutTest(unittest.TestCase):
         # the forwarder) up too.
         self.assertIn("fetcher-runner", fetcher.get("depends_on") or {})
 
+    def test_the_fetcher_finds_the_runner_at_its_compose_service(self) -> None:
+        """T2 (static): the fetcher's FETCH_RUNNER_URL is unset (its default) or exactly the runner service."""
+        # Pointed anywhere else (the forwarder, say), the fetcher's jobs
+        # would go to a peer the layout never meant it to talk to.
+        default = "http://fetcher-runner:8080"
+        environment = self._service("fetcher").get("environment") or {}
+        self.assertIsInstance(environment, dict, environment)
+        self.assertEqual(environment.get("FETCH_RUNNER_URL", default), default)
+        # Acceptance: the default names a service this file defines, on `jobs`.
+        runner = self._service("fetcher-runner")
+        self.assertIn("jobs", self._networks_of(runner))
+
+    def test_no_service_has_a_volume_and_only_tmp_is_writable(self) -> None:
+        """Stateless (CLAUDE.md): no volume, a read-only root, and /tmp's tmpfs the only writable mount."""
+        config = self._config()
+        self.assertFalse(config.get("volumes"), f"compose.example.yaml declares volumes: {config.get('volumes')!r}")
+        for name, service in self._services().items():
+            with self.subTest(service=name):
+                # No data directory, bind mount or named volume: the
+                # services write only to /tmp, and the forwarder nothing.
+                self.assertNotIn("volumes", service, f"{name} mounts {service.get('volumes')!r}")
+                self.assertNotIn("volumes_from", service, f"{name} mounts another service's volumes")
+                self.assertIs(service.get("read_only"), True, f"{name} has a writable root filesystem")
+                tmpfs = service.get("tmpfs") or []
+                if name == "fetcher-forwarder":
+                    self.assertEqual(tmpfs, [], f"the forwarder writes nothing: {tmpfs!r}")
+                    continue
+                self.assertEqual(len(tmpfs), 1, f"{name}: {tmpfs!r}")
+                self.assertTrue(tmpfs[0].startswith("/tmp:"), f"{name}: {tmpfs!r}")
+
     def test_runner_command_and_hardening(self) -> None:
         """T2 (static): the runner command of the fetcher image, with the contract's flags and /tmp for one download."""
         runner = self._service("fetcher-runner")
