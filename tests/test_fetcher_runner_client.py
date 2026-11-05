@@ -539,13 +539,29 @@ class ClientHappyPathTest(ClientTestCase):
                 self.assertRequests(runner, ["POST", "GET"])
                 download.audio.unlink()
 
-    def test_exactly_content_length_bytes_are_read_and_the_rest_ignored(self) -> None:
-        # S1: the declared length is what is kept; bytes past it are never read.
+    def test_bytes_past_the_declared_length_fail_the_fetch_even_in_one_write(self) -> None:
+        # S1: the runner writes exactly the length it declares, then closes.
+        # Bytes past it are no answer of the runner's, also when they come in
+        # the same write as the body, so that a buffered reader already holds
+        # them when the declared length is reached: the fetch fails and
+        # leaves nothing behind, for either exchange.
         data = bytes(range(10))
-        runner = self.use(json_response(DONE), audio_response(data, body=data + b"Z" * 10))
+        # Control: exactly the declared length, then the close.
+        runner = self.use(json_response(DONE), audio_response(data))
         download = self.client().fetch(VIDEO_ID, self.job_dir)
         self.assertEqual(download.audio.read_bytes(), data)
         self.assertRequests(runner, ["POST", "GET"])
+        download.audio.unlink()
+        # Past the JSON answer: no GET is ever sent.
+        runner = self.use(raw(json_response(DONE) + b"Z" * 10), audio_response(data))
+        self.assertFailed(self.client())
+        self.assertRequests(runner, ["POST"])
+        self.assertJobDirEmpty()
+        # Past the audio: the complete file the client wrote goes again.
+        runner = self.use(json_response(DONE), audio_response(data, body=data + b"Z" * 10))
+        self.assertFailed(self.client())
+        self.assertRequests(runner, ["POST", "GET"])
+        self.assertJobDirEmpty()
 
 
 class ClientRefusalTest(ClientTestCase):

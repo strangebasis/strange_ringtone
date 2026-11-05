@@ -23,8 +23,11 @@ declared length has been read. The runner closes it only once its handler
 has returned, after it freed its one-job lock (and, after a stream, deleted
 the audio); a client that went on at the last byte could send its next
 request, the audio GET or the next job's POST, while the lock was still
-held, and the runner would answer 503 busy. A runner that sends more than it
-declared, or never closes, fails the fetch within the same bounds.
+held, and the runner would answer 503 busy. The body and that wait are read
+through http.client's own buffered reader, which is never left to close
+itself at the declared length: bytes past it are seen even when they came in
+the same write as the body, and fail the fetch, as does a runner that never
+closes.
 
 No magic-byte or codec check on the audio: the browser decodes by content
 and refuses what it can't, the page receives the bytes only as a no-store
@@ -102,75 +105,44 @@ class _Exchange:
     while the owner may still be about to read from that number, which could
     by then belong to another connection in this process. A shut-down socket
     wakes a blocked read with EOF or an error, which is all that is needed.
-
-    It also keeps a handle of its own on the connection (a dup of the
-    socket): http.client closes its descriptor as soon as it has read the
-    declared length, and the exchange ends only at the runner's close
-    (wait_for_close). A shutdown through either handle ends the connection
-    for both.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
-        self._watch: socket.socket | None = None
         self.aborted = False
 
     def attach(self, sock: socket.socket) -> None:
         """Hand over the connected socket; FetchError if the exchange was aborted meanwhile."""
-        watch = sock.dup()
         with self._lock:
             self._sock = sock
-            self._watch = watch
             aborted = self.aborted
         if aborted:
             # The deadline or cancel() fired while connect() ran, when there
             # was no socket to shut down yet.
-            _shut_down(watch)
+            _shut_down(sock)
             raise FetchError("failed")
 
     def abort(self) -> None:
-        """Shut the connection down (now, or as soon as it exists), so a blocked read returns."""
+        """Shut the socket down (now, or as soon as it exists), so a blocked read returns."""
         with self._lock:
             self.aborted = True
-            watch = self._watch
-        if watch is not None:
-            # Through this exchange's own handle, which stays open until
-            # close(): http.client may already have closed its descriptor.
-            _shut_down(watch)
+            sock = self._sock
+        if sock is not None:
+            _shut_down(sock)
 
     def settimeout(self, seconds: float) -> None:
-        # Through the sockets this exchange kept: http.client drops its own
+        # Through the socket this exchange kept: http.client drops its own
         # reference (conn.sock) once a Connection: close answer has begun.
-        # The timeout is per socket object, so the dup gets it too.
         with self._lock:
-            socks = [sock for sock in (self._sock, self._watch) if sock is not None]
-        for sock in socks:
+            sock = self._sock
+        if sock is not None:
             sock.settimeout(seconds)
-
-    def wait_for_close(self) -> None:
-        """Return once the runner has closed the connection; FetchError if it sends more or the wait is cut short."""
-        with self._lock:
-            watch = self._watch
-        if watch is None:
-            raise FetchError("failed")
-        try:
-            data = watch.recv(1)
-        except OSError:
-            # The read timeout, a reset, or the deadline's or cancel()'s
-            # shutdown where it shows as an error.
-            raise FetchError("failed") from None
-        # A byte past the declared length is an answer the runner never
-        # writes; an EOF made by the deadline's or cancel()'s shutdown is no
-        # close of the runner's.
-        if data or self.aborted:
-            raise FetchError("failed")
 
     def close(self) -> None:
         with self._lock:
-            socks = [sock for sock in (self._sock, self._watch) if sock is not None]
-            self._sock = self._watch = None
-        for sock in socks:
+            sock, self._sock = self._sock, None
+        if sock is not None:
             sock.close()
 
 
@@ -305,6 +277,7 @@ class RunnerClient:
                 length = self._check_head(response, exchange, JSON_TYPE, JSON_MAX_BYTES)
                 data = bytearray()
                 self._read_exactly(response, exchange, length, data.extend)
+                self._expect_close(response, exchange)
             finally:
                 response.close()
         return self._parse_answer(bytes(data))
@@ -322,6 +295,7 @@ class RunnerClient:
                     length = self._check_head(response, exchange, AUDIO_TYPE, self.max_bytes)
                     self._write_audio(response, exchange, length, path)
                     written = True
+                    self._expect_close(response, exchange)
                 finally:
                     response.close()
         except BaseException:
@@ -351,6 +325,14 @@ class RunnerClient:
         timer.daemon = True
         timer.start()
         try:
+            # Neither the deadline nor cancel() can cut the name lookup or the
+            # TCP connect inside connect(): there is no socket to shut down
+            # yet. Both are bounded all the same, each connect attempt by
+            # CONNECT_TIMEOUT_SECONDS and the lookup by the resolver's own
+            # timeouts, and an exchange whose deadline passed meanwhile fails
+            # at attach(). The runner can hold an attempt open no longer than
+            # the connect timeout, and it can't touch the lookup: Docker's
+            # embedded DNS answers the name in FETCH_RUNNER_URL.
             conn.connect()
             sock = conn.sock
             if not isinstance(sock, socket.socket):
@@ -358,11 +340,6 @@ class RunnerClient:
             exchange.attach(sock)
             exchange.settimeout(head_timeout)
             yield conn, exchange
-            # The whole answer is in, but the runner may not have freed its
-            # job lock yet: it does so before it closes the connection, so the
-            # exchange ends at that close, within the same timeout and
-            # deadline (the module docstring says why).
-            exchange.wait_for_close()
             # Anything the timer cut short has already failed a check; this
             # makes sure a shutdown that raced a complete read fails too.
             if exchange.aborted:
@@ -408,14 +385,35 @@ class RunnerClient:
 
     def _read_exactly(self, response: http.client.HTTPResponse, exchange: _Exchange, length: int,
                       sink: Any) -> None:
-        """Pass exactly length body bytes to sink; FetchError on an early end. Nothing past length is read."""
+        """Pass exactly length body bytes to sink; FetchError on an early end.
+
+        Read from the response's buffered reader itself: HTTPResponse.read()
+        closes it once the declared length is in, and with it whatever it had
+        already buffered past that length, which _expect_close must still see.
+        """
+        fp = response.fp
+        if fp is None:
+            raise FetchError("failed")
         remaining = length
         while remaining:
-            chunk = response.read(min(CHUNK_BYTES, remaining))
+            chunk = fp.read(min(CHUNK_BYTES, remaining))
             if not chunk or exchange.aborted:
                 raise FetchError("failed")
             sink(chunk)
             remaining -= len(chunk)
+
+    def _expect_close(self, response: http.client.HTTPResponse, exchange: _Exchange) -> None:
+        """Return at the runner's close, right after the declared length; FetchError on anything else."""
+        fp = response.fp
+        if fp is None:
+            raise FetchError("failed")
+        # One more read from the same buffer as the body: a byte here is past
+        # the declared length, an answer the runner never writes, even if it
+        # arrived with the body. EOF is the runner's close, unless the
+        # deadline's or cancel()'s shutdown made it. The socket's read timeout
+        # and the deadline bound the wait, as for every read of the body.
+        if fp.read(1) or exchange.aborted:
+            raise FetchError("failed")
 
     def _write_audio(self, response: http.client.HTTPResponse, exchange: _Exchange, length: int,
                      path: Path) -> None:
