@@ -44,8 +44,12 @@ from strange_ringtone_fetch.metadata import ERROR_CODES, VIDEO_ID_RE, Download, 
 CONNECT_TIMEOUT_SECONDS = 10.0
 # Socket timeout for each recv of a response head or body.
 READ_TIMEOUT_SECONDS = 30.0
-# On top of FETCH_TIMEOUT_SECONDS for the POST's total deadline: the runner's
-# DRAIN_SECONDS (5) after a timeout kill, and a margin.
+# On top of FETCH_TIMEOUT_SECONDS for the POST's total deadline. The runner's
+# worst case before it answers is FETCH_TIMEOUT_SECONDS, its DRAIN_SECONDS (5)
+# after a timeout kill, and two bounded reaps of REAP_SECONDS (2) each, one
+# at each run boundary of its sweep (strange_ringtone_runner.ytdlp): 9 s past
+# the timeout, so this leaves a margin of 6 s. PostGraceTest in
+# tests/test_fetcher_runner_client_hardening.py keeps at least 3 s.
 POST_GRACE_SECONDS = 15.0
 # The audio GET's total deadline is this plus one second per MiB of the cap
 # (70 s with the default 40 MiB).
@@ -197,7 +201,8 @@ class RunnerClient:
     def post_deadline(self) -> float:
         """The POST's total deadline: timeout_seconds + post_grace."""
         # The runner answers only once yt-dlp is done, which its own
-        # FETCH_TIMEOUT_SECONDS bounds; the grace covers its drain and margin.
+        # FETCH_TIMEOUT_SECONDS bounds; the grace covers its drain, its two
+        # reaps and a margin (POST_GRACE_SECONDS).
         return self.timeout_seconds + self._post_grace
 
     @property

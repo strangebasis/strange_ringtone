@@ -37,8 +37,15 @@ from strange_ringtone_fetch.metadata import VIDEO_ID_RE, Download, FetchError, M
 
 # Exactly what secrets.token_hex(16) produces, checked before any lookup.
 JOB_ID_RE = re.compile(r"[0-9a-f]{32}")
-# Four waiting plus the one running. With FETCH_TIMEOUT_SECONDS at 120 the
-# last in the queue waits at most ten minutes, which the page's polling covers.
+# Four waiting plus the one running. With FETCH_TIMEOUT_SECONDS at 120, each
+# job holds the runner for at most 129 s (the run, the runner's drain after a
+# timeout kill and its two bounded reaps) plus the audio GET, which takes
+# seconds over `jobs`: the last in the queue is done a little over ten
+# minutes after it was queued, which the page's 15 minutes of polling
+# (core/static/fetch.js, MAX_POLLS) covers. Only a runner that stalls every
+# exchange up to the client's deadlines (POST_GRACE_SECONDS, the audio
+# deadline) could stretch that past 15 minutes, and such a runner already
+# denies the feature.
 QUEUE_SIZE = 4
 RESULTS_DIR = "results"
 # Finished downloads, held or being streamed, that may stay on the tmpfs while

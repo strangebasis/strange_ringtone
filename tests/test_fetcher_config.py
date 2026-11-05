@@ -206,6 +206,15 @@ class RunnerUrlTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "FETCH_RUNNER_URL"):
                 from_env(FETCH_RUNNER_URL=value)
 
+    def test_the_refusals_fit_a_runner_address_too(self) -> None:
+        # RC1.9: one check for the proxies and FETCH_RUNNER_URL, so no
+        # message may call the runner's address a proxy.
+        for value in ("http://runner.example.invalid:99999", "https://runner.example.invalid:8080",
+                      "http://user@runner.example.invalid:8080", "http://runner.example.invalid:8080/path"):
+            with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "FETCH_RUNNER_URL") as raised:
+                from_env(FETCH_RUNNER_URL=value)
+            self.assertNotIn("proxy", str(raised.exception).lower())
+
     def test_the_fetcher_reads_no_proxy_variable_and_no_max_seconds(self) -> None:
         # R2: the proxies reach the runner's yt-dlp, and FETCH_MAX_SECONDS is
         # the runner's filter; the fetcher looks up none of them, so it can't

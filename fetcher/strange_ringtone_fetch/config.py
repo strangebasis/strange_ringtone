@@ -164,18 +164,19 @@ def check_http_url(name: str, value: str) -> None:
         parts = urlsplit(value)
         port = parts.port  # raises ValueError for a non-numeric or out-of-range port
     except ValueError as exc:
-        raise ConfigError(f"{name} is not a valid proxy URL") from exc
+        raise ConfigError(f"{name} is not a valid http://host[:port] URL") from exc
     # yt-dlp without the optional requests package talks to a proxy through
-    # urllib, which supports only plain-HTTP proxies (CONNECT for https).
+    # urllib, which supports only plain-HTTP proxies (CONNECT for https), and
+    # the runner client speaks plain HTTP only.
     if parts.scheme != "http":
-        raise ConfigError(f"{name} must start with http://; other proxy schemes are not supported")
+        raise ConfigError(f"{name} must start with http://; no other scheme is supported")
     # Credentials in an environment variable would be a secret outside a
     # *_FILE variable (CLAUDE.md), and yt-dlp could repeat them in an error.
     if "@" in parts.netloc:
-        raise ConfigError(f"{name} must not contain credentials; use a proxy that needs none")
+        raise ConfigError(f"{name} must not contain credentials; use an address that needs none")
     if not parts.hostname or parts.netloc.endswith(":"):
         raise ConfigError(f"{name} has an invalid host")
     if port is not None and not parts.netloc.endswith(f":{port}"):
         raise ConfigError(f"{name} has a malformed port")
     if parts.path not in ("", "/") or parts.query or parts.fragment or "?" in value or "#" in value:
-        raise ConfigError(f"{name} must be a proxy address only: http://host:port")
+        raise ConfigError(f"{name} must be an address only: http://host[:port]")
