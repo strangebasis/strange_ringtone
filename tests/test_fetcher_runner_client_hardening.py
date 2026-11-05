@@ -200,6 +200,56 @@ class ClientAnswerShapeTest(ClientTestCase):
                 self.assertJobDirEmpty()
 
 
+class ClientHugeNumberTest(ClientTestCase):
+    """S1/S1.3: a JSON integer beyond the float range is an invalid number, cleaned like NaN or infinity.
+
+    float() of such an integer raises OverflowError, which no except tuple of
+    the client names; the shared whitelist treats it as no number at all, so
+    the answer's field is dropped, the same as for every other invalid number.
+    """
+
+    HUGE = 10 ** 400
+
+    def test_a_huge_duration_is_dropped_with_the_heatmap_that_depends_on_it(self) -> None:
+        for duration in (self.HUGE, -self.HUGE):
+            with self.subTest(sign=duration > 0):
+                info = {"title": "T", "duration": duration,
+                        "heatmap": [{"start_time": 0, "end_time": 1, "value": 0.5}]}
+                download = self.accept(json_response({"status": "done", "info": info}), audio_response(AUDIO))
+                self.assertEqual((download.metadata.title, download.metadata.duration, download.metadata.heatmap),
+                                 ("T", None, None))
+                # accept() removed the one file the fetch made: nothing else is left.
+                self.assertJobDirEmpty()
+
+    def test_a_huge_number_in_a_heatmap_point_drops_the_heatmap(self) -> None:
+        for key in ("start_time", "end_time", "value"):
+            with self.subTest(key=key):
+                point = {"start_time": 0, "end_time": 1, "value": 0.5, key: self.HUGE}
+                info = {"title": "T", "duration": 10, "heatmap": [point]}
+                download = self.accept(json_response({"status": "done", "info": info}), audio_response(AUDIO))
+                self.assertEqual(download.metadata.duration, 10)
+                self.assertIsNone(download.metadata.heatmap)
+                self.assertJobDirEmpty()
+
+
+class PostGraceTest(unittest.TestCase):
+    """S1/A2.5: the POST deadline's grace covers the runner's worst case past FETCH_TIMEOUT_SECONDS, with a margin."""
+
+    def test_the_grace_covers_the_drain_and_two_reaps_with_a_margin_of_3_s(self) -> None:
+        # Before it answers, the runner may spend FETCH_TIMEOUT_SECONDS on
+        # the run, DRAIN_SECONDS on the pipes after a timeout kill, and one
+        # bounded reap at each of the two run boundaries. A grace shorter
+        # than that would fail a job the runner was still finishing, and the
+        # client would then ask for audio the runner never got to hold.
+        from strange_ringtone_runner import ytdlp
+
+        worst = ytdlp.DRAIN_SECONDS + 2 * ytdlp.REAP_SECONDS
+        self.assertGreaterEqual(runner_client.POST_GRACE_SECONDS, worst + 3.0)
+        # And it is what a client gets by default.
+        client = RunnerClient("http://127.0.0.1:9", max_bytes=MIB, timeout_seconds=120)
+        self.assertEqual(client.post_deadline, 120 + runner_client.POST_GRACE_SECONDS)
+
+
 class ClientUrlTest(unittest.TestCase):
     """S1: a caller that bypasses Settings still gets a client for one plain-HTTP host and port only."""
 

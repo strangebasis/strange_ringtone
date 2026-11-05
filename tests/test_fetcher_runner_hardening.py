@@ -22,8 +22,10 @@ from typing import Any
 from unittest import mock
 
 import helpers  # noqa: F401  (puts core/ and fetcher/ on sys.path)
+from strange_ringtone_fetch import metadata as metadata_module
 from strange_ringtone_fetch.metadata import Download, Metadata
 from strange_ringtone_runner import server as runner_server
+from strange_ringtone_runner import ytdlp as ytdlp_module
 from strange_ringtone_runner.server import Results
 from test_fetcher_jobs import FakeClock
 from test_fetcher_runner import (
@@ -299,6 +301,65 @@ class RunnerLogHardeningTest(RunnerServerTestCase):
         self.assertNotIn("127.0.0.1", self.log.getvalue())
         for line in lines:
             self.assertRegex(line, LOG_LINE_RE)
+
+
+class RunnerLogCapTest(unittest.TestCase):
+    """R4/N2: the log line's caps, pinned at their values and at the helpers that apply them."""
+
+    def test_the_caps_are_16_and_200(self) -> None:
+        self.assertEqual((runner_server._LOG_METHOD_MAX, runner_server._LOG_PATH_MAX), (16, 200))
+
+    def test_the_path_helper_cuts_at_the_cap(self) -> None:
+        self.assertEqual(runner_server._log_path("/" + "z" * 300), "/" + "z" * 199)
+        # Masked first, then cut: a token never survives in part.
+        self.assertEqual(runner_server._log_path("/jobs/" + "a" * 32 + "/audio"), "/jobs/<job>/audio")
+
+    def test_the_printable_helper_cuts_at_its_limit(self) -> None:
+        self.assertEqual(runner_server._printable("Z" * 40, runner_server._LOG_METHOD_MAX), "Z" * 16)
+
+
+class InfoNumberRangeTest(unittest.TestCase):
+    """S1.3: an info JSON integer beyond the float range is cleaned like NaN or infinity, in the runner's read."""
+
+    HUGE = 10 ** 400
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        self.job = Path(temp.name) / "job"
+        self.job.mkdir()
+
+    def read(self, info_text: str) -> Metadata:
+        (self.job / f"{VIDEO_ID}.m4a").write_bytes(b"STUB-M4A")
+        (self.job / f"{VIDEO_ID}.info.json").write_text(info_text, encoding="ascii")
+        download: Download = ytdlp_module.read_result(self.job, VIDEO_ID, MIB)
+        return download.metadata
+
+    def test_the_whitelist_drops_a_huge_integer(self) -> None:
+        for raw in (self.HUGE, -self.HUGE):
+            with self.subTest(sign=raw > 0):
+                self.assertIsNone(metadata_module.clean_duration(raw))
+                point = {"start_time": 0, "end_time": 1, "value": raw}
+                self.assertIsNone(metadata_module.clean_heatmap([point], 10))
+                self.assertEqual(metadata_module.parse_info({"title": "T", "duration": raw}),
+                                 Metadata(title="T", duration=None, heatmap=None))
+        # Control: a large integer that a float holds is still a number.
+        self.assertEqual(metadata_module.clean_duration(10 ** 300), 10 ** 300)
+
+    def test_the_runners_read_drops_a_huge_duration_and_its_heatmap(self) -> None:
+        text = ('{"title": "T", "duration": ' + str(self.HUGE)
+                + ', "heatmap": [{"start_time": 0, "end_time": 1, "value": 0.5}]}')
+        self.assertEqual(self.read(text), Metadata(title="T", duration=None, heatmap=None))
+        # The read closed what it opened: the job directory can go at once.
+        for path in self.job.iterdir():
+            path.unlink()
+        self.job.rmdir()
+        self.assertFalse(self.job.exists())
+
+    def test_the_runners_read_drops_a_heatmap_with_a_huge_value(self) -> None:
+        text = '{"title": "T", "duration": 10, "heatmap": [{"start_time": 0, "end_time": ' + str(self.HUGE) + \
+            ', "value": 0.5}]}'
+        self.assertEqual(self.read(text), Metadata(title="T", duration=10, heatmap=None))
 
 
 class RunnerSweepIntervalTest(unittest.TestCase):

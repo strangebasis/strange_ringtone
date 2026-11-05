@@ -83,7 +83,14 @@ def _number(value: Any) -> float | None:
     # bool is an int subclass; JSON true is not a number here.
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        # JSON integers have no size limit, and float() of one beyond the
+        # float range raises instead of returning infinity. Such a number is
+        # invalid exactly like NaN or infinity: no number, never an
+        # exception that the callers' except tuples don't name.
+        return None
     return number if math.isfinite(number) else None
 
 
