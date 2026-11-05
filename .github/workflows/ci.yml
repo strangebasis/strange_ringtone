@@ -96,10 +96,12 @@ jobs:
   fetcher-image:
     name: Fetcher image tests
     # The fetcher image under the same contract flags as the core's: its
-    # yt-dlp, yt-dlp-ejs and Deno, the container contract, and the fetcher's
-    # unit tests under the image's Python 3.12 (docs/PLAN.md 9.2). The yt-dlp
-    # stub stands in for every fetch, and --network none keeps the one test
-    # that starts the real yt-dlp from reaching anything.
+    # yt-dlp, yt-dlp-ejs and Deno, the container contract of its three
+    # commands, and the fetcher's, the runner's and the forwarder's unit tests
+    # under the image's Python 3.12 (docs/PLAN.md 9.2). The yt-dlp stub
+    # stands in for every fetch, and --network none keeps the tests that
+    # start the real yt-dlp, directly or through the runner command, from
+    # reaching anything.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -127,9 +129,10 @@ jobs:
           cache-to: type=gha,mode=max,scope=fetcher
 
       - name: Run the in-image tests
-        # The fetcher's contract flags (README, Development); the tmpfs is
-        # 2 x FETCH_MAX_BYTES + 16 MB. The tests are mounted read-only and
-        # nothing is published.
+        # The fetcher image's contract flags (README, Development); the tmpfs
+        # is 96 MB, more than either container's contract /tmp (80 MB for the
+        # fetcher, 56 MB for the runner), because one container runs both
+        # suites. The tests are mounted read-only and nothing is published.
         run: |
           docker run --rm --name "fetcher-image-tests-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
             --network none --read-only \
@@ -145,8 +148,8 @@ jobs:
     name: Compose topology tests
     # The only test of the layout (docs/PLAN.md 6.1, T1 to T3): the fetcher
     # image brought up with compose.example.yaml itself, the fetcher on
-    # internal networks and the forwarder the only way out, with no YouTube
-    # traffic. The engine must be 28.0 or newer, as the contract says, and
+    # `fetcher` and `jobs`, the runner on `jobs` and `egress`, the forwarder
+    # the only way out, with no YouTube traffic. The engine must be 28.0 or newer, as the contract says, and
     # Compose 2.27.1 or newer, for the example's per-network driver_opts
     # (endpoint sysctls that turn forwarding and redirects off on each
     # interface; the engine has had them since 27.0.1).
