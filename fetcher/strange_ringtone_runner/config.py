@@ -15,11 +15,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# _parse_bool, _parse_int, MAX_SECONDS_LIMIT, PROXY_VARIABLES and
-# parse_proxies are what from_env reads with (docs/PLAN.md 6.1): the same
-# parsers, bounds and messages as the fetcher's.
-from strange_ringtone.config import ConfigError, _parse_bool, _parse_int  # noqa: F401
-from strange_ringtone_fetch.config import MAX_SECONDS_LIMIT, MIB, PROXY_VARIABLES, parse_proxies  # noqa: F401
+# The core's parsers and the fetcher's proxy rules, reused rather than copied
+# (docs/PLAN.md 6.1): one implementation of each check, so the runner can't
+# drift into accepting a value the fetcher's documentation refuses.
+from strange_ringtone.config import ConfigError, _parse_bool, _parse_int
+from strange_ringtone_fetch.config import MAX_SECONDS_LIMIT, MIB, PROXY_VARIABLES, parse_proxies
 
 __all__ = ["ConfigError", "Settings", "SCRATCH_DIR", "RUNNER_VARIABLES"]
 
@@ -32,14 +32,13 @@ SCRATCH_DIR = Path("/tmp/strange_ringtone_runner")
 _WINDOWS = sys.platform == "win32"
 
 # Every variable the runner reads, for the docs test (.env.example's fetcher
-# block lists the union of the fetcher's and the runner's variables).
+# block lists the union of the fetcher's and the runner's variables). The
+# proxy names come from the fetcher's config, whose parser reads them.
 RUNNER_VARIABLES = (
     "FETCH_MAX_SECONDS",
     "FETCH_MAX_BYTES",
     "FETCH_TIMEOUT_SECONDS",
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "NO_PROXY",
+    *PROXY_VARIABLES,
     "FETCH_ALLOW_DEFAULT_ROUTE",
 )
 
@@ -74,4 +73,23 @@ class Settings:
         override through the core's boolean words. Nothing is required, so an
         empty environment is a valid configuration.
         """
-        raise NotImplementedError
+        # Each variable is looked up by name, never by walking the mapping,
+        # so nothing else in the runner's environment can become a setting.
+        return cls(
+            # decode.js refuses input longer than 600 s (MAX_SECONDS_LIMIT),
+            # so a longer video would be downloaded only to be refused.
+            fetch_max_seconds=_parse_int(environ, "FETCH_MAX_SECONDS", 600, 1, MAX_SECONDS_LIMIT),
+            # At least 1 MiB, or no real audio track fits; at most 512 MiB,
+            # the fetcher's bound, since the two read one shared .env.
+            fetch_max_bytes=_parse_int(environ, "FETCH_MAX_BYTES", 40 * MIB, MIB, 512 * MIB),
+            # At most 10 minutes: one run holds the runner's only job slot
+            # for this long.
+            fetch_timeout_seconds=_parse_int(environ, "FETCH_TIMEOUT_SECONDS", 120, 1, 600),
+            # Uppercase names only, http:// only, no credentials: the rules
+            # strange_ringtone_fetch.config.parse_proxies applies and explains.
+            proxies=parse_proxies(environ),
+            # The core's boolean words only, unstripped: a value the parser
+            # doesn't know is a configuration error, so a typo never turns
+            # the start check off (docs/PLAN.md 6.1, S2).
+            allow_default_route=_parse_bool(environ, "FETCH_ALLOW_DEFAULT_ROUTE", False),
+        )

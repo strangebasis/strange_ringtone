@@ -151,4 +151,19 @@ def metadata_to_info(metadata: Metadata) -> dict[str, Any]:
     are left out; a heatmap point {start, end, value} goes back to yt-dlp's
     {start_time, end_time, value}.
     """
-    raise NotImplementedError
+    info: dict[str, Any] = {}
+    # Only these three keys: anything else yt-dlp wrote stays in the runner,
+    # because parse_info never kept it.
+    if metadata.title is not None:
+        info["title"] = metadata.title
+    if metadata.duration is not None:
+        info["duration"] = metadata.duration
+    if metadata.heatmap is not None:
+        # A list, not the tuple Metadata holds: it goes out as JSON. Already
+        # clipped to the duration and free of empty points, so parse_info
+        # reads every point back as it is.
+        info["heatmap"] = [
+            {"start_time": point["start"], "end_time": point["end"], "value": point["value"]}
+            for point in metadata.heatmap
+        ]
+    return info
