@@ -365,9 +365,10 @@ The core has no secrets in v0.1.0, so `.env.example` holds only
 `PUBLIC_ORIGIN=` and commented optional settings. Any later secret arrives as
 `*_FILE`, with no usable default. The same file carries the optional fetcher's
 settings in a block of their own, all commented out; `compose.example.yaml`
-gives the core and the fetcher that one `.env` (the forwarder reads none),
-and each server reads only its own variables (`PUBLIC_ORIGIN` and
-`TRUSTED_PROXIES` are shared).
+gives the core, the fetcher and its runner that one `.env` (the forwarder
+reads none), and each server reads only its own variables (`PUBLIC_ORIGIN`
+and `TRUSTED_PROXIES` are shared by the core and the fetcher; the runner
+reads neither).
 
 The fetcher image is a second, separate contract with its own table in the
 README (section 6, "Fetcher contract"). Nothing in it changes the core's: the
@@ -925,12 +926,25 @@ where the runner answers only a well-formed job request and runs yt-dlp
 through the forwarder itself. A compromised runner shares `jobs` with the
 fetcher and can reach its port 8080 there: the Origin check needs only the
 public origin, which is no secret, the rate limit keys on the runner's
-address (so `TRUSTED_PROXIES` must never cover `jobs`), and it never learns
+address (so `TRUSTED_PROXIES` must never cover `jobs`, whose subnet Docker
+may change when it recreates the network, so the README tells operators to
+list only an address their deployment pins), and it never learns
 a job ID, so it can submit jobs that come back to itself and nothing more,
 which adds nothing to what the forwarder already gives it. Binding the
 fetcher to its `fetcher` address alone would need a fixed subnet and
 address in the example; the owner declined that on 2026-11-05 and accepts
-this path as a documented risk. The isolated gateway mode also means the
+this path as a documented risk. The runner kills each yt-dlp run's process
+group when the run ends, success included, so nothing a run started
+outlives it; a child that calls `setsid()` leaves that group and survives
+the run, with the runner's reach (the forwarder, the fetcher's port 8080),
+write access to the next job's directory and `results/` (same UID), and a
+share of `pids_limit`. The runner opens every result `O_NOFOLLOW` and
+`O_NONBLOCK` and holds and serves only a regular file within
+`FETCH_MAX_BYTES`, so such a survivor can't wedge it with a FIFO or have it
+serve a link, but it could still replace a later job's audio with another
+regular file. The complete answer inside the container would be a sweep
+that kills every process of UID 10001 outside the runner's own tree before
+each run. The isolated gateway mode also means the
 host has no route to the internal networks, so the reverse proxy must be a
 container on them.
 
