@@ -24,7 +24,17 @@ from strange_ringtone.config import (
     _parse_trusted_proxies,
 )
 
-__all__ = ["ConfigError", "Settings", "SCRATCH_DIR", "PROXY_VARIABLES"]
+__all__ = [
+    "ConfigError",
+    "Settings",
+    "SCRATCH_DIR",
+    "PROXY_VARIABLES",
+    "DEFAULT_RUNNER_URL",
+    "MAX_SECONDS_LIMIT",
+    "MIB",
+    "parse_proxies",
+    "check_http_url",
+]
 
 # The fetcher's own directory under the /tmp tmpfs, fixed for the reason the
 # core gives in strange_ringtone.config: tempfile.gettempdir() follows TMPDIR
@@ -46,6 +56,10 @@ PROXY_VARIABLES = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY")
 # and ports, separated by commas, or a lone '*'.
 _NO_PROXY_RE = re.compile(r"[A-Za-z0-9.*:_\[\]/,-]{1,1024}")
 _PROXY_MAX_CHARS = 1024
+# Where the fetcher finds its runner when FETCH_RUNNER_URL is unset: the
+# compose service of that name, reached over the internal `jobs` network
+# (docs/PLAN.md 6.1).
+DEFAULT_RUNNER_URL = "http://fetcher-runner:8080"
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -70,6 +84,10 @@ class Settings:
     # True turns the default-route start check off (docs/PLAN.md 6.1) where
     # egress is filtered some other way. Off by default: fail closed.
     allow_default_route: bool = False
+    # Where the runner is: validated like a proxy URL (http://host[:port],
+    # nothing else). The fetcher trusts nothing the runner answers (S1), so
+    # pointing this elsewhere can break fetches but not the posture.
+    runner_url: str = DEFAULT_RUNNER_URL
     scratch_dir: Path = field(default_factory=_default_scratch_dir)
 
     @classmethod
@@ -135,3 +153,11 @@ def _check_proxy_url(name: str, value: str) -> None:
         raise ConfigError(f"{name} has a malformed port")
     if parts.path not in ("", "/") or parts.query or parts.fragment or "?" in value or "#" in value:
         raise ConfigError(f"{name} must be a proxy address only: http://host:port")
+
+
+# Public names for the runner's settings (strange_ringtone_runner.config),
+# which read the proxy variables with exactly these rules. Aliases for now,
+# so the runner's package imports; they become the definitions once the
+# fetcher stops reading the proxies itself (docs/PLAN.md 6.1).
+parse_proxies = _parse_proxies
+check_http_url = _check_proxy_url

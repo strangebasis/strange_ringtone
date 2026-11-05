@@ -2,7 +2,7 @@
 
 The fetcher runs it as (sys.executable, "-I", this file, *yt-dlp arguments).
 It refuses (exit 2) any argument list that is not exactly what the fetcher
-must send (strange_ringtone_fetch.ytdlp.ytdlp_args), so a loosened argument
+must send (strange_ringtone_runner.ytdlp.ytdlp_args), so a loosened argument
 fails the tests here too. The video ID is taken from the watch URL.
 
 The behaviour comes from STRANGE_RINGTONE_YTDLP_STUB when set, and otherwise

@@ -1,8 +1,9 @@
 """The fetcher's HTTP server (strange_ringtone_fetch.server) on loopback, port 0, with no network.
 
 Most tests inject a fake runner that the test holds at a gate, so queue and
-timing are deterministic; the flow tests run the real runner against the
-stub yt-dlp (tests/stubs/ytdlp_stub.py).
+timing are deterministic; the flow tests run the fetcher's real runner
+client against a real runner server (strange_ringtone_runner.server) on
+loopback, which runs the stub yt-dlp (tests/stubs/ytdlp_stub.py).
 """
 from __future__ import annotations
 
@@ -14,7 +15,6 @@ import json
 import os
 import re
 import socket
-import sys
 import tempfile
 import threading
 import time
@@ -26,15 +26,20 @@ from unittest import mock
 
 import helpers  # noqa: F401  (puts core/ and fetcher/ on sys.path)
 from strange_ringtone_fetch import server as server_module
-from strange_ringtone_fetch.config import Settings
+from strange_ringtone_fetch.config import DEFAULT_RUNNER_URL, Settings
 from strange_ringtone_fetch.jobs import Jobs, QueueFull
+from strange_ringtone_fetch.metadata import FetchError
+from strange_ringtone_fetch.runner_client import RunnerClient
 from strange_ringtone_fetch.server import FetchServer, Handler, parse_job_request, prepare_scratch
-from strange_ringtone_fetch.ytdlp import YTDLP_PYTHON, FetchError, YtDlp, default_prlimit
+from strange_ringtone_runner import server as runner_server_module
+from strange_ringtone_runner.config import Settings as RunnerSettings
+from strange_ringtone_runner.server import RunnerServer
 from test_fetcher_jobs import FakeClock, FakeRunner
 from test_fetcher_ytdlp import StubYtDlp, stub_title
 
 ORIGIN = "https://example.internal"
 DEADLINE = 10.0
+MIB = 1024 * 1024
 VIDEO_ID = "dQw4w9WgXcQ"
 OTHER_ID = "abcdefghijk"
 JOBS = "/fetch/api/jobs"
@@ -252,27 +257,31 @@ class ServerTestCase(unittest.TestCase):
 
 
 class DefaultRunnerTest(unittest.TestCase):
-    """The yt-dlp runner the server builds itself gets the operator's settings."""
+    """The runner the server builds itself is the client for the runner container, with the operator's settings."""
 
-    def test_settings_reach_the_runner(self) -> None:
+    def test_the_default_runner_is_the_client_with_the_settings(self) -> None:
+        # S1: the fetcher runs no yt-dlp; its default runner is the client
+        # that reaches the runner over `jobs`, with the settings' cap and
+        # timeout. Building it resolves no name, so the fetcher starts (and
+        # answers its health check) before the runner does.
         temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(temp.cleanup)
-        proxies = (("HTTPS_PROXY", "http://proxy.example.internal:3128"),)
         settings = Settings(
-            public_origin=ORIGIN, fetch_max_seconds=300, fetch_max_bytes=2 * 1024 * 1024, fetch_timeout_seconds=45,
-            proxies=proxies, scratch_dir=Path(temp.name) / "scratch",
+            public_origin=ORIGIN, fetch_max_bytes=2 * MIB, fetch_timeout_seconds=45,
+            runner_url="http://runner.example.invalid:8081", scratch_dir=Path(temp.name) / "scratch",
         )
-        server = FetchServer(("127.0.0.1", 0), settings)
+        with mock.patch.object(socket, "getaddrinfo", side_effect=AssertionError("resolved a name at startup")):
+            server = FetchServer(("127.0.0.1", 0), settings)
         self.addCleanup(server.server_close)
         runner = server.runner
-        assert isinstance(runner, YtDlp)
-        # A deployment that can reach YouTube only through its proxy would
-        # otherwise fail every fetch, with no setting looking wrong.
-        self.assertEqual(runner.proxies, proxies)
-        env = runner.child_env(Path(temp.name) / "job")
-        self.assertEqual(env.get("HTTPS_PROXY"), "http://proxy.example.internal:3128")
-        self.assertEqual((runner.max_seconds, runner.max_bytes, runner.timeout_seconds), (300, 2 * 1024 * 1024, 45))
-        self.assertEqual(runner.prlimit, default_prlimit())
+        self.assertIsInstance(runner, RunnerClient)
+        assert isinstance(runner, RunnerClient)
+        self.assertEqual(runner.runner_url, "http://runner.example.invalid:8081")
+        self.assertEqual((runner.host, runner.port), ("runner.example.invalid", 8081))
+        self.assertEqual((runner.max_bytes, runner.timeout_seconds), (2 * MIB, 45))
+        self.assertEqual(runner.post_deadline, 60)
+        # The proxy settings are the runner's now (R2), not the fetcher's.
+        self.assertFalse(hasattr(settings, "proxies"))
 
 
 class HeadersTest(ServerTestCase):
@@ -969,13 +978,43 @@ class AudioTest(ServerTestCase):
 
 
 class FlowTest(ServerTestCase):
-    """The real runner and the stub yt-dlp, end to end over HTTP."""
+    """The fetcher's runner client and a real runner (with the stub yt-dlp), end to end over HTTP on loopback."""
 
     def setUp(self) -> None:
         super().setUp()
-        self.start(runner=StubYtDlp(600, 1024 * 1024, 5))
+        self.runner_starts = 0
+        self.start_runner(timeout=5)
+
+    def start_runner(self, timeout: int) -> None:
+        """A RunnerServer on 127.0.0.1 and a free port, and a fetcher whose RunnerClient points at it."""
+        self.runner_starts += 1
+        # A scratch of its own per start, so an earlier runner's cleanup never
+        # touches the current one's.
+        self.runner_scratch = self.temp / f"runner{self.runner_starts}"
+        settings = RunnerSettings(fetch_timeout_seconds=timeout, fetch_max_bytes=MIB, scratch_dir=self.runner_scratch)
+        runner_server = RunnerServer(("127.0.0.1", 0), settings, ytdlp=StubYtDlp(600, MIB, timeout))
+        thread = threading.Thread(target=runner_server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+        # Registered before the fetcher's, so it runs after it: the fetcher
+        # cancels its client before the runner goes away.
+        self.addCleanup(self._stop, runner_server, thread)
+        self.runner_server = runner_server
+        port = runner_server.server_address[1]
+        self.start(runner=RunnerClient(f"http://127.0.0.1:{port}", MIB, timeout))
+
+    def runner_scratch_contents(self) -> list[str]:
+        names = [p.relative_to(self.runner_scratch).as_posix() for p in self.runner_scratch.rglob("*")]
+        return sorted(name for name in names if name != "results")
+
+    def assertRunnerScratchEmpty(self) -> None:
+        try:
+            wait_for(lambda: not self.runner_scratch_contents(), "an empty runner scratch directory")
+        except AssertionError:
+            pass
+        self.assertEqual(self.runner_scratch_contents(), [])
 
     def test_fetch_poll_download(self) -> None:
+        # S1 acceptance: the whole chain, fetcher -> client -> runner -> stub.
         job_id = self.create_job()
         status = self.wait_done(job_id)
         self.assertEqual(status["status"], "done")
@@ -987,6 +1026,8 @@ class FlowTest(ServerTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(response.body, b"STUB-M4A\n" + VIDEO_ID.encode("ascii"))
         self.assertScratchEmpty()
+        # The runner handed its copy over once and deleted it.
+        self.assertRunnerScratchEmpty()
 
     def test_the_log_never_holds_a_title_an_id_or_an_address(self) -> None:
         job_id = self.create_job("ctrlTitle__")
@@ -1001,18 +1042,59 @@ class FlowTest(ServerTestCase):
         for line in self.log.lines():
             self.assertRegex(line, LOG_LINE_RE)
 
-    def test_every_failure_leaves_the_scratch_directory_empty(self) -> None:
+    def test_every_failure_leaves_both_scratch_directories_empty(self) -> None:
+        # S1: each failure the runner reports reaches the job as its code,
+        # and neither the fetcher's scratch nor the runner's keeps anything.
         cases = {
             "tooLong____": "too_long", "blocked____": "blocked", "notFound___": "not_found",
             "failing____": "failed", "noAudio____": "failed", "notADict___": "failed", "hanging____": "timeout",
+            "oversize___": "failed", "symlinked__": "failed",
         }
-        self.start(runner=StubYtDlp(600, 1024 * 1024, 1))
-        with mock.patch("strange_ringtone_fetch.ytdlp.DRAIN_SECONDS", 0.5):
+        # A timeout of 1 s, so the hanging case ends quickly.
+        self.start_runner(timeout=1)
+        with mock.patch("strange_ringtone_runner.ytdlp.DRAIN_SECONDS", 0.5):
             for video_id, code in cases.items():
                 with self.subTest(video_id=video_id):
                     job_id = self.create_job(video_id)
                     self.assertEqual(self.wait_done(job_id), {"status": "failed", "error": code})
                     self.assertScratchEmpty()
+                    if video_id == "symlinked__":
+                        # The stub plants its symlink's target beside the job
+                        # directory, as a hostile yt-dlp could; it must still
+                        # hold the stub's bytes (nothing was written through
+                        # the link) and is the stub's to remove, not the runner's.
+                        planted = self.runner_scratch / "outside.m4a"
+                        self.assertEqual(planted.read_bytes(), b"STUB-M4A\n")
+                        planted.unlink()
+                    self.assertRunnerScratchEmpty()
+
+    def test_the_fetchers_job_id_never_reaches_the_runner(self) -> None:
+        # S1: the runner can reach the fetcher's port 8080 over `jobs`; a job
+        # ID would let it collect the browser's download there. The runner
+        # sees only the client's own token, which has the same shape.
+        seen: list[tuple[str, str]] = []
+        real = runner_server_module.parse_job_request
+
+        def recording(body: bytes) -> tuple[str, str]:
+            result = real(body)
+            seen.append(result)
+            return result
+
+        job_ids: list[str] = []
+        with mock.patch.object(runner_server_module, "parse_job_request", side_effect=recording):
+            for video_id in (VIDEO_ID, OTHER_ID):
+                job_id = self.create_job(video_id)
+                self.assertEqual(self.wait_done(job_id)["status"], "done")
+                self.assertEqual(self.request("GET", f"{JOBS}/{job_id}/audio").status, 200)
+                job_ids.append(job_id)
+        self.assertEqual([video_id for video_id, _ in seen], [VIDEO_ID, OTHER_ID])
+        tokens = [token for _, token in seen]
+        for token in tokens:
+            self.assertRegex(token, r"\A[0-9a-f]{32}\Z")
+        self.assertEqual(len(set(tokens)), 2)
+        for job_id in job_ids:
+            self.assertRegex(job_id, r"\A[0-9a-f]{32}\Z")
+            self.assertNotIn(job_id, tokens)
 
 
 class LogTest(ServerTestCase):
@@ -1193,15 +1275,18 @@ class ScratchTest(ServerTestCase):
                 _TestServer(("127.0.0.1", 0), self.settings, self.runner)
         self.assertEqual(close.call_count, 1)
 
-    def test_the_default_runner_is_the_real_yt_dlp_under_prlimit_on_linux(self) -> None:
+    def test_the_default_runner_is_the_client_for_the_compose_runner(self) -> None:
+        # S1: with FETCH_RUNNER_URL unset, the fetcher asks the compose
+        # service fetcher-runner; yt-dlp, prlimit and the venv's interpreter
+        # are the runner's (tests/test_fetcher_runner.py, RunnerDefaultsTest).
         server = self.server_class(("127.0.0.1", 0), self.settings)
         try:
             runner = server.runner
-            # I1: the venv's interpreter, never the server's own (sys.executable).
-            self.assertEqual(runner.command, (YTDLP_PYTHON, "-I", "-m", "yt_dlp"))  # type: ignore[attr-defined]
-            expected = ("/usr/bin/prlimit",) if sys.platform.startswith("linux") else None
-            self.assertEqual(runner.prlimit, expected)  # type: ignore[attr-defined]
+            self.assertIsInstance(runner, RunnerClient)
+            self.assertEqual(runner.runner_url, DEFAULT_RUNNER_URL)  # type: ignore[attr-defined]
+            self.assertEqual((runner.host, runner.port), ("fetcher-runner", 8080))  # type: ignore[attr-defined]
             self.assertEqual(runner.timeout_seconds, self.settings.fetch_timeout_seconds)  # type: ignore[attr-defined]
+            self.assertEqual(runner.max_bytes, self.settings.fetch_max_bytes)  # type: ignore[attr-defined]
         finally:
             server.server_close()
 

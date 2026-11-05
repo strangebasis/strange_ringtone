@@ -364,13 +364,24 @@ class ContractDocsTest(unittest.TestCase):
 
     def test_env_example_fetcher_block_lists_every_fetcher_variable(self) -> None:
         from strange_ringtone_fetch.config import Settings as FetcherSettings
+        from strange_ringtone_runner.config import Settings as RunnerSettings
 
-        environ = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN})
-        FetcherSettings.from_env(environ)
-        # PUBLIC_ORIGIN and TRUSTED_PROXIES are shared, documented once above.
+        # One .env serves the fetcher image's containers (compose.example.yaml
+        # gives the fetcher and its runner the same file), so its fetcher block
+        # lists what either of them reads.
+        fetcher = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN})
+        FetcherSettings.from_env(fetcher)
+        runner = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN, "TRUSTED_PROXIES": ""})
+        RunnerSettings.from_env(runner)
+        # PUBLIC_ORIGIN and TRUSTED_PROXIES are shared with the core,
+        # documented once above, and browser-facing: the runner serves only
+        # the fetcher and reads neither.
         shared = {"PUBLIC_ORIGIN", "TRUSTED_PROXIES"}
-        self.assertLessEqual(shared, environ.looked_up)
-        self.assertEqual(self.variables_in(self.env_example_blocks()[1]), environ.looked_up - shared)
+        self.assertLessEqual(shared, fetcher.looked_up)
+        self.assertTrue(shared.isdisjoint(runner.looked_up), runner.looked_up & shared)
+        self.assertEqual(
+            self.variables_in(self.env_example_blocks()[1]), (fetcher.looked_up | runner.looked_up) - shared
+        )
 
 
 if __name__ == "__main__":
