@@ -757,6 +757,11 @@ class RunnerFlowTest(RunnerServerTestCase):
         thread.join(DEADLINE)
         self.assertEqual([response.status for response in outcome], [200])
         self.assertEqual(outcome[0].body, b"STUB-M4A\n" + VIDEO_ID.encode("ascii"))
+        # The client has the stream's last byte before the handler returns
+        # from release() and lets go of busy (busy covers the whole stream,
+        # by design), so wait, bounded, for the stream to be over on the
+        # server's side too. locked() only reads the lock; it never takes it.
+        wait_for(lambda: not self.server.busy.locked(), "the stream's handler to let go of busy")
         # Acceptance: once the stream is over, the next job runs.
         self.done(OTHER_ID)
         self.assertEqual(len(self.runs()), 2)
