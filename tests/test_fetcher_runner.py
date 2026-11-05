@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-import helpers
+import helpers  # noqa: F401  (puts core/ and fetcher/ on sys.path)
 from strange_ringtone.http_guard import GuardError
 from strange_ringtone_fetch import config as fetch_config
 from strange_ringtone_fetch.metadata import ERROR_CODES, parse_info
@@ -55,8 +55,12 @@ VIDEO_ID = "dQw4w9WgXcQ"
 OTHER_ID = "abcdefghijk"
 MIB = 1024 * 1024
 JSON_TYPE = "application/json"
-RUNNER_PACKAGE = helpers.ROOT / "fetcher" / "strange_ringtone_runner"
-RUNNER_SCRIPT = helpers.ROOT / "fetcher" / "runner.py"
+# Found from the imported package, not the checkout's layout, so the same
+# tests read the image's copy when tests/image_fetcher runs them there
+# (/app/fetcher, where helpers.ROOT holds no fetcher/), as test_fetcher_config
+# does for the fetcher's package.
+RUNNER_PACKAGE = Path(runner_server.__file__).resolve().parent
+RUNNER_SCRIPT = RUNNER_PACKAGE.parent / "runner.py"
 # R4: method, path, status (or -), duration; nothing else, printable ASCII only.
 LOG_LINE_RE = re.compile(r"^[!-~]+ [!-~]+ (?:[0-9]{3}|-) [0-9]+\.[0-9]{3}$")
 # What the runner's process may import from the project (docs/PLAN.md 6.1):
@@ -1241,7 +1245,9 @@ class RunnerImportsTest(unittest.TestCase):
             "strange_ringtone_runner.server", "strange_ringtone_runner.ytdlp",
         })
         core_file = Path(lines[-1].removeprefix("core="))
-        self.assertEqual(core_file.resolve().parent.parent, (helpers.ROOT / "core").resolve())
+        # ../core beside the script's directory: the checkout's core/, or the
+        # image's /app/core.
+        self.assertEqual(core_file.resolve().parent.parent, (RUNNER_SCRIPT.parent.parent / "core").resolve())
 
 
 class RunnerMainTest(unittest.TestCase):

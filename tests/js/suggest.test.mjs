@@ -194,7 +194,7 @@ test("rule 2: a point may end up to 1 s after the audio does", () => {
 });
 
 test("rule 2: the fetcher's list for audio longer than its whole-second duration is used", () => {
-  // What strange_ringtone_fetch.ytdlp.clean_heatmap sends for 100 segments
+  // What strange_ringtone_fetch.metadata.clean_heatmap sends for 100 segments
   // of a 45.9 s video whose yt-dlp duration is 45: the segments that start
   // past 45 s are left out and the last kept one ends at 45 s, so no point is
   // zero-length (tests/test_fetcher_ytdlp.py pins that side).
