@@ -1061,8 +1061,24 @@ class RunnerTest(unittest.TestCase):
         try:
             connection.request(method, path, body=body, headers=headers or {})
             response = connection.getresponse()
-            received = {name.lower(): value for name, value in response.getheaders()}
-            return response.status, received, response.read()
+            try:
+                received = {name.lower(): value for name, value in response.getheaders()}
+                # The body and then the runner's close, through the response's
+                # own reader (response.read() would close it at the declared
+                # length). The runner lets go of its one-job lock just before
+                # it closes the connection, so a next request sent at the
+                # last byte could find it busy; the fetcher's client waits
+                # for the close too (strange_ringtone_fetch.runner_client).
+                fp = response.fp
+                if fp is None:
+                    return response.status, received, b""
+                length = received.get("content-length", "")
+                data = fp.read(int(length)) if length.isdigit() else fp.read()
+                while fp.read(65536):
+                    pass
+                return response.status, received, data
+            finally:
+                response.close()
         finally:
             connection.close()
 
