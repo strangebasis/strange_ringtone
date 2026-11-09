@@ -345,8 +345,9 @@ class ContractDocsTest(unittest.TestCase):
         return set(re.findall(r"^\| `([A-Z][A-Z0-9_]*)` \|", section, re.MULTILINE))
 
     def env_example_blocks(self) -> tuple[str, str]:
-        # .env.example serves both images (compose.example.yaml gives both the
-        # same .env); the fetcher's settings follow its marker line.
+        # .env.example serves both images (compose.example.yaml gives the core
+        # and the fetcher the same .env); the fetcher's settings follow its
+        # marker line.
         text = (helpers.ROOT / ".env.example").read_text(encoding="utf-8")
         core, marker, fetcher = text.partition(ENV_EXAMPLE_FETCHER_MARKER)
         self.assertTrue(marker, "the fetcher block's marker line is missing from .env.example")
@@ -364,13 +365,25 @@ class ContractDocsTest(unittest.TestCase):
 
     def test_env_example_fetcher_block_lists_every_fetcher_variable(self) -> None:
         from strange_ringtone_fetch.config import Settings as FetcherSettings
+        from strange_ringtone_runner.config import Settings as RunnerSettings
 
-        environ = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN})
-        FetcherSettings.from_env(environ)
-        # PUBLIC_ORIGIN and TRUSTED_PROXIES are shared, documented once above.
+        # One .env.example documents the fetcher image's settings: its fetcher
+        # block lists what the fetcher or its runner reads, although
+        # compose.example.yaml gives the fetcher the whole .env and the
+        # runner only its three limits from it (docs/PLAN.md 6.1, R6).
+        fetcher = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN})
+        FetcherSettings.from_env(fetcher)
+        runner = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN, "TRUSTED_PROXIES": ""})
+        RunnerSettings.from_env(runner)
+        # PUBLIC_ORIGIN and TRUSTED_PROXIES are shared with the core,
+        # documented once above, and browser-facing: the runner serves only
+        # the fetcher and reads neither.
         shared = {"PUBLIC_ORIGIN", "TRUSTED_PROXIES"}
-        self.assertLessEqual(shared, environ.looked_up)
-        self.assertEqual(self.variables_in(self.env_example_blocks()[1]), environ.looked_up - shared)
+        self.assertLessEqual(shared, fetcher.looked_up)
+        self.assertTrue(shared.isdisjoint(runner.looked_up), runner.looked_up & shared)
+        self.assertEqual(
+            self.variables_in(self.env_example_blocks()[1]), (fetcher.looked_up | runner.looked_up) - shared
+        )
 
 
 if __name__ == "__main__":

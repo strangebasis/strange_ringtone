@@ -6,14 +6,20 @@ and --ulimit msgqueue=0. These tests prove the image works under them and that
 they hold: a fixed non-root user, no writable path but /tmp, exactly the
 locked yt-dlp and yt-dlp-ejs in a venv of their own while the server's
 interpreter holds no third-party distribution at all, a Deno that yt-dlp finds
-and that runs under the fetcher's resource limits, a server that starts with
-the image's CMD and answers /fetch/healthz, and the forwarder command, which
-answers refusals and loads only its own package.
+and that runs under the runner's resource limits, and the image's three
+commands (docs/PLAN.md 6.1): the fetcher, the image's CMD, which starts and
+answers /fetch/healthz without a runner; the runner
+(python -I /app/fetcher/runner.py), yt-dlp's only home, which starts with no
+default route, answers /healthz, fails an offline fetch, leaves its scratch
+empty and loads only its own package and the modules it shares; and the
+forwarder (python -I /app/fetcher/forwarder.py), which answers refusals and
+loads only its own package.
 
-Nothing here talks to YouTube. The one test that starts the real yt-dlp with
-the fetcher's real argument list first proves the container has no network,
-so the run can only fail at name resolution. The forwarder test sends only
-requests the forwarder refuses before any DNS lookup.
+Nothing here talks to YouTube. The tests that start the real yt-dlp with the
+runner's real argument list, directly or through the runner command, first
+prove the container has no network, so the run can only fail at name
+resolution. The forwarder test sends only requests the forwarder refuses
+before any DNS lookup.
 """
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ import operator
 import os
 import re
 import resource
+import secrets
 import shutil
 import signal
 import socket
@@ -37,14 +44,50 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from strange_ringtone_fetch import ytdlp
-from strange_ringtone_fetch.ytdlp import DEFAULT_COMMAND, DENO, PRLIMIT, FetchError, YtDlp, default_prlimit, ytdlp_args
+# The run code lives where yt-dlp runs, in the runner's package (docs/PLAN.md
+# 6.1); the metadata whitelist and its FetchError are shared by both servers.
+try:
+    from strange_ringtone_fetch.metadata import FetchError
+    from strange_ringtone_runner import ytdlp
+    from strange_ringtone_runner.ytdlp import DEFAULT_COMMAND, DENO, PRLIMIT, YtDlp, default_prlimit, ytdlp_args
+
+    _RUNNER_IMPORT_ERROR = ""
+except ImportError as _error:
+    # An image without the runner's package (a broken build) must still load
+    # this module, so that what is missing shows up as failed assertions
+    # (RunnerTest, FilesystemTest, UserTest.test_the_runner_uses_prlimit_here)
+    # rather than one import error that hides every other result. The names
+    # come from the fetcher's own copy of the run code while an image still
+    # ships it; once it is gone, an image without the runner fails to import
+    # here, loudly.
+    _RUNNER_IMPORT_ERROR = f"{type(_error).__name__}: {_error}"
+    from strange_ringtone_fetch import ytdlp  # type: ignore[no-redef]
+    from strange_ringtone_fetch.ytdlp import (  # type: ignore[no-redef]
+        DEFAULT_COMMAND,
+        DENO,
+        PRLIMIT,
+        FetchError,
+        YtDlp,
+        default_prlimit,
+        ytdlp_args,
+    )
 
 UID = GID = 10001
 PORT = 8080
 # The image's CMD (fetcher/Dockerfile). A test can't read it from inside the
 # container, so a change there must change this line too.
 CMD = ["python", "-I", "/app/fetcher"]
+# The runner, the image's third command (compose.example.yaml), on its fixed
+# port (strange_ringtone_runner.__main__.PORT), written out so that a change
+# there fails here too. Its scratch directory is its own, beside the
+# fetcher's (strange_ringtone_runner.config.SCRATCH_DIR).
+RUNNER_CMD = ["python", "-I", "/app/fetcher/runner.py"]
+RUNNER_PORT = 8080
+RUNNER_HEALTH_PATH = "/healthz"
+RUNNER_PACKAGE = Path("/app/fetcher/strange_ringtone_runner")
+RUNNER_MODULES = {"__init__.py", "__main__.py", "config.py", "server.py", "ytdlp.py"}
+RUNNER_SCRATCH = "/tmp/strange_ringtone_runner"
+FETCHER_SCRATCH = "/tmp/strange_ringtone_fetch"
 # The forwarder, the image's second command (compose.example.yaml), on its
 # fixed port (strange_ringtone_forwarder.policy.PORT), written out so that a
 # change there fails here too.
@@ -201,6 +244,25 @@ sys.path.insert(0, "/app/fetcher")
 import strange_ringtone_forwarder.__main__
 print(json.dumps(sorted(name for name in sys.modules if name.startswith("strange_ringtone"))))
 """
+# The modules a process starting the runner loads: the entry script itself is
+# run (under another name, so its main() doesn't start a server), so its own
+# sys.path edit is what is tested, and the strange_ringtone* and yt_dlp*
+# modules are listed afterwards.
+_RUNNER_MODULES_PROBE = """\
+import json, runpy, sys
+runpy.run_path(sys.argv[1], run_name="strange_ringtone_runner_probe")
+print(json.dumps({
+    "modules": sorted(name for name in sys.modules if name.startswith("strange_ringtone")),
+    "yt_dlp": sorted(name for name in sys.modules if name.split(".")[0] in ("yt_dlp", "yt_dlp_ejs")),
+}))
+"""
+# The runner's audio route's token: 32 lowercase hex characters, as the
+# fetcher mints them (secrets.token_hex(16)).
+_TOKEN_RE = re.compile(r"[0-9a-f]{32}")
+# A console script's interpreter line: "#!" and the interpreter's path.
+_SHEBANG_RE = re.compile(r"#!\s*(\S+)")
+# The base interpreter's names in its prefix (python, python3, python3.12).
+_BASE_PYTHON_RE = re.compile(r"/usr/local/bin/python(3(\.12)?)?")
 
 
 def _status_fields(pid: int | str = "self") -> dict[str, str]:
@@ -232,8 +294,8 @@ def _locked() -> dict[str, str]:
     return {name.lower(): version for name, version in _LOCK_LINE_RE.findall(LOCK.read_text(encoding="utf-8"))}
 
 
-def _fetcher() -> YtDlp:
-    # The server's own construction (strange_ringtone_fetch.server) with the
+def _ytdlp() -> YtDlp:
+    # The runner's own construction (strange_ringtone_runner.server) with the
     # default settings: the real command, prlimit and limits.
     return YtDlp(max_seconds=600, max_bytes=40 * 1024 * 1024, timeout_seconds=120, prlimit=default_prlimit())
 
@@ -352,22 +414,28 @@ class UserTest(unittest.TestCase):
         )
         self.assertEqual(proc.stdout.split(), ["20", "67108864", "64", "512", str(resource.RLIM_INFINITY)])
 
-    def test_the_fetcher_uses_prlimit_here(self) -> None:
-        # On Linux the fetcher never runs yt-dlp without its limits.
+    def test_the_runner_uses_prlimit_here(self) -> None:
+        # R2/I1: on Linux the runner never runs yt-dlp without its limits. The
+        # names must be the runner's own, from its package in the image, not
+        # a copy the fetcher kept.
+        self.assertEqual(_RUNNER_IMPORT_ERROR, "", "the runner's package does not import in the image")
+        self.assertEqual(default_prlimit.__module__, "strange_ringtone_runner.ytdlp")
         self.assertEqual(default_prlimit(), (PRLIMIT,))
 
 
 class FilesystemTest(unittest.TestCase):
     def test_nothing_outside_tmp_is_writable(self) -> None:
-        # The directories this image adds for the venv and the forwarder must
-        # exist, or the probe below would pass on them without proving
-        # anything (a missing directory refuses a file too).
-        for directory in (str(VENV), str(VENV_SITE), str(VENV_SITE / "yt_dlp"), str(FORWARDER_PACKAGE)):
+        # The directories this image adds for the venv, the forwarder and the
+        # runner must exist, or the probe below would pass on them without
+        # proving anything (a missing directory refuses a file too).
+        for directory in (
+            str(VENV), str(VENV_SITE), str(VENV_SITE / "yt_dlp"), str(FORWARDER_PACKAGE), str(RUNNER_PACKAGE),
+        ):
             with self.subTest(exists=directory):
                 self.assertTrue(os.path.isdir(directory), f"{directory} is not in the image")
         for directory in (
             "/", "/app", "/app/core", "/app/core/strange_ringtone", "/app/fetcher",
-            "/app/fetcher/strange_ringtone_fetch", str(FORWARDER_PACKAGE),
+            "/app/fetcher/strange_ringtone_fetch", str(FORWARDER_PACKAGE), str(RUNNER_PACKAGE),
             str(BASE_SITE), str(BASE_SITE / "yt_dlp"),
             # The venv is root's: neither the server, the forwarder nor yt-dlp
             # can change the code yt-dlp runs.
@@ -392,9 +460,10 @@ class FilesystemTest(unittest.TestCase):
 
     def test_shipped_files_cannot_be_modified(self) -> None:
         for path in (
-            DENO, str(LOCK), "/app/fetcher/__main__.py", "/app/fetcher/strange_ringtone_fetch/ytdlp.py",
+            DENO, str(LOCK), "/app/fetcher/__main__.py", "/app/fetcher/strange_ringtone_fetch/metadata.py",
             "/app/core/strange_ringtone/http_guard.py", str(VENV_SITE / "yt_dlp" / "__init__.py"),
             VENV_PYTHON, str(VENV / "pyvenv.cfg"), "/app/fetcher/forwarder.py", str(FORWARDER_PACKAGE / "server.py"),
+            "/app/fetcher/runner.py", str(RUNNER_PACKAGE / "server.py"), str(RUNNER_PACKAGE / "ytdlp.py"),
         ):
             with self.subTest(path=path):
                 # It must ship, or the refused open below proves nothing.
@@ -506,6 +575,37 @@ class DependenciesTest(unittest.TestCase):
                 self.assertTrue(os.path.lexists(VENV / relative), f"{VENV / relative} is listed but missing")
                 self.assertFalse(os.path.lexists(Path(BASE_PREFIX) / relative), f"{BASE_PREFIX}/{relative} exists")
 
+    def test_venv_scripts_went_to_the_venv_not_the_base_prefix(self) -> None:
+        # I2. The venv is filled by the base interpreter's pip through
+        # --prefix /opt/yt-dlp, never by pip running under the venv's
+        # interpreter (--python), which would have had the venv on its path
+        # while it wrote the wheels. pip writes a console script's
+        # interpreter line from the interpreter pip itself runs under, so
+        # yt-dlp's script names the base interpreter, not the venv's. It
+        # lands in the venv's bin, which no PATH holds, and nothing runs it:
+        # yt-dlp runs as a module of the venv's interpreter.
+        script = VENV / "bin" / "yt-dlp"
+        try:
+            info = os.lstat(script)
+            with open(script, "rb") as handle:
+                first = handle.readline(256)
+        except OSError as error:
+            self.fail(f"{script} is not in the image: {error}")
+        self.assertTrue(stat.S_ISREG(info.st_mode), f"{script} is not a regular file")
+        self.assertEqual((info.st_uid, info.st_gid), (0, 0), f"{script} is not root's")
+        match = _SHEBANG_RE.match(first.decode("ascii", "replace"))
+        self.assertIsNotNone(match, f"{script} has no interpreter line: {first!r}")
+        assert match is not None
+        interpreter = match.group(1)
+        self.assertFalse(interpreter.startswith(str(VENV) + "/"),
+                         f"{script} names the venv's interpreter {interpreter}: pip ran under it (--python)")
+        self.assertIsNotNone(_BASE_PYTHON_RE.fullmatch(interpreter),
+                             f"{script} names {interpreter}, not the base interpreter")
+        self.assertIsNone(shutil.which("yt-dlp", path=os.environ.get("PATH", "")),
+                          "a yt-dlp script is on the image's PATH")
+        self.assertNotIn(str(script), DEFAULT_COMMAND)
+        self.assertNotIn("yt-dlp", [Path(part).name for part in DEFAULT_COMMAND])
+
     def test_venv_distributions_are_the_lock(self) -> None:
         # I1. --no-deps installs nothing a package's metadata asks for and the
         # venv is made --without-pip, so it holds the lock and nothing more.
@@ -570,7 +670,7 @@ class DependenciesTest(unittest.TestCase):
         # interpreter in isolated mode, and that interpreter is the venv's.
         self.assertEqual(ytdlp.YTDLP_PYTHON, VENV_PYTHON)
         self.assertEqual(DEFAULT_COMMAND, (VENV_PYTHON, "-I", "-m", "yt_dlp"))
-        self.assertEqual(_fetcher().command, DEFAULT_COMMAND)
+        self.assertEqual(_ytdlp().command, DEFAULT_COMMAND)
         proc = _run([DEFAULT_COMMAND[0], "-I", "-c", "import sys; print(sys.prefix)"])
         self.assertEqual((proc.returncode, proc.stdout.strip()), (0, str(VENV)), proc.stderr)
 
@@ -659,7 +759,7 @@ class DenoTest(unittest.TestCase):
     def setUp(self) -> None:
         self.job_dir = Path(tempfile.mkdtemp(prefix="job-", dir="/tmp"))
         self.addCleanup(shutil.rmtree, self.job_dir, ignore_errors=True)
-        self.fetcher = _fetcher()
+        self.fetcher = _ytdlp()
 
     def _deno(self, env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
         # The fetcher's prlimit prefix and limits, with Deno in yt-dlp's place.
@@ -742,7 +842,7 @@ class RealYtDlpOfflineTest(unittest.TestCase):
         self.assertEqual(_interfaces(), {"lo"}, "refusing to run yt-dlp with a network")
         self.job_dir = Path(tempfile.mkdtemp(prefix="job-", dir="/tmp"))
         self.addCleanup(shutil.rmtree, self.job_dir, ignore_errors=True)
-        self.fetcher = _fetcher()
+        self.fetcher = _ytdlp()
 
     def test_the_argument_list_is_accepted(self) -> None:
         command = self.fetcher.full_command(ytdlp_args(OFFLINE_VIDEO_ID, self.job_dir, 600, 40 * 1024 * 1024))
@@ -942,6 +1042,181 @@ class ForwarderTest(unittest.TestCase):
         self.assertEqual(modules, FORWARDER_MODULES)
         tag = sys.implementation.cache_tag
         self.assertLessEqual({f"{Path(name).stem}.{tag}.pyc" for name in modules}, cached)
+
+
+class RunnerTest(unittest.TestCase):
+    """The image's third command (docs/PLAN.md 6.1): yt-dlp's container, started as compose starts it.
+
+    The one request that starts a run asks for a format-valid ID with the
+    container proven to have no network, so the real yt-dlp the runner starts
+    can only fail at name resolution.
+    """
+
+    def _exchange(
+        self, method: str, path: str, body: bytes | None = None, headers: dict[str, str] | None = None,
+        timeout: float = 5,
+    ) -> tuple[int, dict[str, str], bytes]:
+        # http.client, not urllib: urllib would honour proxy variables.
+        connection = http.client.HTTPConnection("127.0.0.1", RUNNER_PORT, timeout=timeout)
+        try:
+            connection.request(method, path, body=body, headers=headers or {})
+            response = connection.getresponse()
+            try:
+                received = {name.lower(): value for name, value in response.getheaders()}
+                # The body and then the runner's close, through the response's
+                # own reader (response.read() would close it at the declared
+                # length). The runner lets go of its one-job lock just before
+                # it closes the connection, so a next request sent at the
+                # last byte could find it busy; the fetcher's client waits
+                # for the close too (strange_ringtone_fetch.runner_client).
+                fp = response.fp
+                if fp is None:
+                    return response.status, received, b""
+                length = received.get("content-length", "")
+                data = fp.read(int(length)) if length.isdigit() else fp.read()
+                while fp.read(65536):
+                    pass
+                return response.status, received, data
+            finally:
+                response.close()
+        finally:
+            connection.close()
+
+    def _wait_for_healthz(self, proc: subprocess.Popen[bytes]) -> tuple[int, dict[str, str], bytes]:
+        deadline = time.monotonic() + STARTUP_SECONDS
+        while True:
+            if proc.poll() is not None:
+                _out, err = proc.communicate(timeout=10)
+                self.fail(f"runner exited {proc.returncode}: {err!r}")
+            try:
+                return self._exchange("GET", RUNNER_HEALTH_PATH, timeout=2)
+            except ConnectionRefusedError:
+                if time.monotonic() > deadline:
+                    self.fail("runner did not start listening")
+                time.sleep(0.1)
+
+    def test_runner_command_serves_healthz_fails_a_real_fetch_offline_and_leaves_nothing(self) -> None:
+        # S2 (acceptance on a real kernel) and R3. Never let the real yt-dlp
+        # run where it could reach YouTube.
+        self.assertEqual(_interfaces(), {"lo"}, "refusing to run the runner with a network")
+        env = dict(os.environ)
+        # No override: under --network none there is no default route, so
+        # the start check must pass on its own.
+        env.pop("FETCH_ALLOW_DEFAULT_ROUTE", None)
+        # The unittest process is this container's PID 1, so the runner is
+        # not and can't sweep: the override lets it serve without the sweep
+        # (Q4), which RealSweepTest proves on its own.
+        env["FETCH_ALLOW_NO_SWEEP"] = "true"
+        env["FETCH_TIMEOUT_SECONDS"] = str(RUN_SECONDS)
+        proc = subprocess.Popen(
+            [*RUNNER_CMD, "--bind", "127.0.0.1"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        self.addCleanup(_reap, proc)
+        status, headers, body = self._wait_for_healthz(proc)
+        self.assertEqual((status, body), (200, b"ok"))
+        self.assertEqual(headers.get("cache-control"), "no-store")
+        runner = _status_fields(proc.pid)
+        self.assertEqual(runner["Uid"].split(), [str(UID)] * 4)
+        self.assertEqual(runner["Gid"].split(), [str(GID)] * 4)
+        # The scratch directory is the runner's own, under the /tmp tmpfs.
+        scratch = os.lstat(RUNNER_SCRATCH)
+        self.assertTrue(stat.S_ISDIR(scratch.st_mode), f"{RUNNER_SCRATCH} is not a directory")
+        self.assertEqual((scratch.st_uid, scratch.st_mode & 0o777), (UID, 0o700))
+
+        # A real run through the runner: the fetcher's request, the real
+        # argument list and environment, and yt-dlp failing at name
+        # resolution, which the runner answers as `failed`.
+        token = secrets.token_hex(16)
+        self.assertRegex(token, _TOKEN_RE)
+        request = json.dumps({"video_id": OFFLINE_VIDEO_ID, "job": token}).encode("ascii")
+        try:
+            status, headers, body = self._exchange(
+                "POST", "/jobs", request, {"Content-Type": "application/json"}, timeout=RUN_SECONDS + 30,
+            )
+        except OSError as error:
+            self.fail(f"the runner gave no answer to a job: {error}")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(headers.get("content-type"), "application/json")
+        self.assertEqual(json.loads(body), {"status": "failed", "error": "failed"})
+        # Nothing to collect: the failed run left no audio.
+        status, _headers, _body = self._exchange("GET", f"/jobs/{token}/audio")
+        self.assertEqual(status, 404)
+        # The job directory is gone and no result waits: only the empty
+        # results directory remains.
+        self.assertEqual(sorted(os.listdir(RUNNER_SCRATCH)), ["results"])
+        self.assertEqual(os.listdir(os.path.join(RUNNER_SCRATCH, "results")), [])
+
+        proc.send_signal(signal.SIGTERM)
+        _out, err = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 0, err)
+        log = err.decode("utf-8", "replace")
+        self.assertNotIn("refusing to start", log)
+        self.assertNotIn("FETCH_ALLOW_DEFAULT_ROUTE is set", log)
+        # Not PID 1 here: it served only because of the override, and said so.
+        self.assertIn("strange_ringtone_runner: FETCH_ALLOW_NO_SWEEP is set and the sweep can't run here", log)
+        # Control: the job's request line is there, so the absences below
+        # are read from a log that holds the run (R4's format: method, path,
+        # status, duration).
+        self.assertRegex(log, r"(?m)^POST /jobs 200 ")
+        # Nothing of yt-dlp's output, the video ID or the token.
+        self.assertNotIn("youtube", log.lower())
+        self.assertNotIn(OFFLINE_VIDEO_ID, log)
+        self.assertNotIn(token, log)
+
+    def test_runner_process_loads_only_the_allowed_modules(self) -> None:
+        # The entry is a script beside the packages, so its process loads the
+        # runner's package, the three fetcher modules it shares and the two
+        # core modules they need: never the fetcher's server, jobs or client,
+        # and never yt-dlp, which runs only as the venv's subprocess.
+        data, why = _python_json(RUNNER_CMD[0], _RUNNER_MODULES_PROBE, RUNNER_CMD[2])
+        self.assertIsNotNone(data, why)
+        assert data is not None
+        self.assertEqual(data["modules"], [
+            "strange_ringtone",
+            "strange_ringtone.config",
+            "strange_ringtone.http_guard",
+            "strange_ringtone_fetch",
+            "strange_ringtone_fetch.config",
+            "strange_ringtone_fetch.metadata",
+            "strange_ringtone_fetch.routes",
+            "strange_ringtone_runner",
+            "strange_ringtone_runner.__main__",
+            "strange_ringtone_runner.config",
+            "strange_ringtone_runner.server",
+            "strange_ringtone_runner.ytdlp",
+        ])
+        self.assertEqual(data["yt_dlp"], [])
+
+    def test_runner_files_ship_precompiled(self) -> None:
+        # The root filesystem is read-only at run time and -I ignores
+        # PYTHONDONTWRITEBYTECODE, so the bytecode must be in the image.
+        try:
+            modules = {path.name for path in RUNNER_PACKAGE.glob("*.py")}
+            cached = {path.name for path in (RUNNER_PACKAGE / "__pycache__").glob("*.pyc")}
+        except OSError as error:
+            self.fail(f"cannot list {RUNNER_PACKAGE}: {error}")
+        self.assertEqual(modules, RUNNER_MODULES)
+        tag = sys.implementation.cache_tag
+        self.assertLessEqual({f"{Path(name).stem}.{tag}.pyc" for name in modules}, cached)
+
+    def test_runner_and_fetcher_scratch_directories_differ(self) -> None:
+        # Each server empties its own scratch directory at startup, so the
+        # two must never share one, nor nest one in the other.
+        try:
+            from strange_ringtone_fetch.config import SCRATCH_DIR as fetcher_scratch
+            from strange_ringtone_runner.config import SCRATCH_DIR as runner_scratch
+            from strange_ringtone_runner.config import Settings as RunnerSettings
+        except ImportError as error:
+            self.fail(f"the runner's configuration does not import in the image: {error}")
+        self.assertEqual(str(runner_scratch), RUNNER_SCRATCH)
+        self.assertEqual(str(fetcher_scratch), FETCHER_SCRATCH)
+        self.assertEqual(RunnerSettings().scratch_dir, runner_scratch)
+        self.assertFalse(runner_scratch.is_relative_to(fetcher_scratch), (runner_scratch, fetcher_scratch))
+        self.assertFalse(fetcher_scratch.is_relative_to(runner_scratch), (runner_scratch, fetcher_scratch))
 
 
 if __name__ == "__main__":

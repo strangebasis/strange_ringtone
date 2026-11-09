@@ -1,9 +1,10 @@
 # strange_ringtone: research and v0.1.0 plan
 
 Status: design agreed on 2026-10-24 (decisions in section 3). Milestones 0
-to 5 are merged; the owner's phone tests of the share sheet and the Shortcut
-are still open (section 12). Before the release (milestone 6), the fetcher's
-egress confinement (section 6.1, decided on 2026-11-03) lands in two PRs.
+to 5 are merged, and so is the fetcher's egress confinement (section 6.1,
+decided on 2026-11-03), built in two PRs. The owner's phone tests of the
+share sheet and the Shortcut are still open (section 12). The release
+(milestone 6) is next.
 This file is the design record; the README's "Deployment contract" becomes the
 source of truth for operators once v0.1.0 ships.
 
@@ -365,9 +366,13 @@ The core has no secrets in v0.1.0, so `.env.example` holds only
 `PUBLIC_ORIGIN=` and commented optional settings. Any later secret arrives as
 `*_FILE`, with no usable default. The same file carries the optional fetcher's
 settings in a block of their own, all commented out; `compose.example.yaml`
-gives the core and the fetcher that one `.env` (the forwarder reads none),
-and each server reads only its own variables (`PUBLIC_ORIGIN` and
-`TRUSTED_PROXIES` are shared).
+gives the core and the fetcher that one `.env`, and the fetcher's runner
+only its three limits from it (6.1; the forwarder reads no setting), and
+each server reads only its own variables (`PUBLIC_ORIGIN`
+is shared by the core and the fetcher; both read `TRUSTED_PROXIES`, but the
+example sets the fetcher's to empty in its own `environment`, which wins
+over `.env`, so the value in `.env` is the core's (6.1); the runner reads
+neither, and its container is given neither).
 
 The fetcher image is a second, separate contract with its own table in the
 README (section 6, "Fetcher contract"). Nothing in it changes the core's: the
@@ -376,18 +381,17 @@ core still needs no egress, and `FETCH_ENABLED` only shows the YouTube box.
 ## 6. Fetcher image (opt-in)
 
 Section 6.1, decided on 2026-11-03, moves yt-dlp into a container of its own
-and gives the image its own egress gate. Its first PR (PR A, section 12) has
-landed: the bullets below describe the fetcher as of PR A, which still runs
-yt-dlp itself, from a venv, and reaches YouTube only through the image's
-forwarder. PR B will move yt-dlp into the runner and update them again.
+and gives the image its own egress gate. Its two PRs have landed: the
+bullets below describe the image as of PR B, with yt-dlp in the runner.
 
-- **Input:** JSON `{video_id}` only. The ID must match `^[A-Za-z0-9_-]{11}$`, and
-  the server builds `https://www.youtube.com/watch?v=<id>` itself. No URL a user
-  typed ever reaches yt-dlp, which removes the SSRF path (yt-dlp's generic
-  extractor would otherwise fetch anything).
+- **Input:** JSON `{video_id}` only. The ID must match `^[A-Za-z0-9_-]{11}$`.
+  The fetcher validates it and sends it to the runner, which validates it
+  again and builds `https://www.youtube.com/watch?v=<id>` itself. No URL a
+  user typed ever reaches yt-dlp, which removes the SSRF path (yt-dlp's
+  generic extractor would otherwise fetch anything).
 - **Invocation:** `/opt/yt-dlp/bin/python -I -m yt_dlp`, the interpreter of
-  the image's venv (never the server's own, see Runtime), run as a subprocess
-  with an argument list. The flags were checked against the pinned yt-dlp 2026.10.26, and an
+  the image's venv (never a server's own, see Runtime), run by the runner as
+  a subprocess with an argument list. The flags were checked against the pinned yt-dlp 2026.10.26, and an
   in-image test runs the real yt-dlp with the exact list (offline, so it can
   only fail at name resolution) to prove that version accepts every one:
   - `--ignore-config --no-playlist --use-extractors youtube`
@@ -405,33 +409,40 @@ forwarder. PR B will move yt-dlp into the runner and update them again.
   - `-P <job directory> -o "%(id)s.%(ext)s"`, so file names come from the
     validated ID only, then `--` and the URL the server built
 
-  It runs under `prlimit` and a wall-clock timeout (`communicate()`; on
-  timeout the whole process group is killed and the pipes drained), in its
-  own session, one job at a time (`FETCH_CONCURRENCY=1`, with 4 more queued
-  and 503 `busy` beyond), with its own per-IP rate limit. The fetcher's
-  `prlimit` set is CPU seconds, file size, open files and process count
+  It runs in the runner container under `prlimit` and a wall-clock timeout
+  (`communicate()`; on timeout the whole process group is killed and the
+  pipes drained), in its own session, with every leftover killed and reaped
+  at both run boundaries (6.1, the runner bullet), one job at a time: the fetcher's queue
+  (`FETCH_CONCURRENCY=1`, with 4 more queued and 503 `busy` beyond, and its
+  own per-IP rate limit) and the runner's own lock. The runner's `prlimit`
+  set is CPU seconds, file size, open files and process count
   (512, because `RLIMIT_NPROC` counts every thread of UID 10001, V8's
   included), with no address-space limit: Deno reserves a huge virtual
   address space at startup, so `RLIMIT_AS` would kill it. Memory is bounded
   by the deployment's cgroup limit (`mem_limit` in `compose.example.yaml`),
   which the contract documents as the operator's job. yt-dlp's environment
-  is built from scratch: fixed values, `HOME` and `DENO_DIR` inside the job
-  directory under `/tmp` (the root filesystem is read-only, and nothing
-  carries over between jobs), and `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`
-  when set (`compose.example.yaml` points `HTTPS_PROXY` at the forwarder),
-  never the server's own environment. yt-dlp
-  hands that environment to Deno, which it runs with `--no-remote
+  is built from scratch by the runner: fixed values, `HOME` and `DENO_DIR`
+  inside the job directory under `/tmp` (the root filesystem is read-only,
+  and the job directory is removed after every run; what a run writes
+  elsewhere on `/tmp` stays until the container restarts, 6.1, Accepted
+  risks), and `HTTPS_PROXY`, `HTTP_PROXY` and
+  `NO_PROXY` when set (`compose.example.yaml` points the runner's
+  `HTTPS_PROXY` at the forwarder), never the runner's own environment. That
+  environment is not handed to yt-dlp, but yt-dlp can read what the
+  runner's container was given from inside it (6.1), so the example gives
+  that container only the runner's own settings. yt-dlp
+  hands its environment to Deno, which it runs with `--no-remote
   --cached-only`.
-- **Success** is judged by exactly `<id>.m4a` (a regular file of at most
-  `FETCH_MAX_BYTES`) and `<id>.info.json` being in the job directory, never
+- **Success** is judged by the runner: exactly `<id>.m4a` (a regular file of
+  at most `FETCH_MAX_BYTES`) and `<id>.info.json` being in the job directory, never
   by exit 0 alone. Exit 101 is `too_long`, a timeout is `timeout`, and other
   failures are `blocked` or `not_found` when stderr matches a few fixed
   phrases (bot checks, HTTP 403; unavailable, private or removed videos) and
   `failed` otherwise. The job directory is removed in `finally` on every path.
 - **Logging:** yt-dlp runs with `--quiet --no-warnings --no-progress`, and its
-  stdout and stderr are never logged: they carry the destination filename,
-  which contains the title that becomes the tone name (CLAUDE.md: tone names
-  stay out of logs). Failures map to a fixed error set: `blocked`, `too_long`,
+  stdout and stderr are never logged; neither the runner nor the fetcher logs them:
+  they carry the destination filename, which contains the title that becomes
+  the tone name (CLAUDE.md: tone names stay out of logs). Failures map to a fixed error set: `blocked`, `too_long`,
   `not_found`, `timeout`, `failed`. A test with a stubbed yt-dlp asserts the
   log never contains the stub's title.
 - **Output:** `POST /fetch/api/jobs` answers 202 with `{job_id}` (128 random
@@ -455,6 +466,18 @@ forwarder. PR B will move yt-dlp into the runner and update them again.
   goes, and if streams alone fill the budget, the oldest stream is cut at its
   next chunk and the worker waits for it to let go. This rule is the
   fetcher's only; the core's no-early-eviction rule (5.5) is unchanged.
+
+  The fetcher gets the result from the runner over `jobs`: `POST /jobs` with
+  the ID and a token the fetcher mints (never its job ID) answers, once
+  yt-dlp is done, the cleaned title, duration and heatmap in yt-dlp's key
+  names, which the fetcher re-validates with the same whitelist;
+  `GET /jobs/<token>/audio` streams the audio once, capped at
+  `FETCH_MAX_BYTES` and timed, and the runner deletes it; an uncollected
+  file goes when the next job starts or after 60 s. The runner answers 503
+  `busy` while a run or a stream is in progress. It lets go of that lock
+  before it closes the connection, so the fetcher ends each exchange at the
+  runner's close, not at the answer's last byte, and its next request never
+  finds the runner busy.
 - **Runtime:** the same `python:3.12-slim-bookworm` base and digest as the
   core, with its `prlimit`. Deno (2.9.8; yt-dlp needs at least 2.3.0) is
   copied from the official `denoland/deno:bin` image, a named build stage
@@ -465,9 +488,9 @@ forwarder. PR B will move yt-dlp into the runner and update them again.
   dependencies, and yt-dlp-ejs must equal the version yt-dlp's own `default`
   extra pins (an in-image test checks both, and Dependabot bumps them as one
   group). They install into a venv of their own at `/opt/yt-dlp`, root-owned,
-  created `--without-pip` and filled by the base image's pip through its
-  `--python` option; the base pip is then uninstalled. So the base
-  interpreter, which runs the fetcher and the forwarder, holds no installed
+  created `--without-pip` and filled by the base image's pip through
+  `--prefix`; the base pip is then uninstalled. So the base interpreter,
+  which runs the fetcher, the runner and the forwarder, holds no installed
   distribution at all and no `.pth` file, and its `sys.path` leaves out the
   venv (I1 in 6.1, checked in the image). Without `requests`, yt-dlp talks
   to a proxy through urllib, so only `http://` proxies work. The fetcher
@@ -475,42 +498,59 @@ forwarder. PR B will move yt-dlp into the runner and update them again.
   `strange_ringtone.http_guard` (the Origin, length, `X-Forwarded-For` and
   rate-limit rules): `fetcher/__main__.py` puts `../core` first on
   `sys.path`, and the image copies exactly those modules to `/app/core`. The
+  runner is the stdlib package `strange_ringtone_runner`, started by
+  `/app/fetcher/runner.py`, which puts `../core` and `fetcher/` on
+  `sys.path`; it imports the core's `config` and `http_guard` and the
+  fetcher's `config`, `metadata` and `routes`, never its server. The
   forwarder is the stdlib package `strange_ringtone_forwarder`, started by
   `/app/fetcher/forwarder.py`, which puts only its own directory on
   `sys.path`, so its process loads neither the core nor the fetcher.
 - **Contract:** the same UID, read-only and capability rules as the core. The
-  fetcher needs YouTube's hosts and no access to any private network, and
-  it gets them **only through the forwarder** (6.1): it sits on internal
-  networks only, `compose.example.yaml` sets its `HTTPS_PROXY` to
-  `http://fetcher-forwarder:3128`, and it refuses to start (exit 3) when its
-  container has a default route, IPv4 or IPv6, or when it can't read or
-  parse its route tables, unless `FETCH_ALLOW_DEFAULT_ROUTE=true` says egress is filtered
-  another way. Docker Engine 28.0 or newer: engines before 26.0 forward DNS
+  fetcher needs no egress at all: it reaches the runner over `jobs` at
+  `FETCH_RUNNER_URL` (default `http://fetcher-runner:8080`). The runner
+  needs YouTube's hosts and no access to any private network, and it gets
+  them **only through the forwarder** (6.1): it sits on `jobs` and `egress`,
+  internal networks only, `compose.example.yaml` sets its `HTTPS_PROXY` to
+  `http://fetcher-forwarder:3128`, and both the fetcher and the runner
+  refuse to start (exit 3) when their container has a default route, IPv4
+  or IPv6, or when they can't read or parse their route tables, unless
+  `FETCH_ALLOW_DEFAULT_ROUTE=true` says egress is filtered another way. Docker Engine 28.0 or newer: engines before 26.0 forward DNS
   from internal networks, and the internal networks' `isolated` gateway
   modes, which keep the Docker host off them, arrived in 28.0
   (moby/moby#49262). With Compose, Docker Compose 2.27.1 or newer, for the
   per-network `driver_opts` that turn forwarding off and refuse ICMP
   redirects on each interface (6.1).
-  Settings: `PUBLIC_ORIGIN` (required), `TRUSTED_PROXIES`,
-  `FETCH_MAX_SECONDS` (600, at most 600: `decode.js`
-  refuses input over 10 minutes, so a longer video would be downloaded only
-  for the phone to refuse it), `FETCH_MAX_BYTES` (40 MiB; 10 minutes of
-  YouTube's AAC is about 10 MB), `FETCH_TIMEOUT_SECONDS` (120),
+  Settings: from the shared `.env`, the fetcher reads `PUBLIC_ORIGIN`
+  (required), `TRUSTED_PROXIES`, `FETCH_MAX_BYTES`, `FETCH_TIMEOUT_SECONDS`,
   `RATE_LIMIT_FETCHES_PER_MINUTE` (5), `FETCH_RESULT_TTL_SECONDS` (600),
-  `FETCH_ALLOW_DEFAULT_ROUTE` (false). The forwarder reads no setting.
+  `FETCH_ALLOW_DEFAULT_ROUTE` and `FETCH_RUNNER_URL`
+  (`http://fetcher-runner:8080`); the runner reads `FETCH_MAX_SECONDS` (600,
+  at most 600: `decode.js` refuses input over 10 minutes, so a longer video
+  would be downloaded only for the phone to refuse it), `FETCH_MAX_BYTES`
+  (40 MiB; 10 minutes of YouTube's AAC is about 10 MB),
+  `FETCH_TIMEOUT_SECONDS` (120; the fetcher waits that long plus 15 s for
+  the runner's answer), `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`,
+  `FETCH_ALLOW_DEFAULT_ROUTE` (false) and `FETCH_ALLOW_NO_SWEEP` (false,
+  never set by the example), and nothing browser-facing. Of these the
+  example passes it only the first three from `.env`, by name, and sets
+  `HTTPS_PROXY` on its service; it gets no `env_file` (6.1). The
+  forwarder reads no setting.
 - **Fetcher contract (the README gets a second table):** image
   `ghcr.io/<owner>/strange_ringtone-fetcher:<semver>`, linux/amd64, UID/GID
-  10001, two commands: the CMD `python -I /app/fetcher`, the fetcher on port
-  8080/tcp plain HTTP, and `python -I /app/fetcher/forwarder.py`, the
-  forwarder on port 3128/tcp. The fetcher serves the `/fetch/` prefix
-  itself (`GET /fetch/healthz`, `POST /fetch/api/jobs`,
-  `GET /fetch/api/jobs/<id>` and `…/audio`), and the proxy forwards those
-  paths unchanged, so no rewriting is needed. Writable: for the fetcher
-  `/tmp` (tmpfs) only, sized at `2 × FETCH_MAX_BYTES + 16 MB` for one
-  download in flight, one finished result, the info JSON and Deno's cache:
-  96 MB with the defaults; for the forwarder nothing. Health: the fetcher's
-  `GET /fetch/healthz` answers 200 `ok`; the forwarder accepts a TCP
-  connection on 3128. The forwarder's limits are named with their values in
+  10001, three commands: the CMD `python -I /app/fetcher`, the fetcher on
+  port 8080/tcp plain HTTP; `python -I /app/fetcher/runner.py`, the runner
+  on port 8080/tcp in its own container; and
+  `python -I /app/fetcher/forwarder.py`, the forwarder on port 3128/tcp. The
+  fetcher serves the `/fetch/` prefix itself (`GET /fetch/healthz`,
+  `POST /fetch/api/jobs`, `GET /fetch/api/jobs/<id>` and `…/audio`), and the
+  proxy forwards those paths unchanged, so no rewriting is needed. Writable:
+  the fetcher `/tmp` (tmpfs) only, sized `2 × FETCH_MAX_BYTES` for one
+  download arriving from the runner and one finished result: 80 MB with the
+  defaults; the runner `/tmp` (tmpfs) only, sized `FETCH_MAX_BYTES + 16 MB`
+  for one download in flight or one audio waiting to be collected, the info
+  JSON and Deno's cache: 56 MB; the forwarder nothing. Health: the fetcher's
+  `GET /fetch/healthz` and the runner's `GET /healthz` answer 200 `ok`; the
+  forwarder accepts a TCP connection on 3128. The forwarder's limits are named with their values in
   the README. The in-image tests live in `tests/image_fetcher/` (not
   `tests/image/`, which is the core's), gated by
   `STRANGE_RINGTONE_FETCHER_IMAGE_TESTS=1`; the compose topology tests live
@@ -519,9 +559,8 @@ forwarder. PR B will move yt-dlp into the runner and update them again.
 ### 6.1 Egress confinement (decided 2026-11-03)
 
 The owner chose this design on 2026-11-03, after a review of five options.
-Milestone 5's follow-up builds it in two PRs (section 12). PR A landed; until
-PR B lands the fetcher runs yt-dlp itself, through the forwarder, and the
-bullets above describe it that way.
+Milestone 5's follow-up builds it in two PRs (section 12). Both PRs have
+landed; this section is the record.
 
 **Threat.** The likeliest compromise is a malicious yt-dlp, yt-dlp-ejs or
 Deno release that arrives through a Dependabot bump and runs as the fetcher's
@@ -574,17 +613,19 @@ source of abuse.
 - Inside every container of the stack `net.ipv4.ip_forward` is 1 (a new
   network namespace copies it from the host's, where dockerd turns it on),
   so the forwarder, with an interface on `egress` and on `outside`, would
-  route a packet that reached it for an off-link destination, and the
-  fetcher would route between `fetcher` and `egress`. Nothing can hand them
-  one today (the fetcher's only routes are its on-link subnets, it has no
-  capability to add a route or craft a frame, and the host has no address
-  on the isolated networks), but that is one capability or one route away
-  from a path around the gate. So the fetcher and the forwarder turn
-  forwarding off (owner, 2026-11-04), on every interface rather than with
-  the global switch (owner, 2026-11-04, after the race below).
+  route a packet that reached it for an off-link destination, the runner
+  would route between `jobs` and `egress`, and the fetcher between `fetcher`
+  and `jobs`. Nothing can hand them one today (the fetcher's and the
+  runner's only routes are their on-link subnets, they have no capability
+  to add a route or craft a frame, and the host has no address on the
+  isolated networks), but that is one capability or one route away from a
+  path around the gate. So every container of the fetcher image turns
+  forwarding off (owner, 2026-11-04, for the fetcher and the forwarder; the
+  runner the same from PR B), on every interface rather than with the
+  global switch (owner, 2026-11-04, after the race below).
 - The kernel forwards a packet only when the interface it arrived on has
   forwarding on (`Documentation/networking/ip-sysctl.rst`,
-  `conf/interface/forwarding`). So the fetcher and the forwarder set
+  `conf/interface/forwarding`). So the fetcher, the runner and the forwarder set
   `net.ipv4.conf.default.forwarding` (every interface created later) and
   `net.ipv4.conf.lo.forwarding` to 0 in `sysctls`, and each interface
   Docker attaches through its endpoint sysctl on every network attachment
@@ -621,8 +662,9 @@ source of abuse.
 - A namespace whose interfaces don't forward is a host, and a host follows
   its router's ICMP redirects (RFC 1122); the kernel takes a redirect when
   `all` or the receiving interface says 1, and only from a route's current
-  gateway: the fetcher has none, and the forwarder's is the Docker host on
-  `outside`. Both refuse them anyway (owner, 2026-11-04): `all`, `default`
+  gateway: the fetcher and the runner have none, and the forwarder's is the
+  Docker host on `outside`. All three refuse them anyway (owner, 2026-11-04;
+  the runner from PR B): `all`, `default`
   and `lo` at 0 in `sysctls`, and each attached interface through the same
   endpoint sysctl. Engine 29.8 attaches the interfaces after it writes the
   container's sysctls, so they take `default`'s 0 anyway (with a network's
@@ -657,17 +699,46 @@ source of abuse.
   that can't start then fails its request or connection closed. Deno, as
   yt-dlp runs it, starts its main thread, 2 tokio threads and one V8 worker
   per usable CPU up to 4 (7 threads with 4 CPUs or more, measured offline in
-  the image), and yt-dlp's Python 1 thread. The fetcher's `pids_limit: 200`
-  is at least twice its worst case of 87: the main thread, 16 request
-  workers (`FetchServer.MAX_WORKERS`), the job worker and the sweeper, the
-  health check, and one yt-dlp run counted as 67 (V8's workers as 63, for a
-  host that reports 64 CPUs, in case the cap of 4 doesn't hold there). It
-  also leaves the one real fetch more than four times the measured 8
-  threads of yt-dlp and Deno on top of the server's 20.
+  the image), and yt-dlp's Python 1 thread. The runner's `pids_limit: 160`
+  is at least twice its worst case of 74: the main thread, 4 request workers
+  (`RunnerServer.MAX_WORKERS`), the result sweeper, the health check, and
+  one yt-dlp run counted as 67 (V8's workers as 63, for a host that reports
+  64 CPUs, in case the cap of 4 doesn't hold there). The fetcher, which
+  runs no yt-dlp, has `pids_limit: 64`, at least twice its worst case of
+  21: the main thread, 16 request workers (`FetchServer.MAX_WORKERS`), the
+  job worker and the sweeper, the health check, and the runner client's
+  deadline timer.
+- A container's PID 1 inherits every orphan and must reap it. Measured as
+  PID 1 of a throwaway container of the fetcher image (2026-11-05): a
+  grandchild killed with its process group stays a zombie of PID 1; one
+  that called `setsid()` survives `killpg`; one that also forks to a new PID
+  every 10 ms left 49 zombies in half a second; then `kill(-1, SIGKILL)`
+  and `waitpid(-1, WNOHANG)` killed and reaped all 51 and left nothing.
+  The kernel sends `kill(-1)` to every process the caller may signal in its
+  PID namespace but PID 1 and the caller, under a lock `fork()` can't slip
+  past.
 - Python 3.12's `ipaddress` calls `64:ff9b::a9fe:a9fe` (NAT64 for
   169.254.169.254) and `::169.254.169.254` global.
 - A child with the same UID can read its parent's `/proc/<pid>/environ`, and
-  it can ptrace the parent where Yama's `ptrace_scope` is 0.
+  it can ptrace the parent where Yama's `ptrace_scope` is 0 (the kernel's
+  default; Docker's default seccomp profile allows `ptrace` on kernels 4.8
+  and newer).
+- A non-dumpable process (`prctl(PR_SET_DUMPABLE, 0)`) can't be ptraced,
+  and its `/proc/<pid>/environ`, `maps` and `mem` can't be read, by a
+  process without `CAP_SYS_PTRACE`, whatever `ptrace_scope` says; `execve`
+  makes a process dumpable again. Measured as PID 1 of a throwaway container
+  of the fetcher image under the contract flags (2026-11-05): before the
+  call, a same-UID child read `/proc/1/environ` and `/proc/1/maps`; after
+  it, both, `process_vm_readv` and `PTRACE_ATTACH` were refused.
+- That protects PID 1, not what the container was given. Docker starts a
+  health check, like any `docker exec`, with the container's environment
+  and user, so each time the check runs, an ordinary dumpable process of
+  UID 10001 holds that environment, and any process of that UID can read
+  its `/proc/<pid>/environ`. Measured in a throwaway container of the
+  fetcher image with no network (Engine 29.8, 2026-11-09): with PID 1
+  non-dumpable and a health check every 3 s, a same-UID process started
+  with an empty environment was refused at `/proc/1/environ` and read a
+  variable of the container's environment from the health check's process.
 - glibc's resolver retries a relative name under each `search` domain of
   `/etc/resolv.conf`, which Docker copies from the host, after an NXDOMAIN,
   so `nosuch.youtube.com` can become `nosuch.youtube.com.<search domain>`.
@@ -680,8 +751,8 @@ source of abuse.
 IPv6 on for them doesn't bring the host back); `outside` keeps its gateway,
 the forwarder's route out. Every service rotates its log (json-file, `max-size` and
 `max-file`), so a flood of refusals can't fill the host's disk. Every
-container of the fetcher image (the fetcher and the forwarder in PR A, the
-runner too from PR B) turns forwarding off on every interface (`forwarding`
+container of the fetcher image (the fetcher, the runner and the forwarder)
+turns forwarding off on every interface (`forwarding`
 0 for `default`, `lo` and, on each network attachment, its interface, and
 never the global `ip_forward`, which reads 1 inside by design), so none of
 them routes between its networks, refuses ICMP redirects (`accept_redirects`
@@ -708,12 +779,57 @@ them routes between its networks, refuses ICMP redirects (`accept_redirects`
   limit and the result store of section 6. It sends the runner a validated
   video ID and treats everything that comes back as untrusted, with timeouts,
   size caps on the JSON and the audio, and the same metadata whitelist.
-  `TRUSTED_PROXIES` and the proxy's routing stay as they are.
+  The proxy's routing stays as it is. The fetcher trusts no proxy in the
+  example: `compose.example.yaml` sets its `TRUSTED_PROXIES` to empty, which
+  wins over the shared `.env`, so it keys its rate limit on the socket peer
+  and behind a reverse proxy every client shares one limit. The runner
+  reaches it over `jobs`, and `TRUSTED_PROXIES` must never cover `jobs`,
+  whose subnet Docker may change when it recreates the network (owner,
+  2026-11-05). It finds the
+  runner at `FETCH_RUNNER_URL`, sends it the ID and a token of its own, and
+  caps the answer: JSON ≤ 256 KiB of a fixed shape, audio of exactly the
+  declared length up to `FETCH_MAX_BYTES`, 30 s per read and a total
+  deadline per exchange; a runner that misbehaves fails the job, never a
+  retry.
 - **fetcher-runner** runs yt-dlp as section 6 describes (the argument list,
   `prlimit`, the timeout, an environment built from scratch) behind a small
-  stdlib server that takes one job at a time. It shares no network with the
-  reverse proxy, never sees a browser's request and can't set a response
-  header on the app's origin.
+  stdlib server (`POST /jobs`, `GET /jobs/<token>/audio`, `GET /healthz`)
+  that takes one job at a time, deletes its job directory in `finally`, and
+  keeps an audio file only until it is collected, the next job starts, or
+  60 s pass. It shares no network with the reverse proxy, never sees a
+  browser's request and can't set a response header on the app's origin.
+  It is its container's PID 1 (no `init`, no wrapper), and under its lock,
+  before each run starts and after each run ends (before it answers the
+  `POST`), it sends `kill(-1, SIGKILL)`, which ends every other process of
+  UID 10001 in its container, a child that left yt-dlp's process group with
+  `setsid()` or one that keeps forking to a new PID included, then reaps
+  with `waitpid(-1, WNOHANG)` for about 2 s, never while a `Popen` is in
+  flight. So nothing of one run reaches the next one's files, and no orphan
+  stays a zombie that counts against `pids_limit`. Only the entry turns it
+  on, and only as PID 1: anywhere else `kill(-1)` would kill every process
+  of the user (owner, 2026-11-05). The example states `init: false`, since
+  an unset `init` takes the daemon's default, which may be an init. Where
+  the sweep can't run (not PID 1, as under an init, or no `kill` and
+  `waitpid`), the entry refuses to start (exit 4) unless
+  `FETCH_ALLOW_NO_SWEEP=true`, which is for a local run or a host that
+  can't run the runner as PID 1, never for a deployment that can; with it,
+  the runner serves without the sweep and says so on stderr. As PID 1 it
+  sweeps whatever the variable says (owner, 2026-11-05). Before it serves, it makes
+  itself non-dumpable: yt-dlp runs as its UID and is not its ancestor, so
+  where `ptrace_scope` is 0 it could otherwise attach to the runner and
+  plant code there that `kill(-1)`, which spares the caller, never ends.
+  Its container is given only the runner's own settings, because a health
+  check or a `docker exec` there holds whatever the container was given,
+  where yt-dlp can read it (What it rests on): the example gives the
+  runner service no `env_file`, passes it `FETCH_MAX_SECONDS`,
+  `FETCH_MAX_BYTES` and `FETCH_TIMEOUT_SECONDS` from `.env` by name, and
+  sets `HTTPS_PROXY` on the service. So `PUBLIC_ORIGIN`, which a
+  compromised run would need to pass the fetcher's Origin check over
+  `jobs`, the core's settings and anything else an operator keeps in `.env`
+  never reach it. The runner's layout-dependent settings (the two
+  overrides, `HTTP_PROXY`, `NO_PROXY`) are no longer taken from `.env`: a
+  layout that needs one sets it on the runner service (2026-11-09, after a
+  security review of both PRs).
 - **fetcher-forwarder** is the only container with a route out.
 - The core image doesn't change. Its example network becomes isolated from
   the host too (both isolated gateway modes, Engine 28.0), so the reverse
@@ -721,10 +837,7 @@ them routes between its networks, refuses ICMP redirects (`accept_redirects`
   rotates. A proxy kept in another Compose project joins the networks as
   external ones under their project-scoped names (`strange_ringtone_core`,
   `strange_ringtone_fetcher`) and is told to use the fetcher's address on
-  `fetcher`, not on `egress`.
-
-PR A's interim layout has two containers: the fetcher on `fetcher` and
-`egress`, and the forwarder on `egress` and `outside`.
+  `fetcher`, not on `jobs`.
 
 **The forwarder.** Stdlib Python on one plain port, 3128. It reads one
 request head per connection and never parses anything after it. In order:
@@ -784,8 +897,7 @@ per-tunnel download cap is a fixed 16 MiB, one 10 MiB yt-dlp range plus
 headroom, never sized from `FETCH_MAX_BYTES` (owner, 2026-11-03); an in-image
 test fails when the pinned yt-dlp's range no longer fits it.
 
-**Fail closed.** The fetcher (from PR A) and the runner (from PR B) refuse to
-start when their container has a default route, IPv4 or IPv6, or when the
+**Fail closed.** The fetcher and the runner refuse to start when their container has a default route, IPv4 or IPv6, or when the
 route tables can't be read or parsed (a missing `ipv6_route` alone means a
 kernel without IPv6), because something other than the forwarder could then
 carry traffic out. `/proc/net/route` lists the IPv4 main table only, so a
@@ -797,18 +909,22 @@ cover every address without one (a VPN client's `0.0.0.0/1` and
 default route while IPv6 skips reject routes. Neither is reachable by the
 attacker in scope, who can't add routes and runs only after the check. `FETCH_ALLOW_DEFAULT_ROUTE=true` turns the check off
 where egress is filtered some other way (a Kubernetes NetworkPolicy, for
-example). The offline dev stack starts the fetcher without its entry point's
-check, so it needs nothing. The check replaces requiring `HTTPS_PROXY`, which
+example). The offline dev stack starts the fetcher and the runner without
+their entry points' checks, so it needs nothing. The check replaces requiring `HTTPS_PROXY`, which
 a malicious yt-dlp would ignore.
 
 **Image.** yt-dlp and yt-dlp-ejs install into a venv from the same hashed
-lock, and only yt-dlp runs from it: in the fetcher's process tree in PR A,
-in the runner from PR B. The fetcher and the forwarder run the base
-interpreter, whose site-packages hold no third-party distribution, so a
-wheel's `.pth`, scripts and data files can't reach them. Once the wheels
-are in, no build step starts the venv's interpreter: the base interpreter
-compiles the venv's bytecode with `-I -S`, so no `.pth` line runs as root
-during the build either.
+lock, and only yt-dlp runs from it, in the runner. The fetcher, the runner
+and the forwarder run the base interpreter, whose site-packages hold no
+third-party distribution, so a wheel's `.pth`, scripts and data files can't
+reach them. The venv is filled by the base interpreter's `pip install
+--prefix /opt/yt-dlp`, so pip never runs under the venv's interpreter: with
+`--python` it did, while it wrote the wheels (owner-approved change after
+PR A's review). The wheels' scripts land in `/opt/yt-dlp/bin` with the base
+interpreter's shebang; nothing runs them and nothing puts that directory on
+a PATH. Once the wheels are in, no build step starts the venv's
+interpreter: the base interpreter compiles the venv's bytecode with
+`-I -S`, so no `.pth` line runs as root during the build either.
 Keeping one image leaves CI, Trivy, publishing, provenance and Dependabot as
 they are.
 
@@ -839,13 +955,34 @@ they are.
   - Docker Engine 28.0 or newer (the first release with the isolated gateway
     modes; endpoint sysctls date from 27.0.1), and Docker Compose 2.27.1 or
     newer for a service network's `driver_opts`
-- planned for PR B:
-  - the runner command and the `jobs` network (`egress` moves from the
-    fetcher to the runner)
-  - how the fetcher finds the runner (an address that defaults to the compose
-    service), with `HTTPS_PROXY` moving to the runner
-  - `/tmp` per container (expected: the runner `FETCH_MAX_BYTES + 16 MB`, the
-    fetcher `2 × FETCH_MAX_BYTES`)
+- shipped in PR B:
+  - the runner command (`python -I /app/fetcher/runner.py`, port 8080, a
+    `/tmp` of `FETCH_MAX_BYTES + 16 MB`, 56 MB with the defaults)
+  - the `jobs` network between the fetcher and the runner (internal, both
+    isolated gateway modes); `egress` moves from the fetcher to the runner
+  - `FETCH_RUNNER_URL` (default `http://fetcher-runner:8080`), how the
+    fetcher finds the runner
+  - `HTTPS_PROXY` moved to the runner service
+  - the fetcher's `/tmp` at `2 × FETCH_MAX_BYTES` (80 MB with the defaults)
+  - `mem_limit` 256 MB for the fetcher (512 MB for the runner)
+  - `pids_limit` 64 for the fetcher and 160 for the runner
+  - the kernel settings (forwarding off per interface, ICMP redirects
+    refused) on the runner
+  - the runner as its container's PID 1 (`init: false`, stated, and no
+    wrapper), which its kill-and-reap sweep needs; a `docker exec` or health
+    check running at a run boundary is killed too
+  - `FETCH_ALLOW_NO_SWEEP` (runner only, default false): where the sweep
+    can't run, the runner refuses to start (exit 4) unless it is `true`
+    (owner, 2026-11-05)
+  - the runner non-dumpable, so a `docker exec` as its UID can't read its
+    `/proc/1/environ`, `maps` or `mem`
+  - `TRUSTED_PROXIES: ""` on the fetcher service, which wins over `.env`
+  - no `env_file` on the runner service: `FETCH_MAX_SECONDS`,
+    `FETCH_MAX_BYTES` and `FETCH_TIMEOUT_SECONDS` from `.env` by name,
+    `HTTPS_PROXY` set on the service, and nothing else; its other settings
+    (`FETCH_ALLOW_DEFAULT_ROUTE`, `FETCH_ALLOW_NO_SWEEP`, `HTTP_PROXY`,
+    `NO_PROXY`) are set on the service where a layout needs them
+    (2026-11-09)
 
 **Dropped, and why.**
 
@@ -860,8 +997,9 @@ they are.
   third-party code off the reverse proxy's network without a new image or a
   second `X-Forwarded-For` hop.
 - **Requiring `HTTPS_PROXY` at startup.** The route check replaces it.
-- **Making the server non-dumpable.** Moot once yt-dlp runs in another
-  container. If a release ever ships PR A without PR B, PR A must add it.
+- **Making the fetcher's server non-dumpable.** Moot: yt-dlp runs in
+  another container. The runner, PID 1 of yt-dlp's container, does make
+  itself non-dumpable (see fetcher-runner above).
 - **An off-the-shelf gate.** Smokescreen (Stripe's egress proxy) came closest,
   but it has no port rule or byte budgets, accepts clients without
   certificates only through a YAML setting, and its release tags are years
@@ -879,20 +1017,52 @@ internal networks, and before 28.0 has no way to keep the host off them
 28.0. The forwarder is our own code at the boundary, so it stays small. It
 listens on all its interfaces, `outside` included, where the Docker host can
 reach port 3128 (Engine 28 and newer drop direct routing to unpublished
-ports from elsewhere); nothing else may join `outside`. Until PR B, a
-compromised forwarder shares `egress` with the fetcher and can reach its port
-8080 there, where the fetcher's Origin and rate checks still apply. Binding the forwarder to its `egress` address alone
-would need a fixed subnet in the example, which is the owner's call.
-
-Until PR B, yt-dlp, yt-dlp-ejs and Deno run inside the fetcher container: on
-the `fetcher` network beside the reverse proxy (they can reach every port it
-listens on there, and through it the app's origin and the core), as the UID
-that owns the fetcher's `/tmp` job directories and results, and able to read
-the server's environment. PR A alone does not meet the threat paragraph's
-reverse-proxy and request/response goals; the runner split in PR B does, and
-a release without PR B must first make the server non-dumpable (see
-**Dropped**). The isolated gateway mode also means the host has no route to
-the internal networks, so the reverse proxy must be a container on them.
+ports from elsewhere); nothing else may join `outside`. A compromised
+forwarder shares `egress` with the runner and can reach its port 8080 there,
+where the runner answers its health path, a well-formed job request, which
+runs yt-dlp through the forwarder itself, and that job's audio request: it
+could keep the runner's one job slot and its workers busy, or make it
+discard an uncollected result, so that fetches fail, and it never sees a
+token the fetcher minted. A compromised runner shares `jobs` with the
+fetcher and can reach its port 8080 there: the Origin check needs only the
+public origin, which the example keeps out of the runner's container (it
+gets none of `.env` but its three limits) but which is no secret, so the
+check is not counted on to keep the runner out, the rate limit keys on the runner's
+address (so `TRUSTED_PROXIES` must never cover `jobs`; the example sets
+the fetcher's to empty, because Docker may give `jobs` another subnet when
+it recreates the network), and it learns the job IDs of its own
+submissions, never a browser's, so it can submit jobs that come back to
+itself and nothing more, which adds nothing to what the forwarder already
+gives it. Binding the
+fetcher to its `fetcher` address alone would need a fixed subnet and
+address in the example; the owner declined that on 2026-11-05 and accepts
+this path as a documented risk. Nothing a yt-dlp run starts outlives it:
+the runner kills the run's process group when the run ends, and its
+kill-and-reap sweep at both run boundaries ends and reaps what left the
+group, so a run's child can't keep the runner's reach between jobs, touch
+the next job's files or hold a share of `pids_limit`; and the runner is
+non-dumpable, so such a child can't hide in it by ptrace either, whatever
+the host's `ptrace_scope`. What a run can leave behind is files: the runner
+removes the job directory and the results it tracks, not what a run wrote
+elsewhere on its `/tmp`. Nothing reads such a file back and `noexec` keeps
+it from running, but it can fill the tmpfs, and every later fetch then
+fails, while `/healthz` still answers, until the runner is restarted;
+clearing `/tmp` at the run boundary is not built yet. The sweep's cost is
+accepted (owner, 2026-11-05): a `docker exec` or health check running in
+the runner's container at a run boundary is killed too, and the runner must
+be that container's PID 1. The health check's retries absorb a coincidence,
+not an adversary: a run can time its exit to the checks, or fill
+`pids_limit`, and make the runner read unhealthy, so nothing in the example
+acts on the runner's health status and nothing should restart the runner
+on it. A runner that can't sweep refuses to start; an operator who sets
+`FETCH_ALLOW_NO_SWEEP=true` accepts the residual the sweep removes (a child
+of a run that left its process group keeps running between jobs with the
+runner's reach in its container, and zombies hold a share of `pids_limit`)
+as the operator's own risk. The
+runner still opens every result `O_NOFOLLOW` and `O_NONBLOCK` and holds and
+serves only a regular file within `FETCH_MAX_BYTES`. The isolated gateway mode also means the
+host has no route to the internal networks, so the reverse proxy must be a
+container on them.
 
 **Checks and their tests.** Every check gets its failing test before its code
 (section 12), and the verification panel removes each check and expects a
@@ -910,15 +1080,20 @@ test to fail.
 | G8 | Concurrent tunnels and new tunnels per minute are capped | unit | PR A |
 | G9 | Upload and download bytes are capped, with an idle timeout and a lifetime | unit; in-image for the download cap against the pinned yt-dlp's range size | PR A |
 | G10 | Logs hold the name and the reason only | unit | PR A |
-| R1 | The runner accepts only a valid video ID, and one job at a time | unit | PR B |
-| R2 | The runner builds yt-dlp's environment from scratch, with the proxy settings | unit (today's tests move) | PR B |
-| R3 | The runner deletes its job directory in `finally`, and the audio once collected or after a deadline | unit | PR B |
-| S1 | The fetcher caps, times out and re-validates everything the runner returns | unit, with a fake runner | PR B |
+| R1 | The runner accepts only `POST /jobs` with a small JSON object of exactly a valid video ID and a 32-hex token, and one job at a time: a second `POST`, or an audio `GET`, during a run or a stream gets 503 `busy`; `/healthz` still answers | unit | PR B |
+| R2 | The runner builds yt-dlp's environment from scratch: fixed values, `HOME` and `DENO_DIR` in the job directory, and exactly the proxy variables its own settings read (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, uppercase, `http://` only, no credentials); the fetcher reads no proxy variable | unit (the fetcher's former tests move) | PR B |
+| R3 | The runner deletes its job directory in `finally` on every path; the audio is served once and deleted, deleted when a new job starts, `COLLECT_DEADLINE_SECONDS` (60) after the run if uncollected, and on shutdown, so at most one audio file is on its `/tmp` at any time | unit; in-image | PR B |
+| R4 | The runner's log holds method, path with the token masked, status and duration only; never a video ID, a title, a token, an address or yt-dlp's output | unit | PR B |
+| S1 | The fetcher sends the runner only the validated ID and a token it minted, never its job ID, and consults no proxy variable; it fails the job (nothing left behind, never retried) on any answer that is not status 200 with exactly one `Content-Type` and `Content-Length`, no `Transfer-Encoding`, JSON of at most 256 KiB of the shape `{status, info}` or `{status, error}`, or audio of 1 to `FETCH_MAX_BYTES` bytes of `audio/mp4` within the per-read and total deadlines; it re-validates the metadata with `parse_info`, follows no redirect, accepts nothing past the declared length, and ends each exchange only at the runner's close, which comes after the runner let go of its one-job lock, so its next request never finds it busy | unit, with a fake runner; the fetcher's flow against a real runner with the stub yt-dlp | PR B |
 | S2 | The fetcher (PR A) and the runner (PR B) refuse to start with a default route, or an unreadable or unparsable route table, unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`), in-image and Compose topology tests | PR A (the fetcher), PR B (the runner) |
+| R5 | The runner's kill-and-reap sweep runs only as its container's PID 1, at both run boundaries, never while a `Popen` is in flight; where it can't run, the entry exits 4 before building the server unless `FETCH_ALLOW_NO_SWEEP=true` (parsed like `FETCH_ALLOW_DEFAULT_ROUTE`; a bad value exits 2), which never turns the sweep off as PID 1; the example runs the runner as PID 1 and never sets the override | unit (fake `kill`, `waitpid` and `getpid` that never pass -1 on); in-image as PID 1 (a real sweep of a run's leftovers); Compose topology tests (no init, the exact command, no override, `/proc/1/cmdline` in the running runner) | PR B |
+| R6 | The example gives the runner's container only the runner's own settings: no `env_file`, the three limits `FETCH_MAX_SECONDS`, `FETCH_MAX_BYTES` and `FETCH_TIMEOUT_SECONDS` from `.env` by name, and `HTTPS_PROXY` on the service, so that a health check or `docker exec` there, whose environment yt-dlp can read, holds no `PUBLIC_ORIGIN`, no setting of the core and nothing else from `.env` | Compose topology tests (static: no `env_file` in the runner's block, and the exact names of its resolved environment against an env file that also sets `PUBLIC_ORIGIN`, `TRUSTED_PROXIES` and a stand-in for an operator's own variable; running: what a process started in the runner's container sees) | PR B |
 | I1 | The base interpreter's site-packages hold no third-party distribution and no `.pth` file, and its `sys.path` leaves out the venv; no build step after the wheels' install starts the venv's interpreter or compiles the venv with site enabled, and the venv's bytecode is current for the image's interpreter | in-image; unit (static read of `fetcher/Dockerfile`) | PR A |
-| T1 | In the compose layout, the fetcher (PR A) and the runner (PR B) have no default route and resolve no external name, and the host has no IPv4 or IPv6 address on their internal networks (also with IPv6 turned on for such a network); the forwarder has the only default route, and the fetcher image refuses to start on `outside` unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | Compose topology tests | PR A, extended in PR B |
-| T2 | PR A: the fetcher reaches the forwarder over `egress`, the forwarder reaches nothing on the `fetcher` network and nothing there reaches it, and the fetcher and the forwarder have forwarding 0 on every interface and every `accept_redirects` 0 (a container with the forwarder's settings routes no datagram between two networks, against a control router that does). PR B: the runner reaches the forwarder and nothing on the `fetcher` network, and the fetcher can't reach the forwarder | Compose topology tests | PR A, reworded in PR B |
-| T3 | The running forwarder refuses an unlisted name, an IP literal, port 80 and other methods before DNS, and logs the name and the reason only | Compose topology tests | PR A |
+| I2 | The venv is filled by the base interpreter's `pip install --prefix /opt/yt-dlp`; no build step, the install included, runs pip under the venv's interpreter (`--python`) or starts it; no second install into the venv follows the first; the wheels' scripts land in `/opt/yt-dlp/bin`, none in the base prefix | unit (static read of `fetcher/Dockerfile`); in-image | PR B |
+| K1 | Every container of the fetcher image (fetcher, runner, forwarder) has `forwarding` 0 for `default`, `lo` and each attachment's interface, never the global switch, `accept_redirects` 0 for `all`, `default`, `lo` and each interface, no IPv6 sysctl, and a `pids_limit` of at least twice its worst case from the code's caps | Compose topology tests (static and running; a container with the forwarder's settings routes no datagram between two networks, against a control router that does) | PR A (the fetcher and the forwarder), PR B (the runner) |
+| T1 | In the compose layout, the fetcher and the runner have no default route (IPv4 or IPv6), each resolves its own peer (the fetcher the runner, the runner the forwarder) and no external name, the fetcher can't resolve the forwarder, and the host has no IPv4 or IPv6 address on `fetcher`, `jobs` or `egress` (also with IPv6 turned on for such a network); the forwarder has the only default route, and the fetcher's CMD and the runner's command each refuse to start on `outside` unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | Compose topology tests | PR A, extended in PR B |
+| T2 | The runner reaches the forwarder over `egress`; the fetcher can't reach the forwarder while it reaches the runner over `jobs`; the forwarder can't reach either fetcher address while it reaches the runner over `egress`; nothing on the `fetcher` network reaches the forwarder or the runner, and nothing on `jobs` reaches the forwarder; all three containers run the base interpreter with `-I` | Compose topology tests | PR A, reworded in PR B |
+| T3 | The running forwarder refuses an unlisted name, an IP literal, port 80 and other methods before DNS, and logs the name and the reason only (run from the runner, the only container that reaches it) | Compose topology tests | PR A |
 
 ## 7. Web app
 
@@ -1017,7 +1192,9 @@ going off-site.
   equal to `PUBLIC_ORIGIN` (no `Referer` fallback). Request bodies are
   `audio/wav` or `application/json` only.
 - **Client IP:** `X-Forwarded-For` is honoured only from `TRUSTED_PROXIES`, which
-  is empty by default.
+  is empty by default. The example sets the fetcher's to empty whatever
+  `.env` says, and it must never cover `jobs`, where the runner's requests
+  come from (6.1).
 - **Escaping:** server-rendered text is escaped, and the client uses
   `textContent` only.
 - **Decoder isolation:** see 5.2, 5.3 and 6. Downloads always carry
@@ -1030,8 +1207,8 @@ going off-site.
   a slot indefinitely. The proxy handles slow-client defence beyond that.
 - **Egress (fetcher):** the fetcher image's own forwarder is the only way
   out: one CONNECT allowlist to YouTube's hosts on port 443, within budgets.
-  From PR B, yt-dlp runs in a container that shares no network with the
-  reverse proxy (6.1).
+  yt-dlp runs in a container that shares no network with the reverse proxy
+  (6.1).
 
 ## 9. Supply chain, CI and releases
 
@@ -1074,19 +1251,24 @@ Local jobs run with `permissions: contents: read`:
   allowlist, `--network none` and `read_only`.
 - **Fetcher image tests** (from milestone 5 on): the fetcher image built the
   same way (in its own cache scope), then `tests/image_fetcher` in it under
-  the same flags with a 96 MB tmpfs: the container contract, the venv's
-  yt-dlp and yt-dlp-ejs against the lock and each other, the base
-  interpreter holding no distribution (I1), one yt-dlp range plus headroom
-  fitting the forwarder's download cap, Deno under the fetcher's `prlimit`
-  set, the real yt-dlp accepting the exact argument list (offline), the CMD
-  answering `/fetch/healthz` with no default route, the forwarder command
-  answering refusals without DNS, and the fetcher's and the forwarder's unit
-  tests again under the image's Python 3.12, with the yt-dlp stub.
+  the same flags with a 96 MB tmpfs (more than either container's `/tmp`,
+  because one container runs the fetcher's and the runner's suites): the
+  container contract, the venv's yt-dlp and yt-dlp-ejs against the lock and
+  each other, the base interpreter holding no distribution (I1), the venv's
+  scripts in the venv and none in the base prefix (I2), one yt-dlp range
+  plus headroom fitting the forwarder's download cap, Deno under the
+  runner's `prlimit` set, the real yt-dlp accepting the exact argument list
+  (offline), the CMD answering `/fetch/healthz` with no default route, the
+  runner command answering `/healthz`, failing an offline fetch and leaving
+  its scratch empty, the forwarder command answering refusals without DNS,
+  and the fetcher's, the runner's and the forwarder's unit tests again under
+  the image's Python 3.12, with the yt-dlp stub.
 - **Compose topology tests** (from the egress follow-up's PR A on): the job
   builds the fetcher image as `strange_ringtone-fetcher:ci`, reading the
   fetcher job's cache scope without writing it so the two jobs never race on
-  one scope, brings up `compose.example.yaml` without any YouTube traffic,
-  and checks T1 to T3 of section 6.1. It runs `tests/compose/`, which is
+  one scope, brings up `compose.example.yaml` (the fetcher, the runner and
+  the forwarder) without any YouTube traffic, and checks T1 to T3 and K1 of
+  section 6.1. It runs `tests/compose/`, which is
   skipped unless `STRANGE_RINGTONE_COMPOSE_TESTS=1`, with the image tag
   passed in `STRANGE_RINGTONE_COMPOSE_IMAGE` (default
   `strange_ringtone-fetcher:local`), under a unique project name, a
@@ -1257,12 +1439,14 @@ fetcher/
   Dockerfile  requirements.in  requirements.txt   # yt-dlp and yt-dlp-ejs, hashed lock, installed into the /opt/yt-dlp venv
   __main__.py               # checkout entry point: python -I fetcher; puts ../core on sys.path
   forwarder.py              # the forwarder's entry point: python -I fetcher/forwarder.py; puts only fetcher/ on sys.path
-  strange_ringtone_fetch/{__init__,__main__,config,server,jobs,routes,ytdlp}.py   # imports only config and http_guard from core
+  runner.py                 # the runner's entry point: python -I fetcher/runner.py; puts ../core and fetcher/ on sys.path
+  strange_ringtone_fetch/{__init__,__main__,config,server,jobs,routes,metadata,runner_client}.py   # imports only config and http_guard from core
+  strange_ringtone_runner/{__init__,__main__,config,server,ytdlp}.py   # yt-dlp's container: imports config and http_guard from core, config, metadata and routes from the fetcher
   strange_ringtone_forwarder/{__init__,__main__,policy,server}.py   # the CONNECT gate: stdlib only, imports nothing from core or the fetcher
 tests/  tests/corpus/  tests/image/  tests/image_fetcher/  tests/compose/  tests/stubs/{ffmpeg_stub,ytdlp_stub}.py  tests/js/
 scripts/{check_pr_title.py,check_contract_change.py,check_ffmpeg_release.py}   # stdlib checks CI runs
 tools/spike/phase0.py       # regenerates the iOS test tones into spike-out/
-tools/dev_fetch_stack.py    # loopback dev stack: core, stubbed fetcher and one origin, for the offline product check
+tools/dev_fetch_stack.py    # loopback dev stack: core, runner with the stub, fetcher, one origin, for the offline product check
 .github/{dependabot.yml,workflows/{ci,pr-checks,security_gate,release-please,ffmpeg-watch}.yml}
 release-please-config.json  .release-please-manifest.json
 docs/PLAN.md
@@ -1365,11 +1549,11 @@ docs/PLAN.md
    The product check runs offline: the UI is driven in a browser against
    `tools/dev_fetch_stack.py`, which serves the core and the fetcher with the
    stubbed yt-dlp on one loopback origin, so no YouTube traffic leaves the
-   development machine. Still open: the owner's decision on one real fetch
-   from a throwaway container before v0.1.0, to confirm that
-   `bestaudio[ext=m4a]` is still served without a PO token; without it the
-   first real fetch happens in a deployment. Also open: the owner's phone test
-   of the Shortcut.
+   development machine. The one real fetch from throwaway containers before
+   v0.1.0, to confirm that `bestaudio[ext=m4a]` is still served without a PO
+   token, was made by 6.1's product checks with the owner's approval: on
+   2026-11-05, through the fetcher, the runner and the forwarder, it was.
+   Still open: the owner's phone test of the Shortcut.
 
    **Follow-up: egress confinement (section 6.1, decided on 2026-11-03).** Two
    PRs before the release, one after the other, because their files overlap:
@@ -1399,14 +1583,22 @@ docs/PLAN.md
      - the **Compose topology tests** job (T1 to T3, in PR A's wording)
      - the README contract, `.env.example`, CLAUDE.md and section 6
 
-     The fetcher still runs yt-dlp itself, through the forwarder. If the
-     owner agrees, its product check makes the one real fetch still open
-     above, through the forwarder, and sizes the budgets from it; until
-     then the forwarder's limits are provisional.
-   - **PR B**, branch `feat/fetcher-runner`, from `main` after PR A merges:
-     the runner command and its protocol, the fetcher's runner client, the
-     `jobs` network (`egress` moves from the fetcher to the runner), the dev
-     stack, and the same documentation.
+     With PR A alone the fetcher still ran yt-dlp itself, through the
+     forwarder. PR B's product check made the real fetch through the
+     fetcher, the runner and the forwarder on 2026-11-05: six tunnels, one
+     at a time, all to allowed names, none refused or cut, and every
+     forwarder limit held with headroom (at most 975,753 bytes down in one
+     tunnel against 16 MiB). The limits stay provisional until the release
+     fixes the contract.
+   - **PR B**, branch `feat/fetcher-runner`, delivered: the runner command
+     and its protocol (R1 to R4), the fetcher's runner client (S1), the
+     runner's start check (S2), the `jobs` network (`egress` moved from the
+     fetcher to the runner), `FETCH_RUNNER_URL`, the venv filled with
+     `pip install --prefix` (I2), the kernel settings and pids cap on the
+     runner (K1), the runner's kill-and-reap sweep as PID 1 and its refusal
+     to start where it can't sweep (R5), the fetcher's
+     empty `TRUSTED_PROXIES` in the example, T1 to T3 for the final layout,
+     the dev stack with the runner in-process, and the same documentation.
 
    Each PR runs test first. A spec maps 6.1's check IDs to interfaces and test
    files. The tests are written, seen to fail for the right reason, reviewed

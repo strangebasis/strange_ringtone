@@ -1,8 +1,9 @@
-"""The fetcher's default-route start check (strange_ringtone_fetch.routes and its entry point, S2).
+"""The default-route start check (strange_ringtone_fetch.routes and the fetcher's and runner's entry points, S2).
 
-The fetcher reaches YouTube only through the forwarder, so its entry point
-refuses to start when the kernel's route tables hold a default route, or when
-they can't be read or understood (docs/PLAN.md 6.1). The parser tests feed it
+The fetcher reaches only its runner and the runner reaches YouTube only
+through the forwarder, so both entry points refuse to start when the kernel's
+route tables hold a default route, or when they can't be read or understood
+(docs/PLAN.md 6.1). The parser tests feed it
 text in the kernel's exact formats; the tree tests use a temporary directory
 as /proc/net; the entry tests patch the check and the server, so nothing here
 reads the host's routes or opens a socket. Only RealKernelTest reads the real
@@ -26,6 +27,7 @@ from strange_ringtone_fetch import __main__ as entry
 from strange_ringtone_fetch import routes
 from strange_ringtone_fetch.config import Settings
 from strange_ringtone_fetch.routes import DefaultRoute, RouteError, default_routes, parse_ipv4_routes, parse_ipv6_routes
+from strange_ringtone_runner import __main__ as runner_entry
 
 ORIGIN = "https://ringtones.example.internal"
 # The entry point's own code for "refused because of the route table",
@@ -381,7 +383,9 @@ class FakeServer:
 
     started: list[tuple[str, int]]
 
-    def __init__(self, address: tuple[str, int], settings: Settings) -> None:
+    # sweep_strays: the runner's entry always passes its PID-1 decision
+    # (tests/test_fetcher_runner_sweep.py tests it); the fetcher's passes none.
+    def __init__(self, address: tuple[str, int], settings: Settings, sweep_strays: bool = False) -> None:
         FakeServer.started.append(address)
 
     def serve_forever(self) -> None:
@@ -483,6 +487,120 @@ class EntryRouteCheckTest(unittest.TestCase):
         # interface, which would describe the deployment's network in its logs.
         found = (DefaultRoute("IPv4", "eth0"), DefaultRoute("IPv4", "ens5"), DefaultRoute("IPv6", "wg-site0"))
         code, stderr, _ = self.run_main({"PUBLIC_ORIGIN": ORIGIN}, return_value=found)
+        self.assertEqual(code, EXIT_ROUTE, stderr)
+        self.assertIn("FETCH_ALLOW_DEFAULT_ROUTE", stderr)
+        self.assertIn("IPv4", stderr)
+        for device in ("eth0", "ens5", "wg-site0"):
+            self.assertNotIn(device, stderr)
+        # Each family once, however many routes it has.
+        self.assertEqual(stderr.count("IPv4"), 1, stderr)
+
+
+class RunnerEntryRouteCheckTest(unittest.TestCase):
+    """S2 for the runner: its main() checks the routes after the settings and before RunnerServer, and exits 3.
+
+    The runner is the container yt-dlp runs in, so a default route there is
+    the very egress the forwarder exists to replace. The same check
+    (strange_ringtone_fetch.routes), the same order and the same messages as
+    the fetcher's entry, under the runner's own name; the runner has no
+    required setting, so an empty environment is a valid one.
+    """
+
+    PREFIX = "strange_ringtone_runner: "
+
+    def run_main(self, environ: dict[str, str], **check: Any) -> tuple[int, str, mock.MagicMock]:
+        FakeServer.started = []
+        log = io.StringIO()
+        # signal.signal itself: the entry must not leave a SIGTERM handler in
+        # the test process; nor, on Linux, a non-dumpable test process.
+        with mock.patch.dict(os.environ, environ, clear=True), \
+                mock.patch.object(runner_entry, "default_routes", create=True, **check) as patched, \
+                mock.patch.object(runner_entry, "RunnerServer", FakeServer), \
+                mock.patch.object(runner_entry, "make_not_dumpable"), \
+                mock.patch.object(runner_entry, "sweep_is_safe_here", return_value=True), \
+                mock.patch("signal.signal"), \
+                contextlib.redirect_stderr(log):
+            code = runner_entry.main(["--bind", "127.0.0.1"])
+        return code, log.getvalue(), patched
+
+    def test_a_default_route_exits_3_before_the_server_starts(self) -> None:
+        # S2 refusal: the server is never built, so the port is never bound.
+        cases = {
+            "IPv4": (DefaultRoute("IPv4", "eth0"),),
+            "IPv6": (DefaultRoute("IPv6", "eth0"),),
+            "IPv4, IPv6": (DefaultRoute("IPv4", "eth0"), DefaultRoute("IPv6", "eth0")),
+        }
+        for families, found in cases.items():
+            with self.subTest(families=families):
+                code, stderr, patched = self.run_main({}, return_value=found)
+                self.assertEqual(code, EXIT_ROUTE, stderr)
+                self.assertEqual(FakeServer.started, [])
+                patched.assert_called_once()
+                self.assertIn(self.PREFIX + "refusing to start", stderr)
+                self.assertIn(f"default route ({families})", stderr)
+                self.assertIn("FETCH_ALLOW_DEFAULT_ROUTE", stderr)
+                self.assertNotIn("listening", stderr)
+
+    def test_an_unreadable_route_table_exits_3(self) -> None:
+        # S2 refusal: a table that can't be read is not "no default route".
+        code, stderr, patched = self.run_main({}, side_effect=RouteError("cannot read /proc/net/route"))
+        self.assertEqual(code, EXIT_ROUTE, stderr)
+        self.assertEqual(FakeServer.started, [])
+        patched.assert_called_once()
+        self.assertIn(self.PREFIX + "refusing to start", stderr)
+        self.assertIn("cannot read /proc/net/route", stderr)
+        self.assertIn("FETCH_ALLOW_DEFAULT_ROUTE", stderr)
+
+    def test_no_default_route_starts(self) -> None:
+        # S2 acceptance: with no default route the check runs, once, on the
+        # real /proc/net, and the server starts on the fixed port.
+        for environ in ({}, {"FETCH_ALLOW_DEFAULT_ROUTE": "false"}, {"FETCH_ALLOW_DEFAULT_ROUTE": ""}):
+            with self.subTest(environ=environ):
+                code, stderr, patched = self.run_main(environ, return_value=())
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(FakeServer.started, [("127.0.0.1", 8080)])
+                patched.assert_called_once()
+                self.assertIn(patched.call_args, (mock.call(), mock.call(routes.PROC_NET),
+                                                  mock.call(proc_net=routes.PROC_NET)))
+                self.assertNotIn("refusing", stderr)
+                self.assertNotIn("FETCH_ALLOW_DEFAULT_ROUTE is set", stderr)
+                self.assertIn("strange_ringtone_runner listening on 127.0.0.1:8080", stderr)
+
+    def test_the_override_skips_the_check_and_says_so(self) -> None:
+        # S2: with the override the tables are not read at all (so a missing
+        # /proc doesn't matter), and one stderr line says the check is off.
+        for value in ("true", "1", "yes", "TRUE"):
+            with self.subTest(value=value):
+                code, stderr, patched = self.run_main(
+                    {"FETCH_ALLOW_DEFAULT_ROUTE": value}, return_value=(DefaultRoute("IPv4", "eth0"),))
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(FakeServer.started, [("127.0.0.1", 8080)])
+                patched.assert_not_called()
+                self.assertIn(self.PREFIX + "FETCH_ALLOW_DEFAULT_ROUTE is set", stderr)
+                self.assertNotIn("refusing", stderr)
+
+    def test_configuration_errors_come_first(self) -> None:
+        # S2: a bad setting exits 2 before the tables are read, and a bad
+        # override value is a configuration error, never permission.
+        cases = (
+            ({"FETCH_MAX_SECONDS": "0"}, "FETCH_MAX_SECONDS"),
+            ({"FETCH_ALLOW_DEFAULT_ROUTE": "on"}, "FETCH_ALLOW_DEFAULT_ROUTE"),
+            ({"FETCH_ALLOW_DEFAULT_ROUTE": " true"}, "FETCH_ALLOW_DEFAULT_ROUTE"),
+        )
+        for environ, name in cases:
+            with self.subTest(environ=environ):
+                code, stderr, patched = self.run_main(environ, return_value=(DefaultRoute("IPv4", "eth0"),))
+                self.assertEqual(code, 2, stderr)
+                self.assertEqual(FakeServer.started, [])
+                patched.assert_not_called()
+                self.assertIn(self.PREFIX + "configuration error", stderr)
+                self.assertIn(name, stderr)
+
+    def test_the_message_names_no_device_or_address(self) -> None:
+        # S2: the refusal names the families and the override, never the
+        # interface, which would describe the deployment's network in its logs.
+        found = (DefaultRoute("IPv4", "eth0"), DefaultRoute("IPv4", "ens5"), DefaultRoute("IPv6", "wg-site0"))
+        code, stderr, _ = self.run_main({}, return_value=found)
         self.assertEqual(code, EXIT_ROUTE, stderr)
         self.assertIn("FETCH_ALLOW_DEFAULT_ROUTE", stderr)
         self.assertIn("IPv4", stderr)

@@ -1,13 +1,16 @@
-"""I1 at build time: once the venv's wheels are in, no build step runs their code as root (fetcher/Dockerfile).
+"""I1 and I2 at build time: no build step runs the venv's code as root (fetcher/Dockerfile).
 
 The site module runs every `.pth` line in a site-packages directory when an
 interpreter starts with site enabled on it. A malicious yt-dlp or yt-dlp-ejs
 release (docs/PLAN.md 6.1) can ship such a line, and every RUN step is root,
 so a step that starts the venv's interpreter after the install would hand that
-line root's rights over the base interpreter, the fetcher and the forwarder
-run on, before any in-image check looks. pip's --python is allowed only for
-the install itself: it starts the venv's interpreter while the venv is still
-empty, and site reads `.pth` files only at startup.
+line root's rights over the base interpreter, the fetcher, the runner and the
+forwarder run on, before any in-image check looks. So the venv is filled by
+the base interpreter's pip through --prefix /opt/yt-dlp (I2), and pip never
+runs under the venv's interpreter at all: a --python naming the venv is
+refused in every step, the install included, because it would start the
+venv's interpreter while pip writes the wheels into it. A second install into
+the venv after the first is refused too: only the hashed lock goes in.
 
 This reads fetcher/Dockerfile on the host, so it runs on every PR without
 Docker; the in-image suite checks the bytecode the build left behind. The
@@ -25,8 +28,11 @@ import helpers
 
 DOCKERFILE = helpers.ROOT / "fetcher" / "Dockerfile"
 VENV = "/opt/yt-dlp"
-# The install step: pip filling the venv through --python.
-_INSTALL_RE = re.compile(r"--python(=|\s+)" + re.escape(VENV) + r"(/bin/python)?\b")
+# The install step: the base interpreter's pip filling the venv through
+# --prefix, so no interpreter has the venv on its path while the wheels go in.
+_INSTALL_RE = re.compile(r"--prefix(=|\s+)" + re.escape(VENV) + r"\b")
+# What venv_hazards reports when it finds no such step: fail closed.
+NOT_FOUND = "no RUN step installs into the venv with pip --prefix"
 # Shell control operators split a RUN line into simple commands.
 _OPERATORS = {"&&", "||", ";", "|", "&", "(", ")", ";;", "|&"}
 # python, python3, python3.12 and the like, by basename.
@@ -41,6 +47,48 @@ _RELATIVE_BIN = "yt-dlp/bin"
 
 def _names_venv(text: str) -> bool:
     return VENV in text or _RELATIVE_BIN in text
+
+
+def _program_index(argv: list[str]) -> int | None:
+    # The first token that is not a VAR=value assignment: the program.
+    return next((index for index, token in enumerate(argv) if "=" not in token), None)
+
+
+def _is_install(argv: list[str]) -> bool:
+    # The venv's install: a pip install naming the venv as its --prefix, run
+    # by the base interpreter (a bare python, never a path into the venv).
+    if "install" not in argv or not _INSTALL_RE.search(" ".join(argv)):
+        return False
+    start = _program_index(argv)
+    return start is not None and _PYTHON_RE.match(argv[start]) is not None
+
+
+def _option_values(argv: list[str], option: str) -> list[str]:
+    # Every value given to a long option, as "--option value" or "--option=value".
+    values: list[str] = []
+    for index, token in enumerate(argv):
+        if token == option and index + 1 < len(argv):
+            values.append(argv[index + 1])
+        elif token.startswith(option + "="):
+            values.append(token.partition("=")[2])
+    return values
+
+
+def _pip_python_on_venv(argv: list[str]) -> bool:
+    # pip --python starts the named interpreter and runs pip under it: with
+    # the venv's interpreter that is the venv's site, and its .pth lines,
+    # while pip writes the wheels in.
+    return any(_names_venv(value) for value in _option_values(argv, "--python"))
+
+
+def _installs_into_venv(argv: list[str]) -> bool:
+    # --prefix or --target naming the venv, by its full path or relative to a
+    # parent ("yt-dlp/..." after a cd to /opt): any second install into it.
+    return any(
+        _names_venv(value) or "yt-dlp" in value
+        for option in ("--prefix", "--target")
+        for value in _option_values(argv, option)
+    )
 
 
 def instructions(text: str) -> list[tuple[str, str]]:
@@ -111,7 +159,7 @@ def _interpreter_flags(argv: list[str], start: int) -> set[str]:
 def _is_site_free_compile(argv: list[str]) -> bool:
     # The one form allowed to name the venv after the install: the base
     # interpreter, isolated and without site, compiling it.
-    start = next((index for index, token in enumerate(argv) if "=" not in token), None)
+    start = _program_index(argv)
     if start is None or not _PYTHON_RE.match(argv[start]):
         return False
     if not {"I", "S"} <= _interpreter_flags(argv, start):
@@ -126,12 +174,14 @@ def _is_site_free_compile(argv: list[str]) -> bool:
 def venv_hazards(text: str) -> tuple[list[str], list[list[str]]]:
     """(problems, the site-free compiles of the venv) for every build step after the venv's install.
 
-    A problem is any later step that names the venv's bin directory, uses
-    pip's --python again, sets anything to a path in the venv, starts any
-    interpreter on a file or directory in the venv other than a site-free
-    compile, compiles the venv without -I and -S, or names the venv in any
-    other way (a cd or WORKDIR into it, a COPY onto it): this is a tripwire
-    for our own Dockerfile, so it fails closed rather than model the shell.
+    A problem is a pip --python naming the venv in any step up to and
+    including the install (I2), and any later step that names the venv's bin
+    directory, uses pip's --python at all, installs into the venv again, sets
+    anything to a path in the venv, starts any interpreter on a file or
+    directory in the venv other than a site-free compile, compiles the venv
+    without -I and -S, or names the venv in any other way (a cd or WORKDIR
+    into it, a COPY onto it): this is a tripwire for our own Dockerfile, so
+    it fails closed rather than model the shell.
     """
     problems: list[str] = []
     compiles: list[list[str]] = []
@@ -141,7 +191,9 @@ def venv_hazards(text: str) -> tuple[list[str], list[list[str]]]:
             if keyword == "RUN":
                 steps = commands(arguments)
                 for index, argv in enumerate(steps):
-                    if _INSTALL_RE.search(" ".join(argv)) and "install" in argv:
+                    if _pip_python_on_venv(argv):
+                        problems.append(f"{shlex.join(argv)}: pip --python runs pip under the venv's interpreter")
+                    if _is_install(argv):
                         installed = True
                         problems.extend(_check(steps[index + 1:], compiles))
                         break
@@ -157,7 +209,7 @@ def venv_hazards(text: str) -> tuple[list[str], list[list[str]]]:
         elif keyword == "RUN":
             problems.extend(_check(commands(arguments), compiles))
     if not installed:
-        problems.append("no RUN step installs into the venv with pip --python")
+        problems.append(NOT_FOUND)
     return problems, compiles
 
 
@@ -167,6 +219,10 @@ def _check(steps: list[list[str]], compiles: list[list[str]]) -> list[str]:
         line = shlex.join(argv)
         if any(token == "--python" or token.startswith("--python=") for token in argv):
             problems.append(f"{line}: pip --python starts the venv's interpreter after its wheels are in")
+            continue
+        if _installs_into_venv(argv):
+            # Only the hashed lock goes in, once (I2).
+            problems.append(f"{line}: installs into the venv a second time")
             continue
         if any(f"{VENV}/bin" in token for token in argv):
             problems.append(f"{line}: names the venv's bin directory, its interpreter or scripts")
@@ -200,19 +256,92 @@ def _with_compile_step(text: str, replacement: str) -> str:
     return text.replace(old, replacement)
 
 
+def _has_option(argv: list[str], option: str, value: str) -> bool:
+    # "--option value" as two tokens, or "--option=value" as one.
+    pairs = zip(argv, argv[1:], strict=False)
+    return (option, value) in pairs or f"{option}={value}" in argv
+
+
 class VenvBuildStepTest(unittest.TestCase):
-    """I1: after the venv's install, no build step starts an interpreter that reads its .pth files."""
+    """I1 and I2: pip never runs under the venv's interpreter, and after the install no step reads its .pth files."""
+
+    # The install's venv option, as fetcher/Dockerfile writes it (I2).
+    PREFIX = "--prefix /opt/yt-dlp"
 
     def setUp(self) -> None:
         with DOCKERFILE.open(encoding="utf-8") as handle:
             self.text = handle.read()
 
+    def assertInstallFound(self, problems: list[str]) -> None:
+        # A refusal must come from the step under test, never from a
+        # Dockerfile whose install the reader didn't recognise.
+        self.assertNotIn(NOT_FOUND, problems)
+
     def test_no_step_after_the_install_runs_the_venvs_pth_lines(self) -> None:
+        # I1/I2 acceptance on the real Dockerfile: the install is found and
+        # nothing before, in or after it is a problem.
         problems, compiles = venv_hazards(self.text)
         self.assertEqual(problems, [])
         # Acceptance: the bytecode is still compiled, by the base interpreter
         # without site, which shares the venv interpreter's cache tag.
         self.assertEqual(compiles, [["python", "-I", "-S", "-m", "compileall", "-q", "/opt/yt-dlp/lib"]])
+
+    def test_the_install_is_the_base_interpreters_prefix_install(self) -> None:
+        # I2: exactly one step installs into the venv, and it is the base
+        # interpreter's pip writing to the venv's prefix with the hashed lock,
+        # right after the venv is created without pip, in the same RUN.
+        installs: list[tuple[list[str], list[str] | None]] = []
+        for keyword, arguments in instructions(self.text):
+            if keyword != "RUN":
+                continue
+            steps = commands(arguments)
+            for index, argv in enumerate(steps):
+                if "install" in argv and any(_names_venv(token) for token in argv):
+                    installs.append((argv, steps[index - 1] if index else None))
+        self.assertEqual(len(installs), 1, installs)
+        argv, previous = installs[0]
+        self.assertEqual(argv[:4], ["python", "-m", "pip", "install"], argv)
+        self.assertTrue(_has_option(argv, "--prefix", VENV), argv)
+        self.assertIn("--require-hashes", argv)
+        self.assertIn("--no-deps", argv)
+        self.assertTrue(_has_option(argv, "--only-binary", ":all:"), argv)
+        self.assertTrue(_has_option(argv, "-r", "/app/fetcher/requirements.txt"), argv)
+        self.assertFalse([token for token in argv if token == "--python" or token.startswith("--python=")], argv)
+        self.assertEqual(previous, ["python", "-m", "venv", "--without-pip", VENV])
+        # The reader recognises exactly this step as the install.
+        self.assertTrue(_is_install(argv))
+
+    def test_pip_python_on_the_venv_is_refused_anywhere(self) -> None:
+        # I2: pip under the venv's interpreter is refused before, in and
+        # after the install, and an install the venv's own interpreter runs
+        # is not the install.
+        self.assertIn(self.PREFIX, self.text, "fetcher/Dockerfile's install no longer uses --prefix; update this test")
+        create = "RUN python -m venv --without-pip /opt/yt-dlp \\\n"
+        install = "&& python -m pip install"
+        self.assertIn(create, self.text)
+        self.assertIn(install, self.text)
+        cases = {
+            "the install through --python": self.text.replace(self.PREFIX, "--python /opt/yt-dlp/bin/python"),
+            "--python on the install too": self.text.replace(
+                self.PREFIX, self.PREFIX + " --python /opt/yt-dlp/bin/python"),
+            "--python= on the install too": self.text.replace(self.PREFIX, self.PREFIX + " --python=/opt/yt-dlp"),
+            "--python before the install": self.text.replace(
+                create, create + "    && python -m pip --python /opt/yt-dlp/bin/python list \\\n"),
+            "--python by a relative path before the install": self.text.replace(
+                create, create + "    && cd /opt && python -m pip --python=yt-dlp/bin/python list \\\n"),
+        }
+        for label, text in cases.items():
+            with self.subTest(label=label):
+                problems, _compiles = venv_hazards(text)
+                self.assertTrue([problem for problem in problems if "pip --python" in problem], problems)
+        # The venv's own interpreter running the install: never the install,
+        # so the check reports that no install was found.
+        problems, _compiles = venv_hazards(self.text.replace(install, "&& /opt/yt-dlp/bin/python -m pip install"))
+        self.assertIn(NOT_FOUND, problems)
+        # Acceptance: a --python that names another interpreter before the
+        # install starts nothing in the venv.
+        text = self.text.replace(create, create + "    && python -m pip --python /usr/local/bin/python --version \\\n")
+        self.assertEqual(venv_hazards(text)[0], [])
 
     def test_every_way_to_run_the_venvs_code_is_refused(self) -> None:
         # Each line takes the place of the compile step, after the install
@@ -236,12 +365,24 @@ class VenvBuildStepTest(unittest.TestCase):
             "cd into the venv, then bin/python": "cd /opt/yt-dlp && bin/python -c pass",
             "cd into site-packages, then python -c": "cd /opt/yt-dlp/lib/python3.12/site-packages && python -c pass",
             "the bin directory by a relative path": "cd /opt && yt-dlp/bin/python -c pass",
+            # I2: only the hashed lock goes in, once.
+            "pip --prefix again": "python -m pip install --prefix /opt/yt-dlp x.whl",
+            "pip --prefix= again": "python -m pip install --prefix=/opt/yt-dlp x.whl",
+            "pip --target into the venv": (
+                "python -m pip install --target /opt/yt-dlp/lib/python3.12/site-packages x.whl"),
+            "pip --target= into the venv": (
+                "python -m pip install --target=/opt/yt-dlp/lib/python3.12/site-packages x.whl"),
         }
+        second_installs = {"pip --prefix again", "pip --prefix= again", "pip --target into the venv",
+                           "pip --target= into the venv"}
         for label, command in bad.items():
             with self.subTest(label=label):
                 text = _with_compile_step(self.text, f"    && {command} \\\n")
                 problems, _compiles = venv_hazards(text)
                 self.assertNotEqual(problems, [], command)
+                self.assertInstallFound(problems)
+                if label in second_installs:
+                    self.assertTrue([problem for problem in problems if "a second time" in problem], problems)
 
     def test_later_instructions_are_checked_too(self) -> None:
         # The same in a RUN or setting of its own, after the install's RUN.
@@ -261,6 +402,7 @@ class VenvBuildStepTest(unittest.TestCase):
             with self.subTest(added=added):
                 problems, _compiles = venv_hazards(self.text.replace(anchor, anchor + added))
                 self.assertNotEqual(problems, [], added)
+                self.assertInstallFound(problems)
 
     def test_comments_and_steps_before_the_install_are_not_problems(self) -> None:
         # Acceptance: the venv's own creation and the install come first, and
@@ -279,7 +421,13 @@ class VenvBuildStepTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             venv_hazards("FROM scratch\nRUN true \\\n")
         self.assertEqual(venv_hazards("FROM scratch\nRUN true\n")[0],
-                         ["no RUN step installs into the venv with pip --python"])
+                         ["no RUN step installs into the venv with pip --prefix"])
+        # I2: the old --python install is no install at all now, and is refused.
+        old = ("FROM scratch\nRUN python -m venv --without-pip /opt/yt-dlp \\\n"
+               "    && python -m pip --python /opt/yt-dlp/bin/python install -r requirements.txt\n")
+        problems = venv_hazards(old)[0]
+        self.assertIn("no RUN step installs into the venv with pip --prefix", problems)
+        self.assertTrue([problem for problem in problems if "pip --python" in problem], problems)
 
 
 if __name__ == "__main__":

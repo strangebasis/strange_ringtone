@@ -1,12 +1,14 @@
-"""The fetcher's default-route start check (docs/PLAN.md 6.1, S2).
+"""The default-route start check of the fetcher and its runner (docs/PLAN.md 6.1, S2).
 
-The fetcher reaches YouTube only through the forwarder (HTTPS_PROXY). If its
-container also had a default route, yt-dlp or anything it runs could carry
-traffic out some other way, so the entry point refuses to start when the
-kernel's route tables hold a default route, or can't be read or understood:
-fail closed. FETCH_ALLOW_DEFAULT_ROUTE=true turns the check off where egress
-is filtered another way. The tables are read from /proc/net as text, so the
-check needs no capability and no extra package.
+The fetcher image's two servers reach out only to their next hop: the
+fetcher to its runner over `jobs`, the runner (and the yt-dlp it starts) to
+YouTube only through the forwarder (HTTPS_PROXY). If either container also
+had a default route, it or anything it runs could carry traffic out some
+other way, so each entry point refuses to start when the kernel's route
+tables hold a default route, or can't be read or understood: fail closed.
+FETCH_ALLOW_DEFAULT_ROUTE=true turns the check off where egress is filtered
+another way. The tables are read from /proc/net as text, so the check needs
+no capability and no extra package.
 """
 from __future__ import annotations
 

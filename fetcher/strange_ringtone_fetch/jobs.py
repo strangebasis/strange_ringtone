@@ -2,13 +2,15 @@
 
 The index in memory is the authority, as in the core's results store: a job
 is a 128-bit random ID mapped to its state, and a file on disk that the index
-doesn't know is never served. Only one yt-dlp runs at a time
-(FETCH_CONCURRENCY=1): a fetch is slow, talks to YouTube from the server's
-address, and holds up to FETCH_MAX_BYTES on the tmpfs, so a short queue and a
-fast 503 beyond it keep all three bounded.
+doesn't know is never served. Only one fetch runs at a time
+(FETCH_CONCURRENCY=1): the runner (docs/PLAN.md 6.1, reached through the
+Runner below) runs one yt-dlp at a time, a fetch is slow, talks to YouTube
+from the deployment's address, and holds up to FETCH_MAX_BYTES on the tmpfs,
+so a short queue and a fast 503 beyond it keep all three bounded.
 
-/tmp is sized for one download in flight plus one finished download
-(2 x FETCH_MAX_BYTES + 16 MB). So when a download finishes, any older one
+/tmp is sized for one download arriving from the runner plus one finished
+download (2 x FETCH_MAX_BYTES; the info JSON and Deno's cache are the
+runner's). So when a download finishes, any older one
 still waiting is deleted, and before the next one starts, the worker makes
 sure at most one finished download is left on the tmpfs. A download that is
 being streamed counts too: its file holds its space until the stream closes
@@ -31,12 +33,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from strange_ringtone_fetch.ytdlp import VIDEO_ID_RE, Download, FetchError, Metadata
+from strange_ringtone_fetch.metadata import VIDEO_ID_RE, Download, FetchError, Metadata
 
 # Exactly what secrets.token_hex(16) produces, checked before any lookup.
 JOB_ID_RE = re.compile(r"[0-9a-f]{32}")
-# Four waiting plus the one running. With FETCH_TIMEOUT_SECONDS at 120 the
-# last in the queue waits at most ten minutes, which the page's polling covers.
+# Four waiting plus the one running. With FETCH_TIMEOUT_SECONDS at 120, each
+# job holds the runner for at most 129 s (the run, the runner's drain after a
+# timeout kill and its two bounded reaps) plus the audio GET, which takes
+# seconds over `jobs`: the last in the queue is done a little over ten
+# minutes after it was queued, which the page's 15 minutes of polling
+# (core/static/fetch.js, MAX_POLLS) covers. Only a runner that stalls every
+# exchange up to the client's deadlines (POST_GRACE_SECONDS, the audio
+# deadline) could stretch that past 15 minutes, and such a runner already
+# denies the feature.
 QUEUE_SIZE = 4
 RESULTS_DIR = "results"
 # Finished downloads, held or being streamed, that may stay on the tmpfs while
@@ -44,7 +53,7 @@ RESULTS_DIR = "results"
 MAX_HELD = 1
 # How often a worker waiting for streams to let go checks for stop().
 ROOM_POLL_SECONDS = 0.2
-# How long stop() waits for each thread; the running yt-dlp is killed first.
+# How long stop() waits for each thread; the running fetch is cancelled first.
 STOP_SECONDS = 10.0
 
 QUEUED = "queued"
@@ -124,7 +133,7 @@ class Jobs:
     def submit(self, video_id: str) -> str:
         """Queue a fetch of video_id and return its job ID, or raise QueueFull."""
         # The server has checked the ID already; checked again, because this
-        # value ends up in yt-dlp's argument list.
+        # value goes to the runner, which puts it in yt-dlp's argument list.
         if not isinstance(video_id, str) or not VIDEO_ID_RE.fullmatch(video_id):
             raise ValueError("not a video ID")
         with self._lock:
@@ -233,14 +242,11 @@ class Jobs:
             held = None
         finally:
             # Every path, success included: what is kept was moved out above.
-            # ignore_errors covers one known gap, on Windows only (development,
-            # never a deployment): there a timed-out yt-dlp's own children
-            # survive, because only the direct child can be ended (see
-            # ytdlp._kill_group), and one that still has the job directory as
-            # its working directory keeps it from being removed. The server
-            # empties the scratch directory when it next starts. On Linux,
-            # killpg ends the whole group first and nothing is left; the
-            # in-image tests check that.
+            # The client closes its file before raising, so nothing of ours
+            # holds the directory; ignore_errors stays for Windows development,
+            # where an injected runner that runs a process there (the tests'
+            # stub yt-dlp) can leave a survivor holding it. The server empties
+            # the scratch directory when it next starts.
             if job_dir is not None:
                 shutil.rmtree(job_dir, ignore_errors=True)
         with self._lock:
@@ -301,7 +307,7 @@ class Jobs:
             thread.start()
 
     def stop(self) -> None:
-        """Stop both threads, killing a running yt-dlp, and wait for them."""
+        """Stop both threads, cancelling a running fetch (Runner.cancel), and wait for them."""
         self._stop.set()
         self.runner.cancel()
         threads, self._threads = self._threads, []

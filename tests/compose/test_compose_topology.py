@@ -1,11 +1,13 @@
-"""The compose layout of the fetcher and its forwarder, brought up for real (docs/PLAN.md 6.1, T1 to T3).
+"""The compose layout of the fetcher, its runner and its forwarder, brought up for real (docs/PLAN.md 6.1, T1 to T3).
 
 compose.example.yaml itself is the system under test: the fetcher on internal
-networks only (`fetcher`, `egress`), the forwarder alone on `outside`, and the
-fetcher's HTTPS_PROXY pointing at the forwarder. The tests start it with the
-already built fetcher image under a unique project name, through a temporary
-override that never builds, never pulls and never reads the developer's .env;
-they publish no port and tear everything down afterwards.
+networks only (`fetcher` for the reverse proxy, `jobs` for the runner), the
+runner on internal networks only (`jobs`, `egress`) with its HTTPS_PROXY
+pointing at the forwarder, and the forwarder alone on `outside`. The tests
+start it with the already built fetcher image under a unique project name,
+through a temporary override that never builds, never pulls and never reads
+the developer's .env; they publish no port and tear everything down
+afterwards.
 
 Nothing here sends a byte to YouTube or any other external host. T3's names
 are refused before the forwarder resolves anything; T1's external-name probe
@@ -56,6 +58,20 @@ FORWARDER_COMMAND = ["python", "-I", "/app/fetcher/forwarder.py"]
 # The image's CMD (fetcher/Dockerfile): the base interpreter, isolated. Not the
 # venv's interpreter, which holds yt-dlp (docs/PLAN.md 6.1, I1).
 FETCHER_COMMAND = ["python", "-I", "/app/fetcher"]
+# The runner, the image's third command: the base interpreter too, which
+# starts yt-dlp under the venv's interpreter as a subprocess. Its port and
+# health path, and the fetcher's (strange_ringtone_runner.__main__.PORT,
+# strange_ringtone_runner.server.HEALTH_PATH).
+RUNNER_COMMAND = ["python", "-I", "/app/fetcher/runner.py"]
+RUNNER_PORT = 8080
+RUNNER_HEALTH_PATH = "/healthz"
+FETCHER_HEALTH_PATH = "/fetch/healthz"
+# Each container's /tmp (README, Writable): the fetcher holds one download
+# arriving from the runner and one uncollected result (2 x FETCH_MAX_BYTES);
+# the runner one download in flight or one audio waiting to be collected,
+# never both, plus the info JSON and Deno's cache (FETCH_MAX_BYTES + 16 MB).
+FETCHER_TMPFS_SIZE = "size=80m"
+RUNNER_TMPFS_SIZE = "size=56m"
 # The engine release that added the bridge driver's `isolated` gateway mode,
 # which the internal networks use so the Docker host has no address on them:
 # Docker Engine 28.0.0 (release notes, moby/moby#49262), which accepts it on
@@ -68,23 +84,27 @@ GATEWAY_MODE_V6 = "com.docker.network.bridge.gateway_mode_ipv6"
 # A port for the IPv6 control's listener in the host's network namespace,
 # bound only to the control bridge's own address.
 V6_CONTROL_PORT = 18081
-INTERNAL_NETWORKS = ("core", "fetcher", "egress")
+INTERNAL_NETWORKS = ("core", "fetcher", "jobs", "egress")
 # Every service's log rotates, so a flood of refusals can't fill the host's disk.
 LOGGING = {"driver": "json-file", "options": {"max-size": "10m", "max-file": "3"}}
 PROXY_URL = f"http://fetcher-forwarder:{FORWARDER_PORT}"
 # The services that run the fetcher image, which turn IP forwarding off and
 # cap their processes and threads (compose.example.yaml).
-FETCHER_IMAGE_SERVICES = ("fetcher", "fetcher-forwarder")
+FETCHER_IMAGE_SERVICES = ("fetcher", "fetcher-runner", "fetcher-forwarder")
 IP_FORWARD = "net.ipv4.ip_forward"
 # The parts of each service's worst-case thread count that aren't one of the
 # code's own caps. Every service: its main thread and the health check's
 # process (Docker runs one at a time). The fetcher also: the job worker and
-# the sweeper (Jobs.start), and one yt-dlp run, measured offline in the image
-# under the contract flags: yt-dlp's Python 1 thread, Deno's main thread, 2
-# tokio threads and V8's workers, at most 4 there (one per usable CPU up to
-# 4), counted as 63 for a host that reports 64 CPUs.
+# the sweeper (Jobs.start), and the runner client's deadline timer for the
+# one exchange the job worker has open. The runner also: its result sweeper,
+# and one yt-dlp run, measured offline in the image under the contract
+# flags: yt-dlp's Python 1 thread, Deno's main thread, 2 tokio threads and
+# V8's workers, at most 4 there (one per usable CPU up to 4), counted as 63
+# for a host that reports 64 CPUs.
 SERVICE_FIXED_THREADS = 1 + 1
 JOB_THREADS = 2
+CLIENT_THREADS = 1
+RUNNER_THREADS = 1
 YTDLP_RUN_THREADS = 1 + 1 + 2 + 63
 # ICMP redirects (compose.example.yaml). With forwarding off the kernel takes a
 # redirect when `all` or the receiving interface says 1, and turning forwarding
@@ -143,16 +163,21 @@ def _worst_case_threads() -> dict[str, int]:
     with the resolv.conf Docker writes for these networks) and each started
     by a tunnel within that time, so tunnels_per_minute bounds them. The
     fetcher: one thread per request worker (FetchServer.MAX_WORKERS), the job
-    threads and one yt-dlp run. Imported here, not copied, so raising a cap
-    without raising the example's pids_limit fails LayoutTest.
+    threads and the client's deadline timer; it runs no yt-dlp. The runner:
+    one thread per request worker (RunnerServer.MAX_WORKERS), its result
+    sweeper and one yt-dlp run (it runs one job at a time). Imported here,
+    not copied, so raising a cap without raising the example's pids_limit
+    fails LayoutTest.
     """
     import helpers  # noqa: F401  (puts core/ and fetcher/ on sys.path)
     from strange_ringtone_fetch.server import FetchServer
     from strange_ringtone_forwarder.policy import DEFAULT_LIMITS
+    from strange_ringtone_runner.server import RunnerServer
 
     return {
         "fetcher-forwarder": SERVICE_FIXED_THREADS + DEFAULT_LIMITS.connections_max + DEFAULT_LIMITS.tunnels_per_minute,
-        "fetcher": SERVICE_FIXED_THREADS + FetchServer.MAX_WORKERS + JOB_THREADS + YTDLP_RUN_THREADS,
+        "fetcher": SERVICE_FIXED_THREADS + FetchServer.MAX_WORKERS + JOB_THREADS + CLIENT_THREADS,
+        "fetcher-runner": SERVICE_FIXED_THREADS + RunnerServer.MAX_WORKERS + RUNNER_THREADS + YTDLP_RUN_THREADS,
     }
 
 # The flags the contract runs a container with (README, Deployment contract),
@@ -478,7 +503,7 @@ print(json.dumps(dict(zip(lines[0][1:], lines[1][1:]))))
 _HEALTH_PROBE = r"""
 import http.client
 connection = http.client.HTTPConnection('127.0.0.1', PORT, timeout=TIMEOUT)
-connection.request('GET', '/fetch/healthz')
+connection.request('GET', PATH)
 response = connection.getresponse()
 print(response.status, response.read().decode('ascii', 'replace'))
 """
@@ -590,8 +615,8 @@ def _v6_connect_probe(targets: list[str], port: int) -> str:
     return f"TARGETS = {targets!r}\nPORT = {port!r}\nTIMEOUT = {PROBE_TIMEOUT!r}\n" + _V6_CONNECT_PROBE
 
 
-def _health_probe() -> str:
-    return f"PORT = {FETCHER_PORT!r}\nTIMEOUT = {PROBE_TIMEOUT!r}\n" + _HEALTH_PROBE
+def _health_probe(port: int = FETCHER_PORT, path: str = FETCHER_HEALTH_PATH) -> str:
+    return f"PORT = {port!r}\nPATH = {path!r}\nTIMEOUT = {PROBE_TIMEOUT!r}\n" + _HEALTH_PROBE
 
 
 def _run(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -639,6 +664,24 @@ def _is_ip(text: object) -> bool:
     return True
 
 
+def _service_block(text: str, service: str) -> str:
+    """The lines of one service in compose.example.yaml's own text, blank lines and comments left out."""
+    lines = text.splitlines()
+    header = f"  {service}:"
+    if header not in lines:
+        return ""
+    block: list[str] = []
+    for line in lines[lines.index(header) + 1:]:
+        comment = line.lstrip().startswith("#")
+        # A service's own lines sit four spaces deep or more: the next
+        # service, or a top-level key, ends the block.
+        if line.strip() and not comment and not line.startswith("    "):
+            break
+        if line.strip() and not comment:
+            block.append(line)
+    return "\n".join(block)
+
+
 def _override_yaml(test_env: Path) -> str:
     # JSON strings are valid YAML double-quoted scalars, so a temp path with
     # spaces or a drive letter needs no escaping of our own.
@@ -646,7 +689,9 @@ def _override_yaml(test_env: Path) -> str:
     image = json.dumps(IMAGE)
     # compose resolves every service's env_file, `config` and services it
     # doesn't start included, so the core's is overridden too: the
-    # developer's .env is never read, and CI has none.
+    # developer's .env is never read, and CI has none. The runner gets no
+    # env_file here, because the example gives it none (R6): its three
+    # limits come, by name, from the --env-file every compose call passes.
     return (
         "services:\n"
         "  core:\n"
@@ -658,6 +703,10 @@ def _override_yaml(test_env: Path) -> str:
         "    pull_policy: never\n"
         "    env_file: !override\n"
         f"      - {env}\n"
+        "  fetcher-runner:\n"
+        "    build: !reset null\n"
+        f"    image: {image}\n"
+        "    pull_policy: never\n"
         "  fetcher-forwarder:\n"
         "    build: !reset null\n"
         f"    image: {image}\n"
@@ -706,8 +755,8 @@ class Stack:
 
     def start(self) -> None:
         self.compose(
-            "up", "-d", "--no-build", "--wait", "--wait-timeout", "90", "fetcher", "fetcher-forwarder",
-            check=True,
+            "up", "-d", "--no-build", "--wait", "--wait-timeout", "90", "fetcher", "fetcher-runner",
+            "fetcher-forwarder", check=True,
         )
 
     def close(self) -> None:
@@ -859,19 +908,24 @@ class LayoutTest(unittest.TestCase):
         return set(service.get("networks") or {})
 
     def test_services_networks_and_flags(self) -> None:
-        """T2 (static): the fetcher only on internal networks, the forwarder alone on `outside`."""
+        """T1/T2 (static): the fetcher and the runner only on internal networks, the forwarder alone on `outside`."""
         services = self._services()
-        self.assertLessEqual({"core", "fetcher", "fetcher-forwarder"}, set(services))
+        self.assertLessEqual({"core", "fetcher", "fetcher-runner", "fetcher-forwarder"}, set(services))
         networks = self._config().get("networks") or {}
-        for name in ("core", "fetcher", "egress", "outside"):
+        for name in ("core", "fetcher", "jobs", "egress", "outside"):
             self.assertIn(name, networks, f"compose.example.yaml has no {name!r} network")
         # internal: no route out and no external DNS (with Engine 26.0+).
         self.assertIs(networks["egress"].get("internal"), True, "egress must be internal")
+        self.assertIs(networks["jobs"].get("internal"), True, "jobs must be internal")
         self.assertIs(networks["fetcher"].get("internal"), True, "fetcher must be internal")
         self.assertIs(networks["core"].get("internal"), True, "core must be internal")
         # compose omits `internal: false`; a missing key is the normal network.
         self.assertIs(networks["outside"].get("internal", False), False, "outside is the forwarder's way out")
-        self.assertEqual(self._networks_of(services["fetcher"]), {"fetcher", "egress"})
+        # The fetcher: the reverse proxy's network and the runner's, never
+        # `egress`. The runner: the fetcher's and the forwarder's, never the
+        # reverse proxy's. The forwarder: the runner's and the way out.
+        self.assertEqual(self._networks_of(services["fetcher"]), {"fetcher", "jobs"})
+        self.assertEqual(self._networks_of(services["fetcher-runner"]), {"jobs", "egress"})
         self.assertEqual(self._networks_of(services["fetcher-forwarder"]), {"egress", "outside"})
         self.assertEqual(self._networks_of(services["core"]), {"core"})
 
@@ -911,13 +965,191 @@ class LayoutTest(unittest.TestCase):
                 self.assertEqual(logging.get("driver"), LOGGING["driver"], f"{name}: {logging!r}")
                 self.assertEqual(logging.get("options"), LOGGING["options"], f"{name}: {logging!r}")
 
-    def test_fetcher_points_https_proxy_at_the_forwarder(self) -> None:
-        """T2 (static): yt-dlp's only way out is the forwarder, set on the service so .env can't change it."""
-        fetcher = self._service("fetcher")
-        environment = fetcher.get("environment") or {}
+    def test_runner_points_https_proxy_at_the_forwarder_and_the_fetcher_has_none(self) -> None:
+        """T2 (static): yt-dlp's only way out is the forwarder, set on the runner so .env can't change it."""
+        runner = self._service("fetcher-runner")
+        environment = runner.get("environment") or {}
         self.assertEqual(environment.get("HTTPS_PROXY"), PROXY_URL)
-        # `docker compose up -d fetcher` must bring the forwarder up too.
-        self.assertIn("fetcher-forwarder", fetcher.get("depends_on") or {})
+        # `up -d fetcher-runner` must bring the forwarder up too.
+        self.assertIn("fetcher-forwarder", runner.get("depends_on") or {})
+        # The fetcher talks to the runner only; it runs no yt-dlp and reads
+        # no proxy variable, so the example gives it none.
+        fetcher = self._service("fetcher")
+        fetcher_environment = fetcher.get("environment") or {}
+        for name in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"):
+            self.assertNotIn(name, fetcher_environment, f"the fetcher sets {name}")
+        # `docker compose up -d fetcher` must bring the runner (and with it
+        # the forwarder) up too.
+        self.assertIn("fetcher-runner", fetcher.get("depends_on") or {})
+
+    def test_the_fetcher_finds_the_runner_at_its_compose_service(self) -> None:
+        """T2 (static): the fetcher's FETCH_RUNNER_URL is unset (its default) or exactly the runner service."""
+        # Pointed anywhere else (the forwarder, say), the fetcher's jobs
+        # would go to a peer the layout never meant it to talk to.
+        default = "http://fetcher-runner:8080"
+        environment = self._service("fetcher").get("environment") or {}
+        self.assertIsInstance(environment, dict, environment)
+        self.assertEqual(environment.get("FETCH_RUNNER_URL", default), default)
+        # Acceptance: the default names a service this file defines, on `jobs`.
+        runner = self._service("fetcher-runner")
+        self.assertIn("jobs", self._networks_of(runner))
+
+    def test_the_fetcher_trusts_no_proxy_whatever_the_env_file_says(self) -> None:
+        """Q3 (owner, 2026-11-05): the fetcher's own TRUSTED_PROXIES is empty and wins over the shared .env."""
+        # The runner reaches the fetcher over `jobs`, whose subnet Docker may
+        # change when it recreates the network: a CIDR in the fetcher's
+        # TRUSTED_PROXIES could come to cover the runner and let it write
+        # its own X-Forwarded-For past the rate limit.
+        environment = self._service("fetcher").get("environment") or {}
+        self.assertIn("TRUSTED_PROXIES", environment, "the fetcher's environment doesn't set TRUSTED_PROXIES")
+        self.assertEqual(environment["TRUSTED_PROXIES"], "")
+        # With a CIDR in the env file, as an operator would set for the core:
+        # the fetcher still resolves to empty, and the core (control) gets
+        # the CIDR, so the file was read and the override is what wins.
+        stack = Stack()
+        try:
+            with open(stack.test_env, "a", encoding="ascii", newline="\n") as handle:
+                handle.write("TRUSTED_PROXIES=192.0.2.0/24\n")
+            result = stack.compose("config", "--format", "json")
+        finally:
+            stack.close()
+        self.assertEqual(result.returncode, 0, f"docker compose config: {result.stderr.strip()}")
+        services = json.loads(result.stdout).get("services") or {}
+        fetcher = (services.get("fetcher") or {}).get("environment") or {}
+        core = (services.get("core") or {}).get("environment") or {}
+        self.assertEqual(core.get("TRUSTED_PROXIES"), "192.0.2.0/24", core)
+        self.assertEqual(fetcher.get("TRUSTED_PROXIES"), "", fetcher)
+
+    def test_the_runner_stays_its_containers_pid_1(self) -> None:
+        """Q2 (owner, 2026-11-05): no init and no wrapper, so the runner is PID 1 and sweeps only its container."""
+        # The runner turns on its kill-and-reap sweep only as PID 1. Under an
+        # init it would never sweep, and the orphans of every run would be
+        # left to the init. StackTest's cmdline probe reads /proc/1 in the
+        # running container.
+        runner = self._service("fetcher-runner")
+        self.assertFalse(runner.get("init"), f"the runner runs under an init: {runner.get('init')!r}")
+        # `compose config` writes `entrypoint: null` when none is set.
+        entrypoint = runner.get("entrypoint")
+        self.assertIn(entrypoint, (None, []), f"the runner has an entrypoint: {entrypoint!r}")
+        self.assertEqual(runner.get("command"), RUNNER_COMMAND)
+        # The image adds no entrypoint in front of the command either.
+        result = _docker("image", "inspect", "--format", "{{json .Config.Entrypoint}}", IMAGE,
+                         timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        self.assertIn(json.loads(result.stdout), (None, []), "the image has an entrypoint")
+
+    def test_the_runner_pins_init_off_against_the_daemons_default(self) -> None:
+        """Q2: `init: false`, stated, because an unset key takes the daemon's default, which may be init."""
+        # A daemon started with --init (daemon.json "init": true) runs every
+        # container whose HostConfig.Init is unset under docker-init; the
+        # runner would then be PID 7, not 1, and could not sweep (since Q4 it
+        # then refuses to start). Only an explicit false overrides that default.
+        runner = self._service("fetcher-runner")
+        self.assertIn("init", runner, "the runner leaves init to the daemon's default")
+        self.assertIs(runner["init"], False, f"the runner's init is {runner['init']!r}")
+
+    def test_the_runner_is_never_permitted_to_serve_without_its_sweep(self) -> None:
+        """Q4 (owner, 2026-11-05): the example never sets FETCH_ALLOW_NO_SWEEP, so a runner that can't sweep refuses."""
+        # The override is for a local run or a host that can't run the
+        # runner as PID 1, never for this layout, which can: set here, it
+        # would let a runner started under an init serve without its sweep.
+        runner = self._service("fetcher-runner")
+        environment = runner.get("environment") or {}
+        self.assertIsInstance(environment, dict, environment)
+        # Control: the resolved environment is the one compose builds (the
+        # forwarder's address is set there), so its absence is meaningful.
+        self.assertIn("HTTPS_PROXY", environment)
+        self.assertNotIn("FETCH_ALLOW_NO_SWEEP", environment)
+        for name, service in self._services().items():
+            with self.subTest(service=name):
+                self.assertNotIn("FETCH_ALLOW_NO_SWEEP", service.get("environment") or {})
+        text = COMPOSE_FILE.read_text(encoding="utf-8")
+        setting = [line for line in text.splitlines()
+                   if "FETCH_ALLOW_NO_SWEEP" in line and not line.lstrip().startswith("#")]
+        self.assertEqual(setting, [], "compose.example.yaml sets FETCH_ALLOW_NO_SWEEP")
+
+    def test_the_runners_container_is_given_only_its_own_settings(self) -> None:
+        """R6: no env_file for the runner; its environment is its three limits and HTTPS_PROXY, whatever .env holds."""
+        # Docker starts every health check and `docker exec` with the
+        # container's environment and user, and yt-dlp, which runs as that
+        # user, can read such a process's /proc/<pid>/environ. So whatever
+        # the runner's container is given, the code it runs can read: it gets
+        # no PUBLIC_ORIGIN (which a compromised run would need to pass the
+        # fetcher's Origin check over `jobs`), no setting of the core and
+        # nothing else an operator keeps in .env.
+        own = {"FETCH_MAX_SECONDS", "FETCH_MAX_BYTES", "FETCH_TIMEOUT_SECONDS", "HTTPS_PROXY"}
+        environment = self._service("fetcher-runner").get("environment") or {}
+        self.assertIsInstance(environment, dict, environment)
+        self.assertIn("HTTPS_PROXY", environment)
+        self.assertLessEqual(set(environment), own, "the runner's container is given more than its own settings")
+        # `compose config` folds an env_file into `environment` and drops the
+        # key, so the example's own text is read for it. Control: the block
+        # found is the runner's, and the same reading finds the fetcher's
+        # env_file.
+        text = COMPOSE_FILE.read_text(encoding="utf-8")
+        block = _service_block(text, "fetcher-runner")
+        self.assertIn("/app/fetcher/runner.py", block, "the runner's block of compose.example.yaml was not found")
+        self.assertIn("env_file:", _service_block(text, "fetcher"))
+        setting = [line for line in block.splitlines() if line.strip().startswith("env_file")]
+        self.assertEqual(setting, [], "compose.example.yaml gives the runner an env_file")
+        # With an env file as an operator's might be: the three limits arrive
+        # by name and nothing else does. Control: the fetcher, which is given
+        # the file, holds the origin and the operator's own variable.
+        limits = {"FETCH_MAX_SECONDS": "300", "FETCH_MAX_BYTES": "2097152", "FETCH_TIMEOUT_SECONDS": "60"}
+        stack = Stack()
+        try:
+            with open(stack.test_env, "a", encoding="ascii", newline="\n") as handle:
+                handle.write("TRUSTED_PROXIES=192.0.2.0/24\nOPERATORS_OWN_SETTING=1\n")
+                for name, value in limits.items():
+                    handle.write(f"{name}={value}\n")
+            result = stack.compose("config", "--format", "json")
+        finally:
+            stack.close()
+        self.assertEqual(result.returncode, 0, f"docker compose config: {result.stderr.strip()}")
+        services = json.loads(result.stdout).get("services") or {}
+        fetcher = (services.get("fetcher") or {}).get("environment") or {}
+        self.assertEqual(fetcher.get("PUBLIC_ORIGIN"), ORIGIN, fetcher)
+        self.assertEqual(fetcher.get("OPERATORS_OWN_SETTING"), "1", fetcher)
+        runner = (services.get("fetcher-runner") or {}).get("environment") or {}
+        self.assertEqual(runner, {**limits, "HTTPS_PROXY": PROXY_URL})
+
+    def test_no_service_has_a_volume_and_only_tmp_is_writable(self) -> None:
+        """Stateless (CLAUDE.md): no volume, a read-only root, and /tmp's tmpfs the only writable mount."""
+        config = self._config()
+        self.assertFalse(config.get("volumes"), f"compose.example.yaml declares volumes: {config.get('volumes')!r}")
+        for name, service in self._services().items():
+            with self.subTest(service=name):
+                # No data directory, bind mount or named volume: the
+                # services write only to /tmp, and the forwarder nothing.
+                self.assertNotIn("volumes", service, f"{name} mounts {service.get('volumes')!r}")
+                self.assertNotIn("volumes_from", service, f"{name} mounts another service's volumes")
+                self.assertIs(service.get("read_only"), True, f"{name} has a writable root filesystem")
+                tmpfs = service.get("tmpfs") or []
+                if name == "fetcher-forwarder":
+                    self.assertEqual(tmpfs, [], f"the forwarder writes nothing: {tmpfs!r}")
+                    continue
+                self.assertEqual(len(tmpfs), 1, f"{name}: {tmpfs!r}")
+                self.assertTrue(tmpfs[0].startswith("/tmp:"), f"{name}: {tmpfs!r}")
+
+    def test_runner_command_and_hardening(self) -> None:
+        """T2 (static): the runner command of the fetcher image, with the contract's flags and /tmp for one download."""
+        runner = self._service("fetcher-runner")
+        self.assertEqual(runner.get("command"), RUNNER_COMMAND)
+        self.assertEqual(runner.get("user"), UID_GID)
+        self.assertIs(runner.get("read_only"), True)
+        self.assertEqual(runner.get("cap_drop"), ["ALL"])
+        self.assertIn("no-new-privileges:true", runner.get("security_opt") or [])
+        self.assertEqual(runner.get("ipc"), "none")
+        tmpfs = runner.get("tmpfs") or []
+        self.assertEqual(len(tmpfs), 1, tmpfs)
+        self.assertTrue(tmpfs[0].startswith("/tmp:"), tmpfs)
+        self.assertIn(RUNNER_TMPFS_SIZE, tmpfs[0].split(":", 1)[1].split(","))
+        # Deno reserves a huge address space, so prlimit can't bound memory:
+        # the cgroup limit does.
+        self.assertIn("mem_limit", runner)
+        # env_file: `compose config` folds one into `environment` and drops
+        # the key, so test_the_runners_container_is_given_only_its_own_settings
+        # reads compose.example.yaml's own text for it (R6).
 
     def test_forwarder_command_and_hardening(self) -> None:
         """Supporting: the forwarder command of the fetcher image, with the contract's flags and nothing writable."""
@@ -940,8 +1172,8 @@ class LayoutTest(unittest.TestCase):
             with self.subTest(service=name):
                 self.assertFalse(service.get("ports"), f"{name} publishes {service.get('ports')!r}")
 
-    def test_fetcher_hardening_unchanged(self) -> None:
-        """Supporting: PR A changes the fetcher's networks and proxy, not its hardening."""
+    def test_fetcher_hardening_and_tmpfs_for_two_downloads(self) -> None:
+        """T2 (static): the fetcher's hardening, and a /tmp for one download from the runner and one result."""
         fetcher = self._service("fetcher")
         self.assertEqual(fetcher.get("user"), UID_GID)
         self.assertIs(fetcher.get("read_only"), True)
@@ -951,10 +1183,10 @@ class LayoutTest(unittest.TestCase):
         tmpfs = fetcher.get("tmpfs") or []
         self.assertEqual(len(tmpfs), 1, tmpfs)
         self.assertTrue(tmpfs[0].startswith("/tmp:"), tmpfs)
-        self.assertIn("size=96m", tmpfs[0].split(":", 1)[1].split(","))
+        self.assertIn(FETCHER_TMPFS_SIZE, tmpfs[0].split(":", 1)[1].split(","))
         self.assertIn("mem_limit", fetcher)
 
-    def test_the_fetcher_and_its_forwarder_turn_ip_forwarding_off(self) -> None:
+    def test_the_fetcher_image_services_turn_ip_forwarding_off(self) -> None:
         """T2 (static): no kernel routing between the networks of a two-network container, around the CONNECT gate."""
         for name in FETCHER_IMAGE_SERVICES:
             with self.subTest(service=name):
@@ -989,7 +1221,7 @@ class LayoutTest(unittest.TestCase):
                     for key in GLOBAL_FORWARDING_SYSCTLS:
                         self.assertNotIn(key, entries, f"{name} on {network}: {entries!r}")
 
-    def test_the_fetcher_and_its_forwarder_cap_processes_at_twice_their_worst_case(self) -> None:
+    def test_the_fetcher_image_services_cap_processes_at_twice_their_worst_case(self) -> None:
         """Supporting (G8): a cgroup pids_limit of at least twice each service's worst case from its own caps."""
         for name, worst in _worst_case_threads().items():
             with self.subTest(service=name, worst=worst):
@@ -1003,7 +1235,7 @@ class LayoutTest(unittest.TestCase):
                     f"raise it with the cap, and the sizing in compose.example.yaml's comment and the README",
                 )
 
-    def test_the_fetcher_and_its_forwarder_refuse_icmp_redirects(self) -> None:
+    def test_the_fetcher_image_services_refuse_icmp_redirects(self) -> None:
         """T2 (static): accept_redirects 0 for all, default and lo, and on the interface of every network attachment."""
         for name in FETCHER_IMAGE_SERVICES:
             with self.subTest(service=name):
@@ -1088,32 +1320,74 @@ class StackTest(unittest.TestCase):
         self.assertTrue(_is_os_error(outcome), f"{target} was reachable or the probe misbehaved: {outcome!r}")
 
     def _t3(self) -> list[str]:
-        # One batch for both T3 tests, sent from a fetcher container (on
-        # `egress`), so each test also passes when run alone.
+        # One batch for both T3 tests, sent from a runner container (on
+        # `egress`, the only container that reaches the forwarder), so each
+        # test also passes when run alone.
         if type(self)._t3_result is None:
             type(self)._t3_result = self._stack.run_in(
-                "fetcher", _request_probe("fetcher-forwarder", FORWARDER_PORT, T3_REQUESTS),
+                "fetcher-runner", _request_probe("fetcher-forwarder", FORWARDER_PORT, T3_REQUESTS),
             )
         assert type(self)._t3_result is not None
         lines = self._probe_output(type(self)._t3_result, "T3 request probe")
         self.assertIsInstance(lines, list)
         return lines
 
+    def _wait_for_health(self, name: str, port: int, path: str) -> str:
+        """The health probe's last answer from a container started with plain `docker run`, within the wait."""
+        deadline = time.monotonic() + OVERRIDE_HEALTH_SECONDS
+        health = ""
+        while time.monotonic() < deadline:
+            probe = _docker("exec", name, "python", "-I", "-c", _health_probe(port, path), timeout=PROBE_RUN_TIMEOUT)
+            health = probe.stdout.strip()
+            if probe.returncode == 0 and health == "200 ok":
+                break
+            time.sleep(0.5)
+        return health
+
+    def _interfaces_without_ipv6(self, service: str) -> None:
+        """The running service has IPv6 off (or no address) on its two non-loopback interfaces."""
+        interfaces = self._probe_output(self._stack.exec_in(service, _IFACE_V6_PROBE), f"{service} IPv6 probe")
+        others = {name: state for name, state in interfaces.items() if name != "lo"}
+        # Control: the service is on two networks, so two interfaces.
+        self.assertEqual(len(others), 2, f"{service}: {interfaces}")
+        for interface, state in others.items():
+            self.assertTrue(state["disable_ipv6"] == "1" or not state["ipv6"],
+                            f"{service} has IPv6 on {interface}: {interfaces}")
+
     # T1
 
     def test_t1_fetcher_has_no_default_route_and_no_external_dns(self) -> None:
-        """T1: the fetcher has no default route (IPv4 or IPv6), resolves no external name, and is healthy."""
+        """T1: the fetcher has no default route (IPv4 or IPv6), resolves its runner, not the forwarder, and is up."""
         result = self._probe_output(
-            self._stack.run_in("fetcher", _routes_probe([EXTERNAL_NAME, "fetcher-forwarder"])),
+            self._stack.run_in("fetcher", _routes_probe([EXTERNAL_NAME, "fetcher-runner", "fetcher-forwarder"])),
             "fetcher route probe",
         )
         self.assertEqual(result["ipv4_default"], [], "the fetcher has an IPv4 default route")
         self.assertEqual(result["ipv6_default"], [], "the fetcher has an IPv6 default route")
-        # Control: the embedded DNS answers, so the external failure means
-        # something.
+        # Control: the embedded DNS answers for the fetcher's own peer, so
+        # the failures below mean something.
+        self.assertIs(result["resolves"].get("fetcher-runner"), True, result)
+        # The fetcher shares no network with the forwarder, so the embedded
+        # DNS doesn't even name it there.
+        self.assertIs(result["resolves"].get("fetcher-forwarder"), False, result)
+        self.assertIs(result["resolves"].get(EXTERNAL_NAME), False, result)
+        health = self._stack.exec_in("fetcher", _health_probe(FETCHER_PORT, FETCHER_HEALTH_PATH))
+        self.assertEqual(health.returncode, 0, health.stderr.strip())
+        self.assertEqual(health.stdout.strip(), "200 ok")
+
+    def test_t1_runner_has_no_default_route_and_no_external_dns(self) -> None:
+        """T1: the runner has no default route (IPv4 or IPv6), resolves the forwarder, no external name, and is up."""
+        result = self._probe_output(
+            self._stack.run_in("fetcher-runner", _routes_probe([EXTERNAL_NAME, "fetcher-forwarder"])),
+            "runner route probe",
+        )
+        self.assertEqual(result["ipv4_default"], [], "the runner has an IPv4 default route")
+        self.assertEqual(result["ipv6_default"], [], "the runner has an IPv6 default route")
+        # Control: the embedded DNS answers for the runner's own peer, so the
+        # external failure means something.
         self.assertIs(result["resolves"].get("fetcher-forwarder"), True, result)
         self.assertIs(result["resolves"].get(EXTERNAL_NAME), False, result)
-        health = self._stack.exec_in("fetcher", _health_probe())
+        health = self._stack.exec_in("fetcher-runner", _health_probe(RUNNER_PORT, RUNNER_HEALTH_PATH))
         self.assertEqual(health.returncode, 0, health.stderr.strip())
         self.assertEqual(health.stdout.strip(), "200 ok")
 
@@ -1151,24 +1425,49 @@ class StackTest(unittest.TestCase):
             "-e", f"PUBLIC_ORIGIN={ORIGIN}", "-e", "FETCH_ALLOW_DEFAULT_ROUTE=true", IMAGE,
         )
         self.assertEqual(started.returncode, 0, started.stderr.strip())
-        deadline = time.monotonic() + OVERRIDE_HEALTH_SECONDS
-        health = ""
-        while time.monotonic() < deadline:
-            probe = _docker("exec", name, "python", "-I", "-c", _health_probe(), timeout=PROBE_RUN_TIMEOUT)
-            health = probe.stdout.strip()
-            if probe.returncode == 0 and health == "200 ok":
-                break
-            time.sleep(0.5)
+        health = self._wait_for_health(name, FETCHER_PORT, FETCHER_HEALTH_PATH)
         self.assertEqual(health, "200 ok", "the fetcher did not serve healthz with the override set")
         logs = _docker("logs", name, timeout=PROBE_RUN_TIMEOUT)
         output = logs.stdout + logs.stderr
         self.assertIn("FETCH_ALLOW_DEFAULT_ROUTE is set", output)
         self.assertNotIn("refusing to start", output)
 
+    def test_t1_runner_refuses_to_start_on_the_outside_network(self) -> None:
+        """T1/S2: the runner's command on a network with a route out exits 3 and says why; it needs no setting."""
+        name = self._stack.container_name("runner-refusal")
+        try:
+            result = self._stack.docker_run(
+                "--rm", "--name", name, "--network", self._stack.network("outside"),
+                *HARDENING, *FETCHER_TMPFS, IMAGE, *RUNNER_COMMAND,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("the runner kept running on the outside network instead of refusing to start")
+        self.assertEqual(result.returncode, EXIT_ROUTE, result.stderr.strip())
+        self.assertIn("refusing to start", result.stderr)
+        self.assertIn("has a default route", result.stderr)
+        self.assertIn("IPv4", result.stderr)
+        self.assertIn("FETCH_ALLOW_DEFAULT_ROUTE", result.stderr)
+
+    def test_t1_the_override_lets_the_runner_start_there(self) -> None:
+        """T1/S2: the runner with FETCH_ALLOW_DEFAULT_ROUTE=true starts there, serves /healthz and says so."""
+        name = self._stack.container_name("runner-override")
+        self.addCleanup(_docker, "rm", "-f", name, timeout=60)
+        started = self._stack.docker_run(
+            "-d", "--name", name, "--network", self._stack.network("outside"),
+            *HARDENING, *FETCHER_TMPFS, "-e", "FETCH_ALLOW_DEFAULT_ROUTE=true", IMAGE, *RUNNER_COMMAND,
+        )
+        self.assertEqual(started.returncode, 0, started.stderr.strip())
+        health = self._wait_for_health(name, RUNNER_PORT, RUNNER_HEALTH_PATH)
+        self.assertEqual(health, "200 ok", "the runner did not serve /healthz with the override set")
+        logs = _docker("logs", name, timeout=PROBE_RUN_TIMEOUT)
+        output = logs.stdout + logs.stderr
+        self.assertIn("FETCH_ALLOW_DEFAULT_ROUTE is set", output)
+        self.assertNotIn("refusing to start", output)
+
     def test_t1_internal_networks_give_the_host_no_address(self) -> None:
-        """T1: the Docker host has no address on the `fetcher` and `egress` bridges, so the fetcher can't reach it."""
+        """T1: the Docker host has no address on the `fetcher`, `jobs` and `egress` bridges, for either to reach."""
         bridges: dict[str, str] = {}
-        for name in ("fetcher", "egress", "outside"):
+        for name in ("fetcher", "jobs", "egress", "outside"):
             network = self._stack.network(name)
             result = _docker("network", "inspect", "--format", "{{json .}}", network, timeout=PROBE_RUN_TIMEOUT)
             self.assertEqual(result.returncode, 0, f"docker network inspect {network}: {result.stderr.strip()}")
@@ -1191,14 +1490,14 @@ class StackTest(unittest.TestCase):
         )
         addresses = self._probe_output(result, "host bridge probe")
         self.assertTrue(_is_ip(addresses.get(bridges["outside"])), f"control failed: {addresses}")
-        for network in ("fetcher", "egress"):
+        for network in ("fetcher", "jobs", "egress"):
             self.assertEqual(addresses.get(bridges[network]), "EADDRNOTAVAIL",
                              f"the host has an address on {network}: {addresses}")
 
-    def test_t1_the_host_has_no_ipv6_address_the_fetcher_can_reach(self) -> None:
-        """T1: the `fetcher` and `egress` bridges hold no IPv6 host address but link-local; the fetcher has no IPv6."""
+    def test_t1_the_host_has_no_ipv6_address_the_fetcher_or_runner_can_reach(self) -> None:
+        """T1: the `fetcher`, `jobs` and `egress` bridges hold no IPv6 host address but link-local; no IPv6 inside."""
         bridges: dict[str, str] = {}
-        for name in ("fetcher", "egress", "outside"):
+        for name in ("fetcher", "jobs", "egress", "outside"):
             network = self._stack.network(name)
             result = _docker("network", "inspect", "--format", "{{json .}}", network, timeout=PROBE_RUN_TIMEOUT)
             self.assertEqual(result.returncode, 0, f"docker network inspect {network}: {result.stderr.strip()}")
@@ -1214,38 +1513,81 @@ class StackTest(unittest.TestCase):
             ),
             "host IPv6 bridge probe",
         )
-        # Control: the probe runs in the host's netns and finds all three
+        # Control: the probe runs in the host's netns and finds all four
         # bridges, so an empty address list is a fact, not a wrong namespace.
         for network, bridge in bridges.items():
             self.assertIs((seen.get(bridge) or {}).get("present"), True, f"{network} bridge not found: {seen}")
-        for network in ("fetcher", "egress"):
+        for network in ("fetcher", "jobs", "egress"):
             # A bridge may keep an fe80:: link-local address; nothing else.
             routable = [address for address in seen[bridges[network]]["ipv6"]
                         if not ipaddress.IPv6Address(address).is_link_local]
             self.assertEqual(routable, [], f"the host has an IPv6 address on {network}: {seen}")
-        # And the running fetcher has IPv6 off (or no address) on every
-        # interface but loopback, so even a link-local host address is out
-        # of its reach.
-        interfaces = self._probe_output(self._stack.exec_in("fetcher", _IFACE_V6_PROBE), "fetcher IPv6 probe")
-        others = {name: state for name, state in interfaces.items() if name != "lo"}
-        # Control: the fetcher is on two networks, so two interfaces.
-        self.assertEqual(len(others), 2, interfaces)
-        for interface, state in others.items():
-            self.assertTrue(state["disable_ipv6"] == "1" or not state["ipv6"],
-                            f"the fetcher has IPv6 on {interface}: {interfaces}")
+        # And the running fetcher and runner have IPv6 off (or no address) on
+        # every interface but loopback, so even a link-local host address is
+        # out of their reach.
+        for service in ("fetcher", "fetcher-runner"):
+            with self.subTest(service=service):
+                self._interfaces_without_ipv6(service)
 
     def test_the_image_and_the_services_run_the_base_interpreter_isolated(self) -> None:
-        """I1: the image's CMD and both running services use the base interpreter with -I, never the venv's."""
+        """I1: the image's CMD and the three running services use the base interpreter with -I, never the venv's."""
         result = _docker("image", "inspect", "--format", "{{json .Config.Cmd}}", IMAGE, timeout=PROBE_RUN_TIMEOUT)
         self.assertEqual(result.returncode, 0, result.stderr.strip())
         self.assertEqual(json.loads(result.stdout), FETCHER_COMMAND, "the image's CMD changed")
-        for service, expected in (("fetcher", FETCHER_COMMAND), ("fetcher-forwarder", FORWARDER_COMMAND)):
+        for service, expected in (
+            ("fetcher", FETCHER_COMMAND),
+            ("fetcher-runner", RUNNER_COMMAND),
+            ("fetcher-forwarder", FORWARDER_COMMAND),
+        ):
             with self.subTest(service=service):
                 running = self._probe_output(self._stack.exec_in(service, _CMDLINE_PROBE), f"{service} cmdline")
                 self.assertEqual(running, expected)
 
+    def test_the_running_runner_is_pid_1_sweeps_and_is_not_dumpable(self) -> None:
+        """Q2: the engine got init false, the runner says it sweeps, and a same-UID process can't read PID 1."""
+        ids = self._stack.container_ids("fetcher-runner")
+        self.assertEqual(len(ids), 1, ids)
+        result = _docker("inspect", "--format", "{{json .HostConfig.Init}}", ids[0], timeout=PROBE_RUN_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        self.assertIs(json.loads(result.stdout), False, "the runner's container leaves init to the daemon")
+        logs = self._stack.logs("fetcher-runner")
+        self.assertEqual(logs.returncode, 0, logs.stderr.strip())
+        self.assertIn("strange_ringtone_runner: PID 1: killing and reaping", logs.stdout + logs.stderr)
+        # `compose exec` runs as the service's user, 10001, like yt-dlp. The
+        # runner made itself non-dumpable, so its environ is closed to it;
+        # cmdline (control) stays world-readable.
+        probe = (
+            "import json\n"
+            "out = {}\n"
+            "for name in ('cmdline', 'environ'):\n"
+            "    try:\n"
+            "        with open('/proc/1/' + name, 'rb') as handle:\n"
+            "            out[name] = 'read' if handle.read() else 'empty'\n"
+            "    except OSError as error:\n"
+            "        out[name] = type(error).__name__\n"
+            "print(json.dumps(out))\n"
+        )
+        state = self._probe_output(self._stack.exec_in("fetcher-runner", probe), "runner /proc/1 probe")
+        self.assertEqual(state, {"cmdline": "read", "environ": "PermissionError"})
+
+    def test_a_process_started_in_the_runners_container_is_given_no_origin(self) -> None:
+        """R6: a process Docker starts in the runner's container holds its limits and proxy, never PUBLIC_ORIGIN."""
+        # `compose exec` starts a process the way Docker starts the health
+        # check: with the container's environment, as the service's user,
+        # 10001, like yt-dlp, which can read such a process's
+        # /proc/<pid>/environ whatever the runner did to its own. Control:
+        # the same probe in the fetcher's container, which is given the env
+        # file, finds the origin there.
+        probe = "import json, os\nprint(json.dumps(sorted(os.environ)))\n"
+        fetcher = self._probe_output(self._stack.exec_in("fetcher", probe), "fetcher environment probe")
+        self.assertIn("PUBLIC_ORIGIN", fetcher)
+        runner = self._probe_output(self._stack.exec_in("fetcher-runner", probe), "runner environment probe")
+        self.assertIn("HTTPS_PROXY", runner)
+        for name in ("PUBLIC_ORIGIN", "TRUSTED_PROXIES"):
+            self.assertNotIn(name, runner, f"the runner's container is given {name}")
+
     def test_t2_the_running_services_forward_nothing_and_have_the_examples_pids_cap(self) -> None:
-        """T2: in the running fetcher and forwarder, IPv4 and IPv6 forwarding read 0, and pids.max is the example's."""
+        """K1/T2: in the three running services, IPv4 and IPv6 forwarding read 0, and pids.max is the example's."""
         config = self._stack.compose("config", "--format", "json")
         self.assertEqual(config.returncode, 0, f"docker compose config: {config.stderr.strip()}")
         services = json.loads(config.stdout).get("services") or {}
@@ -1270,7 +1612,7 @@ class StackTest(unittest.TestCase):
                 self.assertEqual(state["pids_max"], str(expected), state)
 
     def test_t2_the_running_services_refuse_icmp_redirects(self) -> None:
-        """T2: in the running fetcher and forwarder, every accept_redirects value reads 0 (all, default, lo, eth)."""
+        """K1/T2: in the three running services, every accept_redirects value reads 0 (all, default, lo, eth)."""
         for service in FETCHER_IMAGE_SERVICES:
             with self.subTest(service=service):
                 values = self._probe_output(self._stack.exec_in(service, _REDIRECTS_PROBE), f"{service} redirects")
@@ -1285,48 +1627,100 @@ class StackTest(unittest.TestCase):
 
     # T2
 
-    def test_t2_fetcher_reaches_the_forwarder_over_egress(self) -> None:
-        """T2 (a): a GET from the fetcher to fetcher-forwarder:3128 gets the forwarder's 405."""
+    def test_t2_runner_reaches_the_forwarder_over_egress(self) -> None:
+        """T2: a GET from the runner to fetcher-forwarder:3128 gets the forwarder's 405 (acceptance)."""
         lines = self._probe_output(
             self._stack.run_in(
-                "fetcher", _request_probe("fetcher-forwarder", FORWARDER_PORT, [b"GET / HTTP/1.1\r\n\r\n"]),
+                "fetcher-runner", _request_probe("fetcher-forwarder", FORWARDER_PORT, [b"GET / HTTP/1.1\r\n\r\n"]),
             ),
-            "fetcher to forwarder probe",
+            "runner to forwarder probe",
         )
         self.assertEqual(len(lines), 1, lines)
         self.assertTrue(lines[0].startswith("HTTP/1.1 405"), lines)
 
-    def test_t2_forwarder_cannot_reach_the_fetcher(self) -> None:
-        """T2 (b): the forwarder is not on the `fetcher` network and can't reach the fetcher's address there."""
+    def test_t2_fetcher_cannot_reach_the_forwarder(self) -> None:
+        """T2: the fetcher is not on `egress` and reaches neither forwarder address, but the runner on `jobs`."""
         fetcher = self._addresses("fetcher")
+        runner = self._addresses("fetcher-runner")
         forwarder = self._addresses("fetcher-forwarder")
-        self.assertNotIn(self._stack.network("fetcher"), forwarder, "the forwarder is on the fetcher network")
-        target = self._address(fetcher, "fetcher")
-        # Control: the same probe does reach the forwarder over `egress`, so
-        # a failure to reach the fetcher is the network, not the probe.
-        control = self._address(forwarder, "egress")
+        self.assertNotIn(self._stack.network("egress"), fetcher, "the fetcher is on the egress network")
+        self.assertNotIn(self._stack.network("outside"), fetcher, "the fetcher is on the outside network")
+        on_egress = self._address(forwarder, "egress")
+        on_outside = self._address(forwarder, "outside")
+        # Control: the same probe from the same service reaches the runner
+        # over `jobs`, so a failure to reach the forwarder is the network,
+        # not the probe.
+        control = self._address(runner, "jobs")
         outcomes = self._probe_output(
             self._stack.run_in(
-                "fetcher-forwarder", _connect_probe([(target, FETCHER_PORT), (control, FORWARDER_PORT)]),
+                "fetcher",
+                _connect_probe([(on_egress, FORWARDER_PORT), (on_outside, FORWARDER_PORT), (control, RUNNER_PORT)]),
+            ),
+            "fetcher reachability probe",
+        )
+        self.assertEqual(outcomes[2], "connected", f"control failed: {outcomes}")
+        self._assert_unreachable(outcomes[0], f"the forwarder at {on_egress}:{FORWARDER_PORT}")
+        self._assert_unreachable(outcomes[1], f"the forwarder at {on_outside}:{FORWARDER_PORT}")
+
+    def test_t2_forwarder_cannot_reach_the_fetcher(self) -> None:
+        """T2: the forwarder is on neither `fetcher` nor `jobs`, reaches neither fetcher address, but the runner."""
+        fetcher = self._addresses("fetcher")
+        runner = self._addresses("fetcher-runner")
+        forwarder = self._addresses("fetcher-forwarder")
+        self.assertNotIn(self._stack.network("fetcher"), forwarder, "the forwarder is on the fetcher network")
+        self.assertNotIn(self._stack.network("jobs"), forwarder, "the forwarder is on the jobs network")
+        on_fetcher = self._address(fetcher, "fetcher")
+        on_jobs = self._address(fetcher, "jobs")
+        # Control: the same probe reaches the runner over `egress`, so a
+        # failure to reach the fetcher is the network, not the probe.
+        control = self._address(runner, "egress")
+        outcomes = self._probe_output(
+            self._stack.run_in(
+                "fetcher-forwarder",
+                _connect_probe([(on_fetcher, FETCHER_PORT), (on_jobs, FETCHER_PORT), (control, RUNNER_PORT)]),
             ),
             "forwarder reachability probe",
         )
-        self.assertEqual(outcomes[1], "connected", f"control failed: {outcomes}")
-        self._assert_unreachable(outcomes[0], f"the fetcher at {target}:{FETCHER_PORT}")
+        self.assertEqual(outcomes[2], "connected", f"control failed: {outcomes}")
+        self._assert_unreachable(outcomes[0], f"the fetcher at {on_fetcher}:{FETCHER_PORT}")
+        self._assert_unreachable(outcomes[1], f"the fetcher at {on_jobs}:{FETCHER_PORT}")
 
-    def test_t2_nothing_on_the_fetcher_network_reaches_the_forwarder(self) -> None:
-        """T2 (c): a container on the `fetcher` network reaches the fetcher but neither forwarder address."""
+    def test_t2_nothing_on_the_fetcher_network_reaches_the_forwarder_or_the_runner(self) -> None:
+        """T2: a container on the `fetcher` network reaches the fetcher but neither forwarder nor runner address."""
         fetcher = self._addresses("fetcher")
+        runner = self._addresses("fetcher-runner")
         forwarder = self._addresses("fetcher-forwarder")
         control = self._address(fetcher, "fetcher")
+        targets = [
+            (self._address(forwarder, "egress"), FORWARDER_PORT),
+            (self._address(forwarder, "outside"), FORWARDER_PORT),
+            (self._address(runner, "jobs"), RUNNER_PORT),
+            (self._address(runner, "egress"), RUNNER_PORT),
+        ]
+        outcomes = self._probe_output(
+            self._stack.probe_on_network(
+                self._stack.network("fetcher"), _connect_probe([(control, FETCHER_PORT), *targets]),
+            ),
+            "fetcher-network probe",
+        )
+        self.assertEqual(outcomes[0], "connected", f"control failed: {outcomes}")
+        self.assertEqual(len(outcomes), 1 + len(targets), outcomes)
+        for (address, port), outcome in zip(targets, outcomes[1:], strict=True):
+            self._assert_unreachable(outcome, f"{address}:{port}")
+
+    def test_t2_nothing_on_the_jobs_network_reaches_the_forwarder(self) -> None:
+        """T2: a container on the `jobs` network reaches the runner but neither forwarder address."""
+        runner = self._addresses("fetcher-runner")
+        forwarder = self._addresses("fetcher-forwarder")
+        control = self._address(runner, "jobs")
         on_egress = self._address(forwarder, "egress")
         on_outside = self._address(forwarder, "outside")
         outcomes = self._probe_output(
             self._stack.probe_on_network(
-                self._stack.network("fetcher"),
-                _connect_probe([(control, FETCHER_PORT), (on_egress, FORWARDER_PORT), (on_outside, FORWARDER_PORT)]),
+                self._stack.network("jobs"),
+                _connect_probe([(control, RUNNER_PORT), (on_egress, FORWARDER_PORT), (on_outside, FORWARDER_PORT)]),
             ),
-            "fetcher-network probe",
+            "jobs-network probe",
         )
         self.assertEqual(outcomes[0], "connected", f"control failed: {outcomes}")
         self._assert_unreachable(outcomes[1], f"the forwarder at {on_egress}:{FORWARDER_PORT}")
@@ -1487,9 +1881,14 @@ class Ipv6HostIsolationTest(unittest.TestCase):
                 sysctls = definition.get("sysctls") or {}
                 for key in FORWARDING_SYSCTLS:
                     self.assertEqual(str(sysctls.get(key)), "0", sysctls)
-                # Both services are on `egress`; its attachment's endpoint
-                # sysctls set the interface this network gets.
-                attachment = dict(((definition.get("networks") or {}).get("egress") or {}).get("driver_opts") or {})
+                # The service's first network attachment, in name order
+                # (`egress` for the runner and the forwarder; the fetcher is
+                # not on `egress`): its endpoint sysctls set the interface
+                # this network gets, as each attachment does for its own.
+                attachments = definition.get("networks") or {}
+                self.assertTrue(attachments, f"{service} joins no network")
+                first = sorted(attachments)[0] if attachments else ""
+                attachment = dict((attachments.get(first) or {}).get("driver_opts") or {})
                 self.assertEqual(_endpoint_sysctls(attachment).get(IFNAME_FORWARDING), ["0"], attachment)
                 flags: list[str] = []
                 for key, value in sorted(sysctls.items()):

@@ -38,7 +38,8 @@ from strange_ringtone.http_guard import (
 
 from strange_ringtone_fetch.config import Settings
 from strange_ringtone_fetch.jobs import Jobs, QueueFull, Runner
-from strange_ringtone_fetch.ytdlp import VIDEO_ID_RE, YtDlp, default_prlimit
+from strange_ringtone_fetch.metadata import VIDEO_ID_RE
+from strange_ringtone_fetch.runner_client import RunnerClient
 
 SERVER_NAME = "strange_ringtone"
 HEALTH_PATH = "/fetch/healthz"
@@ -456,18 +457,14 @@ class FetchServer(http.server.ThreadingHTTPServer):
         jobs_factory: Callable[[Path, Runner, int], Jobs] = Jobs,
     ) -> None:
         self.settings = settings
-        # The image's yt-dlp, run by this interpreter, under prlimit on Linux.
-        # Building it checks nothing on disk.
+        # The runner container, reached over `jobs` (docs/PLAN.md 6.1): the
+        # fetcher runs no yt-dlp itself. Building the client touches no socket
+        # and resolves no name, so the fetcher starts, and answers its health
+        # check, before the runner does.
         self.runner: Runner = (
             runner
             if runner is not None
-            else YtDlp(
-                settings.fetch_max_seconds,
-                settings.fetch_max_bytes,
-                settings.fetch_timeout_seconds,
-                prlimit=default_prlimit(),
-                proxies=settings.proxies,
-            )
+            else RunnerClient(settings.runner_url, settings.fetch_max_bytes, settings.fetch_timeout_seconds)
         )
         self.limiter = RateLimiter(settings.rate_limit_fetches_per_minute)
         self.submit_lock = threading.Lock()

@@ -1,13 +1,17 @@
-"""The yt-dlp runner (strange_ringtone_fetch.ytdlp) against a stub yt-dlp (tests/stubs/ytdlp_stub.py).
+"""The yt-dlp run (strange_ringtone_runner.ytdlp) against a stub yt-dlp (tests/stubs/ytdlp_stub.py).
 
-The stub checks the argument list it receives and behaves by video ID, so
-these tests pin the exact command, the environment, the prlimit guards, the
-timeout and process-group kill, the error mapping and the metadata whitelist
-without the network or yt-dlp, on Windows and Linux alike.
+yt-dlp runs only in the runner's container (docs/PLAN.md 6.1), so the run
+code lives in the runner's package; the metadata whitelist and the result
+types live in strange_ringtone_fetch.metadata, which the runner and the
+fetcher share. The stub checks the argument list it receives and behaves by
+video ID, so these tests pin the exact command, the environment, the prlimit
+guards, the timeout and process-group kill, the error mapping and the
+metadata whitelist without the network or yt-dlp, on Windows and Linux alike.
 """
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import io
 import json
 import math
@@ -25,21 +29,25 @@ from typing import Any
 from unittest import mock
 
 import helpers
-from strange_ringtone_fetch import ytdlp
-from strange_ringtone_fetch.ytdlp import (
+from strange_ringtone_fetch.metadata import (
+    FetchError,
+    Metadata,
+    clean_duration,
+    clean_heatmap,
+    clean_title,
+    metadata_to_info,
+    parse_info,
+)
+from strange_ringtone_runner import ytdlp
+from strange_ringtone_runner.ytdlp import (
     DEFAULT_COMMAND,
     DENO,
     PRLIMIT,
     YTDLP_PYTHON,
-    FetchError,
     Limits,
     YtDlp,
-    clean_duration,
-    clean_heatmap,
-    clean_title,
     default_prlimit,
     map_failure,
-    parse_info,
     watch_url,
     ytdlp_args,
 )
@@ -57,10 +65,11 @@ def stub_title(video_id: str) -> str:
 
 
 class StubYtDlp(YtDlp):
-    """The real runner with the stub as its program, plus a log the stub appends to.
+    """The runner's real yt-dlp run with the stub as its program, plus a log the stub appends to.
 
-    The runner builds the child's environment from scratch, so the stub's
-    own variables are added here, in the tests only.
+    The run builds the child's environment from scratch, so the stub's own
+    variables are added here, in the tests only. Imported by the fetcher's,
+    the jobs' and the runner's tests.
     """
 
     def __init__(self, *args: Any, log: Path | None = None, mode: str | None = None, **kwargs: Any) -> None:
@@ -428,6 +437,87 @@ class MetadataTest(unittest.TestCase):
             with self.subTest(info=info), self.assertRaises(FetchError) as raised:
                 parse_info(info)
             self.assertEqual(raised.exception.code, "failed")
+
+
+def _stub_module() -> Any:
+    # The stub's own info builder, so the round trip starts from exactly what
+    # the stub (and so the runner's tests) hands the runner.
+    spec = importlib.util.spec_from_file_location("ytdlp_stub_for_metadata", STUB)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class MetadataRoundTripTest(unittest.TestCase):
+    """S1/R1: the runner answers metadata_to_info(parse_info(info)) and the fetcher runs parse_info on it again.
+
+    One whitelist applied on both sides only works if the second pass reads
+    back exactly what the first one kept, through the JSON that crosses `jobs`.
+    """
+
+    def point(self, start: Any, end: Any, value: Any) -> dict[str, Any]:
+        return {"start_time": start, "end_time": end, "value": value}
+
+    def infos(self) -> dict[str, Any]:
+        stub = _stub_module()
+        duration = stub.DURATION
+        return {
+            "the stub's info": {
+                "id": VIDEO_ID, "title": stub_title(VIDEO_ID), "duration": duration,
+                "heatmap": stub.heatmap(duration, stub.HEATMAP_POINTS),
+                "uploader": "Stub Uploader", "description": "stub description",
+                "webpage_url": f"https://www.youtube.com/watch?v={VIDEO_ID}", "formats": [],
+            },
+            # Whole-second duration, last points past it: cleaning clips one
+            # and drops the other, and the clipped list must read back as is.
+            "a clipped heatmap": {
+                "title": "T", "duration": 215,
+                "heatmap": [self.point(200, 214, 0.5), self.point(214, 215.2, 1), self.point(215.2, 215.9, 0.5)],
+            },
+            "a title only": {"title": "  Only ‮a​ title\n"},
+            "nothing kept": {"id": VIDEO_ID, "uploader": "U"},
+        }
+
+    def test_metadata_to_info_round_trips_through_parse_info(self) -> None:
+        for label, info in self.infos().items():
+            with self.subTest(label):
+                metadata = parse_info(info)
+                answered = metadata_to_info(metadata)
+                self.assertEqual(parse_info(answered), metadata)
+                # What really crosses `jobs` is JSON: the tuple of points
+                # becomes a list, and the fetcher must still read it back.
+                wire = json.loads(json.dumps(answered))
+                self.assertEqual(parse_info(wire), metadata)
+                if metadata.duration is not None:
+                    # A whole-second duration stays an int, as the page gets it today.
+                    self.assertIs(type(parse_info(wire).duration), type(metadata.duration))
+        empty = Metadata(None, None, None)
+        self.assertEqual(metadata_to_info(empty), {})
+        self.assertEqual(parse_info(metadata_to_info(empty)), empty)
+        clipped = parse_info(self.infos()["a clipped heatmap"])
+        assert clipped.heatmap is not None
+        self.assertEqual(clipped.heatmap[-1], {"start": 214.0, "end": 215.0, "value": 1.0})
+
+    def test_metadata_to_info_emits_only_the_three_keys_in_yt_dlps_names(self) -> None:
+        metadata = parse_info(self.infos()["the stub's info"])
+        answered = metadata_to_info(metadata)
+        self.assertEqual(set(answered), {"title", "duration", "heatmap"})
+        self.assertEqual(answered["title"], stub_title(VIDEO_ID))
+        self.assertEqual(answered["duration"], 215.5)
+        assert metadata.heatmap is not None
+        self.assertEqual(len(answered["heatmap"]), len(metadata.heatmap))
+        for sent, kept in zip(answered["heatmap"], metadata.heatmap, strict=True):
+            # yt-dlp's names, so parse_info reads them; never the page's.
+            self.assertEqual(set(sent), {"start_time", "end_time", "value"})
+            self.assertEqual((sent["start_time"], sent["end_time"], sent["value"]),
+                             (kept["start"], kept["end"], kept["value"]))
+        text = json.dumps(answered)
+        for never in ("uploader", "description", "webpage_url", "formats", '"id"', "Stub Uploader"):
+            self.assertNotIn(never, text)
+        # A value that is None is left out, not sent as null.
+        self.assertEqual(metadata_to_info(Metadata("T", None, None)), {"title": "T"})
+        self.assertEqual(metadata_to_info(Metadata(None, 10, None)), {"duration": 10})
 
 
 class StubTestCase(unittest.TestCase):
@@ -815,6 +905,76 @@ class TimeoutTest(StubTestCase):
         self.assertLess(time.monotonic() - started, 20)
         self.assertEqual(failures, ["failed"])
         self.assertReaped()
+
+
+@unittest.skipUnless(hasattr(os, "killpg"), "process groups are POSIX")
+class RunEndKillTest(StubTestCase):
+    """R3: nothing a run started outlives it, even when the run succeeds."""
+
+    def test_a_child_left_behind_by_a_successful_run_is_killed(self) -> None:
+        # A child that closed its streams lets communicate() return at once;
+        # without the group kill at the end of every run it would keep the
+        # runner's reach between jobs and could edit the next job's files.
+        download = self.runner().fetch("survivor___", self.job)
+        # Acceptance: the run itself is a normal success.
+        self.assertEqual(download.audio, self.job / "survivor___.m4a")
+        self.assertEqual(download.metadata.title, stub_title("survivor___"))
+        survivor = read_pid(self.job / "survivor.pid", timeout=5)
+        self.assertIsNotNone(survivor, "the stub never started its survivor")
+        assert survivor is not None
+        self.addCleanup(kill_quietly, survivor)
+        deadline = time.monotonic() + 2
+        while alive(survivor) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(alive(survivor), "a child of a successful run outlived it")
+
+    def test_the_group_is_killed_once_per_run(self) -> None:
+        # One kill on success as on the other paths (TimeoutTest pins those),
+        # and with the whole group's signal, not the leader's alone.
+        with mock.patch.object(ytdlp.os, "killpg", wraps=os.killpg) as killpg:
+            self.runner().fetch(VIDEO_ID, self.job)
+            with self.assertRaises(FetchError):
+                self.runner().fetch("failing____", self.job)
+        self.assertEqual(killpg.call_count, 2)
+        for call in killpg.call_args_list:
+            self.assertEqual(call[0][1], signal.SIGKILL)
+
+
+@unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs are POSIX")
+class FifoResultTest(StubTestCase):
+    """R3: a FIFO where the audio should be is refused at once, never waited on."""
+
+    def test_open_regular_never_blocks_on_a_fifo(self) -> None:
+        # As if the FIFO replaced the file between the lstat and the open:
+        # without O_NONBLOCK the open would wait for a writer, holding the
+        # run, and with it the runner's lock, for good.
+        regular_file = self.temp / "regular"
+        regular_file.write_bytes(b"x")
+        regular = os.lstat(regular_file)
+        fifo = self.job / "fifo.m4a"
+        os.mkfifo(fifo)
+        outcome: list[Any] = []
+
+        def run() -> None:
+            outcome.append(ytdlp._open_regular(fifo, MIB))
+
+        with mock.patch.object(ytdlp.os, "lstat", return_value=regular):
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            thread.join(1.0)
+        if thread.is_alive():
+            # Free the blocked open, so the thread ends and the directory can go.
+            writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer)
+            thread.join(5.0)
+            self.fail("_open_regular blocked on a FIFO")
+        self.assertEqual(outcome, [None])
+        # Acceptance: the same call opens the regular file.
+        opened = ytdlp._open_regular(regular_file, MIB)
+        self.assertIsNotNone(opened)
+        assert opened is not None
+        os.close(opened[0])
+        self.assertEqual(opened[1], 1)
 
 
 @unittest.skipUnless(sys.platform.startswith("linux") and os.path.exists(PRLIMIT), "util-linux prlimit")

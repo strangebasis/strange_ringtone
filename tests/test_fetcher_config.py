@@ -17,6 +17,7 @@ import strange_ringtone_fetch
 from strange_ringtone_fetch import __main__ as entry
 from strange_ringtone_fetch import config
 from strange_ringtone_fetch.config import ConfigError, Settings
+from test_config import ReadRecorder
 
 ORIGIN = "https://ringtones.example.internal"
 PACKAGE = Path(strange_ringtone_fetch.__file__).resolve().parent
@@ -33,25 +34,29 @@ class DefaultsTest(unittest.TestCase):
         settings = from_env()
         self.assertEqual(settings.public_origin, ORIGIN)
         self.assertEqual(settings.trusted_proxies, ())
-        # 600, not 900: the page refuses input over ten minutes.
-        self.assertEqual(settings.fetch_max_seconds, 600)
         self.assertEqual(settings.fetch_max_bytes, 41943040)
         self.assertEqual(settings.fetch_timeout_seconds, 120)
         self.assertEqual(settings.rate_limit_fetches_per_minute, 5)
         self.assertEqual(settings.fetch_result_ttl_seconds, 600)
-        self.assertEqual(settings.proxies, ())
         # S2: the default-route start check is on unless the operator turns it off.
         self.assertIs(settings.allow_default_route, False)
+        # The compose service of the runner, reached over `jobs` (docs/PLAN.md 6.1).
+        self.assertEqual(settings.runner_url, config.DEFAULT_RUNNER_URL)
+        self.assertEqual(config.DEFAULT_RUNNER_URL, "http://fetcher-runner:8080")
         self.assertEqual(settings.scratch_dir, config._default_scratch_dir())
+        # The video length cap and the proxies are the runner's settings now
+        # (strange_ringtone_runner.config): the fetcher runs no yt-dlp.
+        self.assertFalse(hasattr(settings, "fetch_max_seconds"))
+        self.assertFalse(hasattr(settings, "proxies"))
 
     def test_direct_construction_uses_the_same_defaults(self) -> None:
         self.assertEqual(Settings(public_origin=ORIGIN), from_env())
 
     def test_empty_optional_values_mean_the_default(self) -> None:
         names = (
-            "TRUSTED_PROXIES", "FETCH_MAX_SECONDS", "FETCH_MAX_BYTES", "FETCH_TIMEOUT_SECONDS",
-            "RATE_LIMIT_FETCHES_PER_MINUTE", "FETCH_RESULT_TTL_SECONDS", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
-            "FETCH_ALLOW_DEFAULT_ROUTE",
+            "TRUSTED_PROXIES", "FETCH_MAX_BYTES", "FETCH_TIMEOUT_SECONDS",
+            "RATE_LIMIT_FETCHES_PER_MINUTE", "FETCH_RESULT_TTL_SECONDS", "FETCH_ALLOW_DEFAULT_ROUTE",
+            "FETCH_RUNNER_URL",
         )
         self.assertEqual(from_env(**dict.fromkeys(names, "")), Settings(public_origin=ORIGIN))
 
@@ -105,6 +110,20 @@ class SharedParsersTest(unittest.TestCase):
             with self.subTest(origin=origin), self.assertRaisesRegex(ConfigError, "PUBLIC_ORIGIN"):
                 from_env(PUBLIC_ORIGIN=origin)
 
+    def test_an_empty_trusted_proxies_trusts_no_proxy(self) -> None:
+        # compose.example.yaml sets TRUSTED_PROXIES: "" on the fetcher (owner,
+        # 2026-11-05): empty must mean "trust none", never an error and never
+        # a catch-all, so the rate limit keys on the socket peer, the runner's
+        # address included, whatever X-Forwarded-For says.
+        from strange_ringtone.http_guard import client_address
+
+        trusted = from_env(TRUSTED_PROXIES="").trusted_proxies
+        self.assertEqual(trusted, ())
+        self.assertEqual(client_address("192.0.2.10", ["198.51.100.1"], trusted), "192.0.2.10")
+        # Control: a listed proxy's X-Forwarded-For is read.
+        listed = from_env(TRUSTED_PROXIES="192.0.2.0/24").trusted_proxies
+        self.assertEqual(client_address("192.0.2.10", ["198.51.100.1"], listed), "198.51.100.1")
+
     def test_trusted_proxies(self) -> None:
         self.assertEqual([str(n) for n in from_env(TRUSTED_PROXIES="10.0.0.0/8, ::1").trusted_proxies],
                          ["10.0.0.0/8", "::1/128"])
@@ -113,7 +132,7 @@ class SharedParsersTest(unittest.TestCase):
 
     def test_messages_never_repeat_the_value(self) -> None:
         secret = "s3cr3t-value"
-        for name in ("FETCH_MAX_BYTES", "HTTPS_PROXY", "NO_PROXY", "PUBLIC_ORIGIN", "FETCH_ALLOW_DEFAULT_ROUTE"):
+        for name in ("FETCH_MAX_BYTES", "FETCH_RUNNER_URL", "PUBLIC_ORIGIN", "FETCH_ALLOW_DEFAULT_ROUTE"):
             # The message check stays inside the subTest: when a name raises
             # nothing, its subTest fails alone instead of erroring on the next line.
             with self.subTest(name=name):
@@ -125,15 +144,12 @@ class SharedParsersTest(unittest.TestCase):
 class LimitsTest(unittest.TestCase):
     def test_bounds(self) -> None:
         cases = {
-            # The page decodes at most 600 s, so a longer fetch is refused at startup.
-            "FETCH_MAX_SECONDS": ("1", "600", "0", "601"),
             "FETCH_MAX_BYTES": ("1048576", "536870912", "1048575", "536870913"),
             "FETCH_TIMEOUT_SECONDS": ("1", "600", "0", "601"),
             "RATE_LIMIT_FETCHES_PER_MINUTE": ("1", "999", "0", None),
             "FETCH_RESULT_TTL_SECONDS": ("1", "999", "0", None),
         }
         attributes = {
-            "FETCH_MAX_SECONDS": "fetch_max_seconds",
             "FETCH_MAX_BYTES": "fetch_max_bytes",
             "FETCH_TIMEOUT_SECONDS": "fetch_timeout_seconds",
             "RATE_LIMIT_FETCHES_PER_MINUTE": "rate_limit_fetches_per_minute",
@@ -150,48 +166,68 @@ class LimitsTest(unittest.TestCase):
                         from_env(**{name: bad})
 
 
-class ProxyTest(unittest.TestCase):
-    def test_http_proxies_are_kept_in_a_fixed_order(self) -> None:
-        settings = from_env(NO_PROXY="localhost,.example.internal,10.0.0.0/8", HTTP_PROXY="http://proxy.example.internal:3128",
-                            HTTPS_PROXY="http://proxy.example.internal:3128/")
-        self.assertEqual(settings.proxies, (
-            ("HTTPS_PROXY", "http://proxy.example.internal:3128/"),
-            ("HTTP_PROXY", "http://proxy.example.internal:3128"),
-            ("NO_PROXY", "localhost,.example.internal,10.0.0.0/8"),
-        ))
+class RunnerUrlTest(unittest.TestCase):
+    """FETCH_RUNNER_URL: where the fetcher finds its runner, checked like a proxy URL (docs/PLAN.md 6.1)."""
 
-    def test_lowercase_variants_are_not_read(self) -> None:
-        self.assertEqual(from_env(https_proxy="http://proxy.example.internal:3128").proxies, ())
+    def test_default_is_the_compose_service(self) -> None:
+        # The variable is read; unset or empty means the compose service.
+        environ = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN})
+        self.assertEqual(Settings.from_env(environ).runner_url, "http://fetcher-runner:8080")
+        self.assertIn("FETCH_RUNNER_URL", environ.looked_up)
+        self.assertEqual(from_env(FETCH_RUNNER_URL="").runner_url, "http://fetcher-runner:8080")
 
-    def test_bad_proxy_urls_refuse_to_start(self) -> None:
+    def test_a_valid_url_is_kept_as_written(self) -> None:
+        for value in ("http://runner.example.invalid:8081", "http://198.51.100.7:8080", "http://[2001:db8::7]:8080",
+                      "http://fetcher-runner"):
+            with self.subTest(value=value):
+                self.assertEqual(from_env(FETCH_RUNNER_URL=value).runner_url, value)
+
+    def test_bad_urls_refuse_to_start(self) -> None:
         for value in (
-            # Without requests, yt-dlp's urllib handler speaks only to http:// proxies.
-            "https://proxy.example.internal:3128",
-            "socks5://proxy.example.internal:1080",
-            "proxy.example.internal:3128",
+            # Plain HTTP over `jobs` only: the client speaks nothing else.
+            "https://runner.example.invalid:8080",
+            "socks5://runner.example.invalid:1080",
+            "runner.example.invalid:8080",
             # Credentials would be a secret outside a *_FILE variable.
-            "http://user:pass@proxy.example.internal:3128",
-            "http://user@proxy.example.internal:3128",
-            "http://proxy.example.internal:3128/path",
-            "http://proxy.example.internal:3128?x=1",
-            "http://proxy.example.internal:3128#x",
-            "http://proxy.example.internal:",
-            "http://proxy.example.internal:99999",
-            "http://proxy.example.internal:31a8",
+            "http://user:pass@runner.example.invalid:8080",
+            "http://user@runner.example.invalid:8080",
+            "http://runner.example.invalid:8080/path",
+            "http://runner.example.invalid:8080?x=1",
+            "http://runner.example.invalid:8080#x",
+            "http://runner.example.invalid:",
+            "http://runner.example.invalid:99999",
+            "http://runner.example.invalid:80a8",
             "http://",
-            "http://proxy.example.internal :3128",
-            "http://pröxy.example.internal:3128",
-            "http://proxy.example.internal:3128\n",
+            "http://runner.example.invalid :8080",
+            "http://r\u00fcnner.example.invalid:8080",
+            "http://runner.example.invalid:8080\n",
             "http://" + "a" * 1100,
         ):
-            for name in ("HTTPS_PROXY", "HTTP_PROXY"):
-                with self.subTest(name=name, value=value), self.assertRaisesRegex(ConfigError, name):
-                    from_env(**{name: value})
+            with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "FETCH_RUNNER_URL"):
+                from_env(FETCH_RUNNER_URL=value)
 
-    def test_bad_no_proxy_refuses_to_start(self) -> None:
-        for value in ("a b", "localhost;rm", "x\n", "é", "a" * 1025):
-            with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "NO_PROXY"):
-                from_env(NO_PROXY=value)
+    def test_the_refusals_fit_a_runner_address_too(self) -> None:
+        # RC1.9: one check for the proxies and FETCH_RUNNER_URL, so no
+        # message may call the runner's address a proxy.
+        for value in ("http://runner.example.invalid:99999", "https://runner.example.invalid:8080",
+                      "http://user@runner.example.invalid:8080", "http://runner.example.invalid:8080/path"):
+            with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "FETCH_RUNNER_URL") as raised:
+                from_env(FETCH_RUNNER_URL=value)
+            self.assertNotIn("proxy", str(raised.exception).lower())
+
+    def test_the_fetcher_reads_no_proxy_variable_and_no_max_seconds(self) -> None:
+        # R2: the proxies reach the runner's yt-dlp, and FETCH_MAX_SECONDS is
+        # the runner's filter; the fetcher looks up none of them, so it can't
+        # pass them anywhere and a value it doesn't use can't stop it.
+        environ = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN})
+        Settings.from_env(environ)
+        self.assertIn("FETCH_RUNNER_URL", environ.looked_up)
+        never = {"HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy", "FETCH_MAX_SECONDS"}
+        self.assertEqual(environ.looked_up & never, set())
+        settings = from_env(HTTPS_PROXY="socks5://x.example.invalid:1", FETCH_MAX_SECONDS="0")
+        self.assertFalse(hasattr(settings, "proxies"))
+        self.assertFalse(hasattr(settings, "fetch_max_seconds"))
+        self.assertEqual(settings, Settings(public_origin=ORIGIN))
 
 
 class ImportRestrictionTest(unittest.TestCase):
@@ -215,7 +251,9 @@ class ImportRestrictionTest(unittest.TestCase):
     def test_only_config_and_http_guard_come_from_the_core(self) -> None:
         found = self.imports()
         self.assertEqual(
-            sorted(found), ["__init__.py", "__main__.py", "config.py", "jobs.py", "routes.py", "server.py", "ytdlp.py"]
+            sorted(found),
+            ["__init__.py", "__main__.py", "config.py", "jobs.py", "metadata.py", "routes.py", "runner_client.py",
+             "server.py"],
         )
         allowed = {"strange_ringtone.config", "strange_ringtone.http_guard"}
         used: set[str] = set()
@@ -227,6 +265,15 @@ class ImportRestrictionTest(unittest.TestCase):
                         self.assertIn(owner, allowed)
                     used.add(owner)
         self.assertEqual(used, allowed)
+
+    def test_the_fetcher_never_imports_the_runner_package(self) -> None:
+        # The fetcher's process holds no yt-dlp run code: that is the runner's
+        # (docs/PLAN.md 6.1), and yt-dlp itself runs only in its venv.
+        for name, imports in self.imports().items():
+            for module in imports:
+                top = module.split(".")[0]
+                with self.subTest(file=name, module=module):
+                    self.assertNotIn(top, ("strange_ringtone_runner", "yt_dlp", "yt_dlp_ejs"))
 
     def test_no_third_party_imports(self) -> None:
         # yt-dlp runs as a subprocess, never in the server's process.

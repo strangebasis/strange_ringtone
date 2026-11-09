@@ -59,7 +59,7 @@ class Limits:
     upload_bytes_per_tunnel: int = 262144  # 256 KiB
     upload_bytes_per_minute: int = 4194304  # 4 MiB
     # 16 MiB: one 10 MiB yt-dlp range plus headroom (fixed by the owner,
-    # 2026-11-03; never sized from FETCH_MAX_BYTES, so a compromised fetcher
+    # 2026-11-03; never sized from FETCH_MAX_BYTES, so a compromised runner
     # moves at most this much per tunnel; tests/image_fetcher pins it against
     # the pinned yt-dlp).
     download_bytes_per_tunnel: int = 16777216
@@ -68,7 +68,7 @@ class Limits:
     resolve_deadline_seconds: int = 5
     connect_timeout_seconds: int = 10
     # Lines the default log writes per sliding minute. Refusals cost a client
-    # no tunnel budget, so without this a compromised fetcher could write log
+    # no tunnel budget, so without this a compromised runner could write log
     # lines as fast as the forwarder answers and fill the Docker host's disk.
     # 600 keeps an operator's view of a real incident; the rest are counted.
     log_lines_per_minute: int = 600
