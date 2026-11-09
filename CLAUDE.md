@@ -61,7 +61,7 @@ is authoritative.
   Both refuse to start with a default route unless
   `FETCH_ALLOW_DEFAULT_ROUTE=true`. The runner is its container's PID 1
   (`init: false`, stated) and makes itself non-dumpable. Before and after
-  each yt-dlp run it kills every other process in its container
+  each yt-dlp run it kills every other process of its UID in its container
   (`kill(-1, SIGKILL)`) and reaps them. Where it can't (anywhere but PID 1)
   it refuses to start (exit 4) unless `FETCH_ALLOW_NO_SWEEP=true`, which is
   for a local run or a host that can't run it as PID 1, never for one that

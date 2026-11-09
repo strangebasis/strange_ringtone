@@ -104,8 +104,9 @@ class Limits:
     file_size_bytes: int = 40 * 1024 * 1024 + 1024 * 1024
     # yt-dlp, Deno and V8 open a few dozen files between them.
     open_files: int = 256
-    # RLIMIT_NPROC counts every thread of UID 10001 in the container: the
-    # server's workers, yt-dlp, and Deno's V8 threads.
+    # RLIMIT_NPROC counts every thread of UID 10001, in every container that
+    # runs as it (docs/PLAN.md 6.1): the runner's workers, yt-dlp, Deno's V8
+    # threads, and the other services' threads too.
     processes: int = 512
 
 
@@ -415,8 +416,10 @@ class YtDlp:
             self._running.add(proc)
         try:
             try:
-                # stdout is read only to keep the pipe from filling; neither
-                # stream is kept or logged.
+                # stdout is read only to keep the pipe from filling. Both
+                # streams are held in memory until the run ends, bounded only
+                # by the container's memory limit; neither is logged, and
+                # neither leaves this module.
                 _stdout, stderr = proc.communicate(timeout=self.timeout_seconds)
             except subprocess.TimeoutExpired:
                 _kill_group(proc)

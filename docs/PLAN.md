@@ -423,7 +423,9 @@ bullets below describe the image as of PR B, with yt-dlp in the runner.
   which the contract documents as the operator's job. yt-dlp's environment
   is built from scratch by the runner: fixed values, `HOME` and `DENO_DIR`
   inside the job directory under `/tmp` (the root filesystem is read-only,
-  and nothing carries over between jobs), and `HTTPS_PROXY`, `HTTP_PROXY` and
+  and the job directory is removed after every run; what a run writes
+  elsewhere on `/tmp` stays until the container restarts, 6.1, Accepted
+  risks), and `HTTPS_PROXY`, `HTTP_PROXY` and
   `NO_PROXY` when set (`compose.example.yaml` points the runner's
   `HTTPS_PROXY` at the forwarder), never the runner's own environment. That
   environment is not handed to yt-dlp, but yt-dlp can read what the
@@ -1017,8 +1019,11 @@ listens on all its interfaces, `outside` included, where the Docker host can
 reach port 3128 (Engine 28 and newer drop direct routing to unpublished
 ports from elsewhere); nothing else may join `outside`. A compromised
 forwarder shares `egress` with the runner and can reach its port 8080 there,
-where the runner answers only a well-formed job request and runs yt-dlp
-through the forwarder itself. A compromised runner shares `jobs` with the
+where the runner answers its health path, a well-formed job request, which
+runs yt-dlp through the forwarder itself, and that job's audio request: it
+could keep the runner's one job slot and its workers busy, or make it
+discard an uncollected result, so that fetches fail, and it never sees a
+token the fetcher minted. A compromised runner shares `jobs` with the
 fetcher and can reach its port 8080 there: the Origin check needs only the
 public origin, which the example keeps out of the runner's container (it
 gets none of `.env` but its three limits) but which is no secret, so the
@@ -1037,7 +1042,12 @@ kill-and-reap sweep at both run boundaries ends and reaps what left the
 group, so a run's child can't keep the runner's reach between jobs, touch
 the next job's files or hold a share of `pids_limit`; and the runner is
 non-dumpable, so such a child can't hide in it by ptrace either, whatever
-the host's `ptrace_scope`. The sweep's cost is
+the host's `ptrace_scope`. What a run can leave behind is files: the runner
+removes the job directory and the results it tracks, not what a run wrote
+elsewhere on its `/tmp`. Nothing reads such a file back and `noexec` keeps
+it from running, but it can fill the tmpfs, and every later fetch then
+fails, while `/healthz` still answers, until the runner is restarted;
+clearing `/tmp` at the run boundary is not built yet. The sweep's cost is
 accepted (owner, 2026-11-05): a `docker exec` or health check running in
 the runner's container at a run boundary is killed too, and the runner must
 be that container's PID 1. The health check's retries absorb a coincidence,

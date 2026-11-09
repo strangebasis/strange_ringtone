@@ -379,7 +379,10 @@ services:
     # out. Not on `fetcher` or `core`, so yt-dlp, yt-dlp-ejs and Deno never
     # share a network with the reverse proxy or the core. The runner listens
     # on all its interfaces, so the forwarder can reach its port 8080 over
-    # `egress`, where it answers only a well-formed job request. Each
+    # `egress`, where it answers its health path, a well-formed job request
+    # and that job's audio request, and nothing else. A compromised forwarder
+    # could keep the runner's one job slot and its workers busy that way, so
+    # that fetches fail; it never sees a token the fetcher made. Each
     # attachment turns forwarding and redirects off on its own interface, as
     # for the fetcher.
     networks:
@@ -476,8 +479,9 @@ services:
     # on `fetcher`, `jobs` or `core`, so a compromised forwarder reaches
     # neither the core, the reverse proxy nor the fetcher. It shares `egress`
     # with the runner, which listens on all its interfaces, so it can reach
-    # the runner's port 8080 there, where the runner answers only a
-    # validated job request and runs yt-dlp through this very forwarder. It
+    # the runner's port 8080 there, where the runner answers its health
+    # path, a validated job request, which runs yt-dlp through this very
+    # forwarder, and that job's audio request (see the runner's networks). It
     # listens on 3128 on all its interfaces, `outside` included, where the
     # Docker host itself can reach it (Engine 28 and newer drop direct
     # routing to unpublished ports from elsewhere): nothing but the forwarder
