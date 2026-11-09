@@ -26,4 +26,4 @@ jobs:
 
   gitleaks:
     name: Gitleaks
-    uses: strangebasisdevs/strange_security/.github/workflows/gitleaks.yml@26c089bb86b845fac6e3417c24469bef6bf9a713 # v1.0.0
+    uses: strangebasisdevs/strange_security/.github/workflows/gitleaks.yml@b3a6732ecbe1796fb2e7eaeedb228c705962db44 # v1.2.1
