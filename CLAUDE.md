@@ -66,6 +66,10 @@ is authoritative.
   it refuses to start (exit 4) unless `FETCH_ALLOW_NO_SWEEP=true`, which is
   for a local run or a host that can't run it as PID 1, never for one that
   can. No test ever sends the real `kill(-1)` outside a throwaway container.
+  The runner's container is given only the runner's own settings, never
+  the shared `.env` (the compose example passes it its three limits by
+  name and sets `HTTPS_PROXY`): a health check or `docker exec` there runs
+  with the container's environment, where yt-dlp can read it.
   Every container of the fetcher image turns forwarding off on every
   interface and refuses ICMP redirects (never by writing
   `net.ipv4.ip_forward`, which resets the redirect setting), and each has a

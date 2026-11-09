@@ -266,16 +266,30 @@ services:
     # FETCH_ALLOW_NO_SWEEP. As PID 1 it says on stderr at startup that it
     # sweeps.
     init: false
-    # The same .env: the runner reads FETCH_MAX_SECONDS, FETCH_MAX_BYTES,
-    # FETCH_TIMEOUT_SECONDS, FETCH_ALLOW_DEFAULT_ROUTE, FETCH_ALLOW_NO_SWEEP
-    # and the proxy variables, and nothing browser-facing. This layout runs
-    # the runner as PID 1, so it never needs FETCH_ALLOW_NO_SWEEP: leave it
-    # out of .env.
-    env_file: .env
+    # No env_file, unlike the core and the fetcher. Docker starts every health
+    # check, and every `docker exec`, with the container's environment and
+    # user, and yt-dlp, which runs as that user, can read such a process's
+    # /proc/<pid>/environ while it runs. The runner keeps yt-dlp out of its
+    # own (it is non-dumpable) and hands it an environment built from
+    # scratch, but what this container is given can be read inside it all the
+    # same. So it is given the runner's own settings and nothing else from
+    # .env: not PUBLIC_ORIGIN, which a compromised run would need to pass the
+    # fetcher's Origin check over `jobs` (README, Networks), not the core's
+    # settings, and nothing else you keep in that file.
     environment:
-      # Set here, not in .env (a service's environment wins over its
-      # env_file), because the example's point is that yt-dlp can leave only
-      # through the forwarder.
+      # The three limits the runner shares with the fetcher, taken from .env
+      # by name: a key with no value gets the value Compose itself was given,
+      # from .env or from the shell that runs it. Unset means the default.
+      FETCH_MAX_SECONDS:
+      FETCH_MAX_BYTES:
+      FETCH_TIMEOUT_SECONDS:
+      # Set here, like everything about the runner that depends on the
+      # layout: the example's point is that yt-dlp can leave only through the
+      # forwarder. The runner's other settings are not passed on from .env.
+      # This layout gives it no default route and runs it as PID 1, so it
+      # needs neither FETCH_ALLOW_DEFAULT_ROUTE nor FETCH_ALLOW_NO_SWEEP, and
+      # yt-dlp needs no HTTP_PROXY or NO_PROXY. A layout that does sets them
+      # here, in its own copy of this file.
       HTTPS_PROXY: http://fetcher-forwarder:3128
     # The same hardening as the core and the fetcher.
     user: "10001:10001"

@@ -345,8 +345,9 @@ class ContractDocsTest(unittest.TestCase):
         return set(re.findall(r"^\| `([A-Z][A-Z0-9_]*)` \|", section, re.MULTILINE))
 
     def env_example_blocks(self) -> tuple[str, str]:
-        # .env.example serves both images (compose.example.yaml gives both the
-        # same .env); the fetcher's settings follow its marker line.
+        # .env.example serves both images (compose.example.yaml gives the core
+        # and the fetcher the same .env); the fetcher's settings follow its
+        # marker line.
         text = (helpers.ROOT / ".env.example").read_text(encoding="utf-8")
         core, marker, fetcher = text.partition(ENV_EXAMPLE_FETCHER_MARKER)
         self.assertTrue(marker, "the fetcher block's marker line is missing from .env.example")
@@ -366,9 +367,10 @@ class ContractDocsTest(unittest.TestCase):
         from strange_ringtone_fetch.config import Settings as FetcherSettings
         from strange_ringtone_runner.config import Settings as RunnerSettings
 
-        # One .env serves the fetcher image's containers (compose.example.yaml
-        # gives the fetcher and its runner the same file), so its fetcher block
-        # lists what either of them reads.
+        # One .env.example documents the fetcher image's settings: its fetcher
+        # block lists what the fetcher or its runner reads, although
+        # compose.example.yaml gives the fetcher the whole .env and the
+        # runner only its three limits from it (docs/PLAN.md 6.1, R6).
         fetcher = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN})
         FetcherSettings.from_env(fetcher)
         runner = ReadRecorder({"PUBLIC_ORIGIN": ORIGIN, "TRUSTED_PROXIES": ""})

@@ -664,6 +664,24 @@ def _is_ip(text: object) -> bool:
     return True
 
 
+def _service_block(text: str, service: str) -> str:
+    """The lines of one service in compose.example.yaml's own text, blank lines and comments left out."""
+    lines = text.splitlines()
+    header = f"  {service}:"
+    if header not in lines:
+        return ""
+    block: list[str] = []
+    for line in lines[lines.index(header) + 1:]:
+        comment = line.lstrip().startswith("#")
+        # A service's own lines sit four spaces deep or more: the next
+        # service, or a top-level key, ends the block.
+        if line.strip() and not comment and not line.startswith("    "):
+            break
+        if line.strip() and not comment:
+            block.append(line)
+    return "\n".join(block)
+
+
 def _override_yaml(test_env: Path) -> str:
     # JSON strings are valid YAML double-quoted scalars, so a temp path with
     # spaces or a drive letter needs no escaping of our own.
@@ -671,7 +689,9 @@ def _override_yaml(test_env: Path) -> str:
     image = json.dumps(IMAGE)
     # compose resolves every service's env_file, `config` and services it
     # doesn't start included, so the core's is overridden too: the
-    # developer's .env is never read, and CI has none.
+    # developer's .env is never read, and CI has none. The runner gets no
+    # env_file here, because the example gives it none (R6): its three
+    # limits come, by name, from the --env-file every compose call passes.
     return (
         "services:\n"
         "  core:\n"
@@ -687,8 +707,6 @@ def _override_yaml(test_env: Path) -> str:
         "    build: !reset null\n"
         f"    image: {image}\n"
         "    pull_policy: never\n"
-        "    env_file: !override\n"
-        f"      - {env}\n"
         "  fetcher-forwarder:\n"
         "    build: !reset null\n"
         f"    image: {image}\n"
@@ -1050,6 +1068,51 @@ class LayoutTest(unittest.TestCase):
                    if "FETCH_ALLOW_NO_SWEEP" in line and not line.lstrip().startswith("#")]
         self.assertEqual(setting, [], "compose.example.yaml sets FETCH_ALLOW_NO_SWEEP")
 
+    def test_the_runners_container_is_given_only_its_own_settings(self) -> None:
+        """R6: no env_file for the runner; its environment is its three limits and HTTPS_PROXY, whatever .env holds."""
+        # Docker starts every health check and `docker exec` with the
+        # container's environment and user, and yt-dlp, which runs as that
+        # user, can read such a process's /proc/<pid>/environ. So whatever
+        # the runner's container is given, the code it runs can read: it gets
+        # no PUBLIC_ORIGIN (which a compromised run would need to pass the
+        # fetcher's Origin check over `jobs`), no setting of the core and
+        # nothing else an operator keeps in .env.
+        own = {"FETCH_MAX_SECONDS", "FETCH_MAX_BYTES", "FETCH_TIMEOUT_SECONDS", "HTTPS_PROXY"}
+        environment = self._service("fetcher-runner").get("environment") or {}
+        self.assertIsInstance(environment, dict, environment)
+        self.assertIn("HTTPS_PROXY", environment)
+        self.assertLessEqual(set(environment), own, "the runner's container is given more than its own settings")
+        # `compose config` folds an env_file into `environment` and drops the
+        # key, so the example's own text is read for it. Control: the block
+        # found is the runner's, and the same reading finds the fetcher's
+        # env_file.
+        text = COMPOSE_FILE.read_text(encoding="utf-8")
+        block = _service_block(text, "fetcher-runner")
+        self.assertIn("/app/fetcher/runner.py", block, "the runner's block of compose.example.yaml was not found")
+        self.assertIn("env_file:", _service_block(text, "fetcher"))
+        setting = [line for line in block.splitlines() if line.strip().startswith("env_file")]
+        self.assertEqual(setting, [], "compose.example.yaml gives the runner an env_file")
+        # With an env file as an operator's might be: the three limits arrive
+        # by name and nothing else does. Control: the fetcher, which is given
+        # the file, holds the origin and the operator's own variable.
+        limits = {"FETCH_MAX_SECONDS": "300", "FETCH_MAX_BYTES": "2097152", "FETCH_TIMEOUT_SECONDS": "60"}
+        stack = Stack()
+        try:
+            with open(stack.test_env, "a", encoding="ascii", newline="\n") as handle:
+                handle.write("TRUSTED_PROXIES=192.0.2.0/24\nOPERATORS_OWN_SETTING=1\n")
+                for name, value in limits.items():
+                    handle.write(f"{name}={value}\n")
+            result = stack.compose("config", "--format", "json")
+        finally:
+            stack.close()
+        self.assertEqual(result.returncode, 0, f"docker compose config: {result.stderr.strip()}")
+        services = json.loads(result.stdout).get("services") or {}
+        fetcher = (services.get("fetcher") or {}).get("environment") or {}
+        self.assertEqual(fetcher.get("PUBLIC_ORIGIN"), ORIGIN, fetcher)
+        self.assertEqual(fetcher.get("OPERATORS_OWN_SETTING"), "1", fetcher)
+        runner = (services.get("fetcher-runner") or {}).get("environment") or {}
+        self.assertEqual(runner, {**limits, "HTTPS_PROXY": PROXY_URL})
+
     def test_no_service_has_a_volume_and_only_tmp_is_writable(self) -> None:
         """Stateless (CLAUDE.md): no volume, a read-only root, and /tmp's tmpfs the only writable mount."""
         config = self._config()
@@ -1084,10 +1147,9 @@ class LayoutTest(unittest.TestCase):
         # Deno reserves a huge address space, so prlimit can't bound memory:
         # the cgroup limit does.
         self.assertIn("mem_limit", runner)
-        # No env_file check: `compose config` folds env_file into
-        # `environment` and drops the key, and the test override sets the
-        # runner's env_file anyway, so neither form would tell whether
-        # compose.example.yaml gives it one.
+        # env_file: `compose config` folds one into `environment` and drops
+        # the key, so test_the_runners_container_is_given_only_its_own_settings
+        # reads compose.example.yaml's own text for it (R6).
 
     def test_forwarder_command_and_hardening(self) -> None:
         """Supporting: the forwarder command of the fetcher image, with the contract's flags and nothing writable."""
@@ -1507,6 +1569,22 @@ class StackTest(unittest.TestCase):
         )
         state = self._probe_output(self._stack.exec_in("fetcher-runner", probe), "runner /proc/1 probe")
         self.assertEqual(state, {"cmdline": "read", "environ": "PermissionError"})
+
+    def test_a_process_started_in_the_runners_container_is_given_no_origin(self) -> None:
+        """R6: a process Docker starts in the runner's container holds its limits and proxy, never PUBLIC_ORIGIN."""
+        # `compose exec` starts a process the way Docker starts the health
+        # check: with the container's environment, as the service's user,
+        # 10001, like yt-dlp, which can read such a process's
+        # /proc/<pid>/environ whatever the runner did to its own. Control:
+        # the same probe in the fetcher's container, which is given the env
+        # file, finds the origin there.
+        probe = "import json, os\nprint(json.dumps(sorted(os.environ)))\n"
+        fetcher = self._probe_output(self._stack.exec_in("fetcher", probe), "fetcher environment probe")
+        self.assertIn("PUBLIC_ORIGIN", fetcher)
+        runner = self._probe_output(self._stack.exec_in("fetcher-runner", probe), "runner environment probe")
+        self.assertIn("HTTPS_PROXY", runner)
+        for name in ("PUBLIC_ORIGIN", "TRUSTED_PROXIES"):
+            self.assertNotIn(name, runner, f"the runner's container is given {name}")
 
     def test_t2_the_running_services_forward_nothing_and_have_the_examples_pids_cap(self) -> None:
         """K1/T2: in the three running services, IPv4 and IPv6 forwarding read 0, and pids.max is the example's."""

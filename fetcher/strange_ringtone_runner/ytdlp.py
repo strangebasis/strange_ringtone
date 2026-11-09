@@ -341,8 +341,12 @@ class YtDlp:
         """The child's whole environment: fixed values plus the operator's proxy settings.
 
         yt-dlp hands its own environment to Deno, so this is everything either
-        of them sees. A token or other secret in the server's environment
-        never reaches code that talks to the internet.
+        of them is handed. Nothing else of the runner's environment is passed
+        on, but that does not hide it: a health check or `docker exec` in the
+        runner's container runs with the container's environment and yt-dlp's
+        UID, and yt-dlp can read such a process's /proc entries. So the
+        container is given only the runner's own settings
+        (compose.example.yaml), and never a secret.
         """
         env = {
             "PATH": _CHILD_PATH,
