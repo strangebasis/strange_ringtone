@@ -89,7 +89,9 @@ is authoritative.
 - **Web:** strict CSP (no inline script, no third-party origins), `nosniff`,
   `DENY` framing, and `Referrer-Policy: same-origin`. Every state change is a
   POST that requires exactly one `Origin` equal to `PUBLIC_ORIGIN`, failing
-  closed. Escape all rendered text; the client uses `textContent` only.
+  closed. The one exception: collecting a fetched audio is a GET that
+  deletes it and needs the job's 128-bit ID (`docs/PLAN.md`, section 8). Add
+  no other. Escape all rendered text; the client uses `textContent` only.
   `X-Forwarded-For` is trusted only from `TRUSTED_PROXIES` (empty by default;
   the compose example pins the fetcher's to empty, and it never covers the
   `jobs` network).
@@ -169,12 +171,12 @@ starts enforcing once `.release-please-manifest.json` records a release.
     arguments, and a timeout. The reason names those guards, and a test pins
     them.
 - **`main` is protected by a ruleset:** changes go through a PR, squash-merge
-  only, and the required checks are Ruff, Unit tests, Image tests,
-  Conventional PR title, Deployment contract change, and the gate's Semgrep,
-  Trivy and Gitleaks jobs. Fetcher image tests and Compose topology tests are
-  to join them (`docs/PLAN.md`, section 9.2); the owner adds them by hand.
-  Renaming a job means updating the ruleset in the same change. `v*` tags can
-  be created, moved or deleted only by organisation admins.
+  only, and the required checks are Ruff, Unit tests, Image tests, Fetcher
+  image tests, Compose topology tests, Conventional PR title, Deployment
+  contract change, and the gate's Semgrep, Trivy and Gitleaks jobs
+  (`docs/PLAN.md`, section 9.2). Renaming a job means updating the ruleset in
+  the same change. A tag ruleset restricts `v*` tags: never create, move or
+  delete one.
 - Workflows default to `contents: read`. Never use `pull_request_target` or
   `workflow_run` with secrets. Write scopes exist only in the release-please and
   publish jobs, plus `security-events: write` in the security gate, which the

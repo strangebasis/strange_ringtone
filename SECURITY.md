@@ -26,15 +26,18 @@ In scope:
 Out of scope:
 
 - how a particular deployment configures its reverse proxy, network or access
-  control
+  control. The app has no login of its own: the README's
+  [Security model](README.md#security-model) says what it leaves to the
+  deployment.
 - bugs in upstream projects (FFmpeg, yt-dlp, Deno, Python). Please report those
   upstream. A report showing that this project exposes such a bug, or makes it
   worse, is in scope.
 
 ## Verifying an image
 
-Every release image is published with build provenance and an SBOM. Before you
-pin a digest, verify it:
+There is no release yet, so there is nothing to verify today. Release images
+will be published with build provenance and an SBOM (docs/PLAN.md, section
+9.3). Once one is, verify its digest before you pin it:
 
 ```bash
 gh attestation verify oci://ghcr.io/<owner>/strange_ringtone@sha256:<digest> --repo <owner>/strange_ringtone

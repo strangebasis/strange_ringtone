@@ -26,6 +26,11 @@
 # so a proxy running on the host itself, or with `network_mode: host`, can't
 # reach core or fetcher.
 #
+# The app has no login: whoever reaches the proxy can use everything it
+# offers, so restrict who can. That, and what else the proxy must do (read
+# each request completely before it passes it on, keep result addresses out
+# of its access log), is in the README's "Security model".
+#
 # A proxy kept in another Compose project (the usual case) declares these
 # networks `external: true` under their real names, the project name plus the
 # network name: `strange_ringtone_core` and `strange_ringtone_fetcher`, which
