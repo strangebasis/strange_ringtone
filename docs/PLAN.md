@@ -458,7 +458,10 @@ bullets below describe the image as of PR B, with yt-dlp in the runner.
   404), streams the file once as `audio/mp4` with `no-store`, then deletes it
   and forgets the job, so a later status request is a 404 too. A TTL sweep
   (`FETCH_RESULT_TTL_SECONDS` from completion) catches any file that was never
-  collected. The fetcher holds **at most one** finished, uncollected result:
+  collected. It leaves a result that is being streamed alone: a stream has no
+  deadline of its own, only the 30 s timeout of each write, so a page that
+  reads slowly can hold its file for hours.
+  The fetcher holds **at most one** finished, uncollected result:
   `/tmp` is sized for one download in flight plus one waiting, so when a
   download finishes, an older one still waiting is deleted. A result being
   streamed counts too, because its file keeps its space until the stream
@@ -1158,10 +1161,17 @@ The Shortcut has two actions:
 2. *Open URL* `<PUBLIC_ORIGIN>/#yt=<URL-encoded input>`.
 
 The fragment never reaches the server or proxy logs. The page extracts the
-video ID and `t=` on the device, from `watch?v=`, `youtu.be/`, `/shorts/`,
-`/live/` and `music.youtube.com` links. It drops tracking parameters such as
+video ID and `t=` on the device, from `watch?v=`, `/shorts/`, `/live/`,
+`/embed/` and `/v/` links on `youtube.com`, `www.youtube.com`,
+`m.youtube.com` and `music.youtube.com`, from `youtu.be/` links, or from a
+bare 11-character ID. It drops tracking parameters such as
 `si=` and sends only the ID to the fetcher. The README documents how to build
 the Shortcut, with a placeholder origin.
+
+Opening the app with `#yt=` in its address starts the fetch without a tap,
+which is what the Shortcut needs, so any web page can start one by linking
+there. It is one fetch against the shared rate limit, of a video named by
+its ID alone, shown to the person who followed the link.
 
 ### 7.5 AGPL source link
 
@@ -1172,6 +1182,12 @@ going off-site.
 
 ## 8. Security summary
 
+- **Access:** the app has no login and no accounts. Whoever reaches
+  `PUBLIC_ORIGIN` can use everything the deployment offers, and restricting
+  who can is the deployment's job: a private network, a VPN (the cost table
+  in section 2 assumes one for remote access) or authentication at the
+  proxy. The README's "Security model" tells operators so, with what the
+  reverse proxy has to do.
 - **Headers on every response:**
   - `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src
     'self'; img-src 'self'; media-src 'self'; connect-src 'self'; base-uri
@@ -1188,9 +1204,13 @@ going off-site.
     on HTTPS for every subdomain of the `PUBLIC_ORIGIN` host as well, so serve
     the app on a host of its own rather than on a domain whose other hosts
     lack TLS.
-- **CSRF:** every state change is a POST, and each requires exactly one `Origin`
-  equal to `PUBLIC_ORIGIN` (no `Referer` fallback). Request bodies are
-  `audio/wav` or `application/json` only.
+- **CSRF:** every request that starts work is a POST, and each requires
+  exactly one `Origin` equal to `PUBLIC_ORIGIN` (no `Referer` fallback).
+  Request bodies are `audio/wav` or `application/json` only. One GET changes
+  state: collecting a fetched audio deletes it (section 6). It needs the
+  job's 128-bit ID, which no other site can know, so it can't be forged.
+  The check stops other websites, not other clients: a client that is not a
+  browser sends whatever `Origin` it likes.
 - **Client IP:** `X-Forwarded-For` is honoured only from `TRUSTED_PROXIES`, which
   is empty by default. The example sets the fetcher's to empty whatever
   `.env` says, and it must never cover `jobs`, where the runner's requests
@@ -1203,12 +1223,52 @@ going off-site.
   fallback (5.6).
 - **Process limits:** `python -I`. A fixed thread pool and global concurrency
   caps. Body reads have socket timeouts, and a whole body must arrive within
-  60 s of taking a render slot (408 otherwise), so a trickled upload can't hold
-  a slot indefinitely. The proxy handles slow-client defence beyond that.
+  60 s of taking a render slot (408 otherwise), so one trickled upload can't
+  hold a slot for longer than that. A client that sends one after another
+  can: each costs it one hit of the rate limit, and two a minute keep both
+  default slots busy. A request head has no deadline of its own, only the
+  30 s timeout of each read, so one that never ends holds one of the 16
+  workers. Both are the proxy's to stop, by reading each request completely
+  before it passes it on (README, Security model).
 - **Egress (fetcher):** the fetcher image's own forwarder is the only way
   out: one CONNECT allowlist to YouTube's hosts on port 443, within budgets.
   yt-dlp runs in a container that shares no network with the reverse proxy
   (6.1).
+
+**Open risks in the core** (from the security review of 2026-11-09; not
+fixed, and none accepted yet. The fetcher image's own list is 6.1's
+"Accepted risks").
+
+- **One client can lock the others out.** The render slots and the results
+  store are one pool for every user, and behind a proxy with
+  `TRUSTED_PROXIES` empty so is the rate limit. A render is counted when it
+  takes its slot, so one that is then refused for its body still counts.
+  Nothing is evicted early (5.5), and the defaults let one address render
+  100 tones in the 10 minutes a tone lives, against a `MAX_RESULTS` of 50:
+  one address can fill the store and keep it full. Not built: counting a
+  render only once its WAV has passed, and a cap on the results one address
+  holds.
+- **An exploited ffmpeg.** The WAV check (5.2) and the minimal build (5.3)
+  keep small what a client's bytes reach: the WAV demuxer, the PCM decoder
+  and encoder, the filters, the AAC encoder and the MP4 and null muxers
+  (`core/ffmpeg/components.txt`). A memory-safety bug there would run as
+  the server's own UID in the server's container, unlike yt-dlp, which has
+  a container to itself (6.1). It could read and replace every upload in
+  flight and every stored tone. What it started could outlive the render
+  and stay until the container restarts: the renderer kills ffmpeg's
+  process group only on a timeout or an error, not after a run that exits
+  by itself, and `setsid()` leaves the group in any case. Where the host's
+  `kernel.yama.ptrace_scope` is 0 it could write into the server, which is
+  dumpable, and serve what it likes from `'self'`, which the CSP allows.
+  `prlimit` bounds each ffmpeg process's address space, CPU time, file size
+  and open files, not the number of processes, and `compose.example.yaml`
+  gives the core service no `mem_limit` and no `pids_limit` (the fetcher
+  image's three containers have both). It has no route out: the `core`
+  network reaches the reverse proxy's container, on every port that listens
+  there, and nothing else. Not built: a group kill at the end of every
+  render, as the runner does it, the two caps and a process limit for
+  ffmpeg, a non-dumpable server as the runner is, and a UID or a container
+  of ffmpeg's own.
 
 ## 9. Supply chain, CI and releases
 
@@ -1300,22 +1360,34 @@ SARIF upload fails there. Until strange_security skips the upload for forks
 while still failing on findings, a fork's PR cannot pass the gate; a
 maintainer pushes the fork's branch into this repository instead.
 
-**Branch ruleset on `main`** (set 2026-10-25): every change needs a PR, merges
-are squash only, and force pushes and deletion are blocked. These checks are
-required, all reported by GitHub Actions:
+**Rulesets on `main`** (as GitHub reported them on 2026-11-09). The
+organisation's rulesets that apply to this repository's default branch:
+
+- Commits are signed, history is linear, and force pushes and deletion are
+  blocked. No bypass is configured for these.
+- Every change needs a pull request, squash-merged, with an approving review
+  from the code owner that is newer than the last push, and every review
+  thread resolved. Organisation admins may bypass this rule, through a pull
+  request only.
+- The security gate's three scans are required, with no bypass: Semgrep /
+  Semgrep scan, Trivy / Trivy filesystem scan and Gitleaks / Gitleaks
+  history scan.
+
+This repository's own ruleset requires the three scans again and the checks
+below, all reported by GitHub Actions, on a branch that is up to date with
+`main`. It has no bypass either:
 
 - Ruff
 - Unit tests
+- Image tests
 - Conventional PR title
 - Deployment contract change
-- Semgrep / Semgrep scan
-- Trivy / Trivy filesystem scan
-- Gitleaks / Gitleaks history scan
-- Image tests (from milestone 3; the owner adds it to the ruleset)
-- Fetcher image tests (from milestone 5; the owner adds it to the ruleset,
-  named exactly so)
-- Compose topology tests (from the egress follow-up's PR A; the owner adds it
-  to the ruleset, named exactly so)
+
+Two jobs are still to join them: Fetcher image tests (from milestone 5) and
+Compose topology tests (from the egress follow-up's PR A). The owner adds
+each to the ruleset, named exactly so. Until then a PR can merge with either
+one failing, and only review keeps a change that breaks the layout out of
+`main`: the compose tests are the only proof of the layout.
 
 The repository squash-merges with the PR title as the commit subject, which is
 what release-please reads. A **tag ruleset** on `v*` lets only organisation
@@ -1614,11 +1686,17 @@ docs/PLAN.md
 
 - YouTube sees the server's IP fetch the video, the same as watching it. No
   account or cookies are used.
-- The Shortcut uses a URL fragment, so proxies never log which video was
+- The Shortcut uses a URL fragment, so proxies never log the link that was
   shared, and `si=` share tracking is stripped on the device.
 - Rendered files carry no metadata except a title. The server keeps nothing:
   each result is deleted after `RESULT_TTL_SECONDS`, and tone names stay out of
-  URLs and logs.
+  URLs and out of the app's own logs. A name does travel in the `X-Tone-Name`
+  request header (section 3) and in the download's `Content-Disposition`
+  (5.6), and for a fetched video it starts as the video's title, so a
+  reverse proxy that logs headers records which video it was. For the
+  minutes a result, or a fetched clip not yet collected, waits on the
+  server, its address alone downloads it, so a proxy's access log holds
+  working links for that long (README, Security model).
 - By default, Safari saves downloads to iCloud Drive → Downloads. To keep files
   off iCloud, change Settings → Apps → Safari → Downloads to *On My iPhone*.
 - No telemetry, no CDN, no web fonts, and no third-party requests from the page.
