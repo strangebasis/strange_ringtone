@@ -29,6 +29,7 @@ from typing import Any
 from unittest import mock
 
 import helpers
+from helpers import alive
 from strange_ringtone_fetch.metadata import (
     FetchError,
     Metadata,
@@ -85,21 +86,6 @@ class StubYtDlp(YtDlp):
         env = super().child_env(job_dir)
         env.update(self.extra)
         return env
-
-
-def alive(pid: int) -> bool:
-    """Whether pid still runs. A zombie (killed, not yet reaped) counts as gone."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    try:
-        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
-            return handle.read().rsplit(")", 1)[1].split()[0] != "Z"
-    except (OSError, IndexError):
-        return True
 
 
 def read_pid(pid_file: Path, timeout: float = 10) -> int | None:
