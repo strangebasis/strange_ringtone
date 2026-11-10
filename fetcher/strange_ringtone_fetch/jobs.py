@@ -14,8 +14,12 @@ runner's). So when a download finishes, any older one
 still waiting is deleted, and before the next one starts, the worker makes
 sure at most one finished download is left on the tmpfs. A download that is
 being streamed counts too: its file holds its space until the stream closes
-it, however slowly the client reads. The TTL remains the upper bound of a
-result's life, and nothing survives a restart.
+it, however slowly the client reads. The TTL is the upper bound of a
+result's life only while it waits to be collected: the sweep leaves a
+download that is being streamed alone, and that one ends with its client,
+with a write that outlasts the handler's socket timeout, or when the worker
+needs its space and streams alone fill the budget. Nothing survives a
+restart.
 """
 from __future__ import annotations
 

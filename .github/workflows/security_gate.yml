@@ -22,7 +22,7 @@ jobs:
 
   trivy:
     name: Trivy
-    uses: strangebasisdevs/strange_security/.github/workflows/trivy.yml@26c089bb86b845fac6e3417c24469bef6bf9a713 # v1.0.0
+    uses: strangebasisdevs/strange_security/.github/workflows/trivy.yml@b3a6732ecbe1796fb2e7eaeedb228c705962db44 # v1.2.1
 
   gitleaks:
     name: Gitleaks
