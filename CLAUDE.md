@@ -36,33 +36,82 @@ is authoritative.
   makes from the trimmed selection, and checks it by content before ffmpeg runs.
   The bundled ffmpeg is a minimal source build (WAV in, AAC/MP4 out, `file`
   protocol only), and a test fails if its build configuration grows.
-- **Fetcher image** (opt-in, the owner's explicit exception for YouTube): the
-  only component with egress. It accepts only an 11-character video ID and
-  builds the URL itself. It never reaches the core. The browser is the only
-  bridge.
+- **Fetcher image** (opt-in, the owner's explicit exception for YouTube): it
+  accepts only an 11-character video ID and runs as three containers of one
+  image. The **fetcher** (CMD, port 8080) is the API behind the reverse
+  proxy. It never runs yt-dlp: it sends the **runner**
+  (`python -I /app/fetcher/runner.py`, port 8080, at `FETCH_RUNNER_URL`) only
+  the validated ID and a token of its own, and trusts nothing that comes
+  back: capped JSON of a fixed shape, audio of exactly the declared length up
+  to `FETCH_MAX_BYTES`, per-read and total deadlines, the metadata
+  re-validated, no retry. The runner is the only container that runs yt-dlp
+  (from the venv, as a subprocess) and Deno. It builds the URL itself, takes
+  one job at a time, deletes its job directory in `finally` and the audio
+  once collected, when the next job starts or after 60 s, and shares no
+  network with the reverse proxy. Neither reaches the core. The browser is
+  the only bridge. The **forwarder** (`python -I /app/fetcher/forwarder.py`,
+  port 3128) is the only component with egress: a stdlib `CONNECT` gate that
+  allows port 443 to `youtube.com`, its subdomains and the subdomains of
+  `googlevideo.com`, decides everything before DNS, resolves IPv4 only and
+  connects only to global unicast addresses it checked, within fixed byte,
+  time and tunnel budgets. The fetcher (on `fetcher` and `jobs`) and the
+  runner (on `jobs` and `egress`) run on internal networks only, which
+  Docker's isolated gateway modes (IPv4 and IPv6) keep off the host, and the
+  runner reaches YouTube through `HTTPS_PROXY` pointing at the forwarder.
+  Both refuse to start with a default route unless
+  `FETCH_ALLOW_DEFAULT_ROUTE=true`. The runner is its container's PID 1
+  (`init: false`, stated) and makes itself non-dumpable. Before and after
+  each yt-dlp run it kills every other process of its UID in its container
+  (`kill(-1, SIGKILL)`) and reaps them. Where it can't (anywhere but PID 1)
+  it refuses to start (exit 4) unless `FETCH_ALLOW_NO_SWEEP=true`, which is
+  for a local run or a host that can't run it as PID 1, never for one that
+  can. No test ever sends the real `kill(-1)` outside a throwaway container.
+  The runner's container is given only the runner's own settings, never
+  the shared `.env` (the compose example passes it its three limits by
+  name and sets `HTTPS_PROXY`): a health check or `docker exec` there runs
+  with the container's environment, where yt-dlp can read it.
+  Every container of the fetcher image turns forwarding off on every
+  interface and refuses ICMP redirects (never by writing
+  `net.ipv4.ip_forward`, which resets the redirect setting), and each has a
+  `pids_limit` of at least twice its worst case (docs/PLAN.md 6.1).
 - **Container contract:** a fixed non-root UID/GID, `read_only`, `cap_drop: [ALL]`,
-  `no-new-privileges`, and one plain-HTTP port. **Stateless:** it writes only to
-  `/tmp` (tmpfs), and results expire after a short TTL. There is no database,
-  data directory or volume, and adding one needs the owner's decision (the
-  library was dropped on 2026-10-25). Tone names stay out of URLs and logs.
-  `GET /healthz` returns 200 and reveals nothing. A change to the env vars, limits, UID/GID, port or writable
-  paths needs a breaking-change commit, so the CHANGELOG marks it BREAKING.
+  `no-new-privileges`, and one plain-HTTP port per container (8080 for the
+  core, the fetcher and the runner, 3128 for the forwarder command).
+  **Stateless:** it writes only to `/tmp` (tmpfs), and the forwarder writes
+  nothing; results expire after a short TTL, and the runner keeps an audio
+  file only until the fetcher collects it. There is no database, data
+  directory or volume, and adding one needs the owner's decision (the library
+  was dropped on 2026-10-25). Tone names stay out of URLs and logs.
+  `GET /healthz` (the fetcher's is `/fetch/healthz`) returns 200 and reveals
+  nothing (the forwarder serves no path; its health check is a TCP connect).
+  A change to the env vars, limits, UID/GID, port or writable paths needs a
+  breaking-change commit, so the CHANGELOG marks it BREAKING.
 - **Web:** strict CSP (no inline script, no third-party origins), `nosniff`,
   `DENY` framing, and `Referrer-Policy: same-origin`. Every state change is a
   POST that requires exactly one `Origin` equal to `PUBLIC_ORIGIN`, failing
-  closed. Escape all rendered text; the client uses `textContent` only.
-  `X-Forwarded-For` is trusted only from `TRUSTED_PROXIES` (empty by default).
+  closed. The one exception: collecting a fetched audio is a GET that
+  deletes it and needs the job's 128-bit ID (`docs/PLAN.md`, section 8). Add
+  no other. Escape all rendered text; the client uses `textContent` only.
+  `X-Forwarded-For` is trusted only from `TRUSTED_PROXIES` (empty by default;
+  the compose example pins the fetcher's to empty, and it never covers the
+  `jobs` network).
 - **Subprocesses** (ffmpeg, yt-dlp): an argument list, never a shell. Each gets
   a wall-clock timeout, `prlimit` resource limits, a fresh per-job directory, and
-  server-generated names only. Clean up in `finally`.
+  server-generated names only. Clean up in `finally`. yt-dlp runs only in the
+  runner container, from the image's venv
+  (`/opt/yt-dlp/bin/python -I -m yt_dlp`), never from a server's
+  interpreter, whose site-packages hold nothing; the build fills the venv
+  with the base interpreter's `pip install --prefix`, never `pip --python`.
 
 ## Code and tests
 
 - Python 3.12 with no newer language features, type hints, and
-  `from __future__ import annotations`. The core is **stdlib-only**. The
-  fetcher's dependencies come from a hashed pip-tools lock
-  (`--require-hashes --no-deps --only-binary :all:`), and nobody hand-edits
-  `requirements.txt`.
+  `from __future__ import annotations`. The core, the fetcher server, the
+  runner server and the forwarder are **stdlib-only**. yt-dlp and yt-dlp-ejs
+  come from a hashed
+  pip-tools lock (`--require-hashes --no-deps --only-binary :all:`) into the
+  image's venv, never into the base interpreter's site-packages, and nobody
+  hand-edits `requirements.txt`.
 - Tests use stdlib `unittest`, not pytest. **Every security check has a test
   that fails when the check is removed.** Malformed-input tests also assert that
   no files are left behind.
@@ -77,6 +126,7 @@ is authoritative.
 python -I -m unittest discover -s tests        # all tests, stdlib only
 ruff check .                                   # ruff from .github/lint/requirements.txt (--require-hashes)
 python -I tools/spike/phase0.py                # regenerate the iOS test tones into spike-out/ (needs local ffmpeg)
+STRANGE_RINGTONE_COMPOSE_TESTS=1 python -I -m unittest discover -s tests/compose -t tests -v   # compose topology tests (built fetcher image, Docker Engine 28.0+, Docker Compose 2.27.1+)
 ```
 
 To recompile ruff's lock, edit `.github/lint/requirements.in`, then run the
@@ -121,22 +171,27 @@ starts enforcing once `.release-please-manifest.json` records a release.
     arguments, and a timeout. The reason names those guards, and a test pins
     them.
 - **`main` is protected by a ruleset:** changes go through a PR, squash-merge
-  only, and the required checks are Ruff, Unit tests, Image tests,
-  Conventional PR title, Deployment contract change, and the gate's Semgrep,
-  Trivy and Gitleaks jobs.
-  Renaming a job means updating the ruleset in the same change. `v*` tags can
-  be created, moved or deleted only by organisation admins.
+  only, and the required checks are Ruff, Unit tests, Image tests, Fetcher
+  image tests, Compose topology tests, Conventional PR title, Deployment
+  contract change, and the gate's Semgrep, Trivy and Gitleaks jobs
+  (`docs/PLAN.md`, section 9.2). Renaming a job means updating the ruleset in
+  the same change. A tag ruleset restricts `v*` tags: never create, move or
+  delete one.
 - Workflows default to `contents: read`. Never use `pull_request_target` or
   `workflow_run` with secrets. Write scopes exist only in the release-please and
   publish jobs, plus `security-events: write` in the security gate, which the
   shared workflows need to upload SARIF.
-- Every PR runs ruff, the tests (including an in-image run with
-  `--network none`, once the image exists), the organisation security gate, the
-  PR-title check and the contract-change check.
+- Every PR runs ruff, the tests (including in-image runs of the core and the
+  fetcher images with `--network none`), the compose topology tests, the
+  organisation security gate, the PR-title check and the contract-change check.
   Releases also scan the image and publish provenance and an SBOM.
 
 ## Local machine
 
 Development happens on Windows with Git Bash and Docker Desktop. A throwaway
 `docker run --rm --network none` with a unique name and no published ports is
-fine. Don't publish ports on the LAN from this machine.
+fine, and so is the compose topology tests' stack (a unique project name, no
+published ports, removed when they finish), including its throwaway networks,
+a `--network host` probe that reads the host's interfaces or listens on one
+test bridge's private address, and a root helper with only `NET_ADMIN` on
+throwaway bridges. Don't publish ports on the LAN from this machine.

@@ -17,7 +17,7 @@ from unittest import mock
 import helpers  # noqa: F401  (puts core/ and fetcher/ on sys.path)
 from strange_ringtone_fetch import jobs as jobs_module
 from strange_ringtone_fetch.jobs import JOB_ID_RE, Jobs, QueueFull
-from strange_ringtone_fetch.ytdlp import Download, FetchError, Metadata
+from strange_ringtone_fetch.metadata import Download, FetchError, Metadata
 from test_fetcher_ytdlp import StubYtDlp
 
 VIDEO_ID = "dQw4w9WgXcQ"
@@ -545,7 +545,7 @@ class StubRunTest(JobsTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.jobs = Jobs(self.scratch, StubYtDlp(600, 1024, 1), ttl_seconds=600, clock=self.clock)
-        patcher = mock.patch("strange_ringtone_fetch.ytdlp.DRAIN_SECONDS", 0.5)
+        patcher = mock.patch("strange_ringtone_runner.ytdlp.DRAIN_SECONDS", 0.5)
         patcher.start()
         self.addCleanup(patcher.stop)
 

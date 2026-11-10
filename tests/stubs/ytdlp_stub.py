@@ -2,7 +2,7 @@
 
 The fetcher runs it as (sys.executable, "-I", this file, *yt-dlp arguments).
 It refuses (exit 2) any argument list that is not exactly what the fetcher
-must send (strange_ringtone_fetch.ytdlp.ytdlp_args), so a loosened argument
+must send (strange_ringtone_runner.ytdlp.ytdlp_args), so a loosened argument
 fails the tests here too. The video ID is taken from the watch URL.
 
 The behaviour comes from STRANGE_RINGTONE_YTDLP_STUB when set, and otherwise
@@ -32,6 +32,10 @@ what tools/dev_fetch_stack.py relies on.
     hang          sleep 60 s
     grandchild    start a sleeping grandchild, write its PID to grandchild.pid
                   in the working directory, then sleep 60 s
+    survivor      both files as "ok", then start a sleeping grandchild in its
+                  process group with its standard streams closed, write its
+                  PID to survivor.pid in the working directory, and exit 0:
+                  a child yt-dlp left behind after a successful run
 
 STRANGE_RINGTONE_YTDLP_STUB_LOG names a file each run appends one JSON line
 to: argv, working directory, environment and (on POSIX) resource limits.
@@ -56,6 +60,7 @@ DURATION_VAR = "STRANGE_RINGTONE_YTDLP_STUB_DURATION"
 MODES = (
     "ok", "too_long", "blocked", "not_found", "fail", "oversize", "no_audio", "ctrl_title", "huge_heatmap",
     "bad_heatmap", "bare_info", "not_a_dict", "symlink", "files_101", "files_1", "hang", "grandchild",
+    "survivor",
 )
 # Eleven characters each, so they pass the fetcher's ID check.
 BY_ID = {
@@ -75,6 +80,7 @@ BY_ID = {
     "failedFiles": "files_1",
     "hanging____": "hang",
     "grandchild_": "grandchild",
+    "survivor___": "survivor",
 }
 AUDIO_MAGIC = b"STUB-M4A\n"
 DURATION = 215.5
@@ -251,6 +257,16 @@ def main(argv: list[str]) -> int:
         else:
             data = AUDIO_MAGIC + video_id.encode("ascii")
         write_bytes(audio, data)
+    if mode == "survivor":
+        # Its streams are not the run's pipes, so communicate() returns as
+        # soon as this process exits: only a kill of the process group ends it.
+        child = subprocess.Popen(
+            [sys.executable, "-I", "-c", "import time; time.sleep(60)"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        Path("survivor.pid.tmp").write_text(str(child.pid), encoding="ascii")
+        os.replace("survivor.pid.tmp", "survivor.pid")
+        return 0
     # A failed run that still left both files behind: the exit status wins.
     if mode == "files_101":
         return 101
