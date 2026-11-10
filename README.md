@@ -83,9 +83,9 @@ Privacy:
 - The link travels in the address's fragment (the part after `#`), which the
   browser never sends to any server, so no proxy log shows which video was
   shared. The page also takes it out of the address bar, and out of the
-  tab's history entry, before it fetches anything. Whether Safari's own
-  History list keeps the address the app was opened with has not been
-  checked on a phone.
+  tab's history entry, before it fetches anything. Safari's own History
+  list may still show the address the app was opened with, the link
+  included: clear it there if that matters.
 - `si=` share tracking and every other parameter are dropped on the phone;
   only the 11-character ID leaves it.
 - YouTube sees the server's IP address fetch the video, the same as watching

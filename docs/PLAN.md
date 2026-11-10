@@ -1236,8 +1236,9 @@ going off-site.
   (6.1).
 
 **Open risks in the core** (from the security review of 2026-11-09; not
-fixed, and none accepted yet. The fetcher image's own list is 6.1's
-"Accepted risks").
+fixed yet. Before v0.1.0 each is either fixed or moved to an "Accepted
+risks" list of the core's own, with its reason. The fetcher image's list is
+6.1's "Accepted risks").
 
 - **One client can lock the others out.** The render slots and the results
   store are one pool for every user, and behind a proxy with
@@ -1360,39 +1361,40 @@ SARIF upload fails there. Until strange_security skips the upload for forks
 while still failing on findings, a fork's PR cannot pass the gate; a
 maintainer pushes the fork's branch into this repository instead.
 
-**Rulesets on `main`** (as GitHub reported them on 2026-11-09). The
-organisation's rulesets that apply to this repository's default branch:
+**Rulesets on `main`** (as the repository's Rules page showed them on
+2026-11-09. Who may bypass a rule is not shown there and is not recorded
+here). The organisation's rulesets that apply to this repository's default
+branch:
 
 - Commits are signed, history is linear, and force pushes and deletion are
-  blocked. No bypass is configured for these.
+  blocked.
 - Every change needs a pull request, squash-merged, with an approving review
   from the code owner that is newer than the last push, and every review
-  thread resolved. Organisation admins may bypass this rule, through a pull
-  request only.
-- The security gate's three scans are required, with no bypass: Semgrep /
-  Semgrep scan, Trivy / Trivy filesystem scan and Gitleaks / Gitleaks
-  history scan.
+  thread resolved.
+- The security gate's three scans are required: Semgrep / Semgrep scan,
+  Trivy / Trivy filesystem scan and Gitleaks / Gitleaks history scan.
 
 This repository's own ruleset requires the three scans again and the checks
 below, all reported by GitHub Actions, on a branch that is up to date with
-`main`. It has no bypass either:
+`main`:
 
 - Ruff
 - Unit tests
 - Image tests
+- Fetcher image tests
+- Compose topology tests
 - Conventional PR title
 - Deployment contract change
 
-Two jobs are still to join them: Fetcher image tests (from milestone 5) and
-Compose topology tests (from the egress follow-up's PR A). The owner adds
-each to the ruleset, named exactly so. Until then a PR can merge with either
-one failing, and only review keeps a change that breaks the layout out of
-`main`: the compose tests are the only proof of the layout.
+Fetcher image tests (from milestone 5) and Compose topology tests (from the
+egress follow-up's PR A) were the last to join. A check is required under
+its job's name, so renaming a job means changing the ruleset in the same
+change.
 
 The repository squash-merges with the PR title as the commit subject, which is
-what release-please reads. A **tag ruleset** on `v*` lets only organisation
-admins create, move or delete release tags. Phase 6 must add the release
-workflow's identity to that ruleset before release-please can tag.
+what release-please reads. A **tag ruleset** on `v*` restricts creating,
+moving and deleting release tags. Phase 6 must add the release workflow's
+identity to that ruleset before release-please can tag.
 
 No workflow uses `pull_request_target` or `workflow_run`.
 
