@@ -1,2 +1,2 @@
 # Linter for CI and local checks. Recompile with the command in CLAUDE.md (Commands).
-ruff==0.17.2
+ruff==0.17.3
