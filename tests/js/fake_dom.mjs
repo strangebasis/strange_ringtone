@@ -382,7 +382,7 @@ export async function loadApp(options = {}) {
 export async function pickFile(page, name, channels) {
   setDecoded(channels);
   const input = page.el("file");
-  input.files = [{ name, arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) }];
+  input.files = [{ name, size: 8, arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) }];
   await Promise.all(input.dispatch("change"));
 }
 
