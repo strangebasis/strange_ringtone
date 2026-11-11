@@ -1,10 +1,11 @@
 """A job is answered done only when its result is where the runner serves it from (docs/PLAN.md 6.1, R7).
 
 A run has the runner's UID. One that leaves a link in place of results/
-has the runner's own move of the audio (Results.hold) follow the link out of
-the scratch directory. The clean-up after the run removes the link and makes
-results/ again, so the audio is not where its collection would look: the
-job fails closed instead of answering done for audio nobody can collect.
+must not have the runner's own move of the audio (Results.hold) follow the
+link out of the scratch directory: the move is refused, nothing lands where
+the link points, the clean-up after the run removes the link and makes
+results/ again, and the job fails closed instead of answering done for audio
+nobody can collect.
 """
 from __future__ import annotations
 
@@ -43,6 +44,9 @@ class HeldResultTest(RunnerServerTestCase):
         response = self.post(VIDEO_ID, job)
         self.assertEqual(response.json(), {"status": "failed", "error": "failed"})
         self.assertJsonError(self.audio(job), 404, "not_found")
+        # Nothing was moved through the link: the directory it pointed to
+        # is as empty as the run left it.
+        self.assertEqual(list((self.temp / "outside_results").iterdir()), [])
         # The link went as a link; results/ is a plain directory again.
         self.assertTrue(stat.S_ISDIR(os.lstat(self.scratch / "results").st_mode))
         self.assertEqual(self.scratch_contents(), [])

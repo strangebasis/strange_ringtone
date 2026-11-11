@@ -681,6 +681,13 @@ class Results:
             # The rule "at most one audio file" is kept here too, not only by
             # the server discarding before each run.
             self._discard_held()
+            # Into results/ itself, never through a link a run put in its
+            # place (same UID), which would carry the audio out of the
+            # scratch directory. Checked after the run's sweep, so nothing
+            # of the run is left to swap it back; where no sweep runs,
+            # what the run left running could write there itself.
+            if not _plain_directory(os.lstat(self.directory)):
+                raise RuntimeError("results path is not a plain directory")
             os.replace(source, self._path(job))
             self._held[job] = self.clock()
 
