@@ -15,10 +15,12 @@ export const MAX_INPUT_SECONDS = 600;
 /**
  * The largest input accepted, in bytes, checked before any of the file is read
  * or decoded, for a picked file and fetched audio alike. 64 MiB holds 10
- * minutes of compressed audio at any usual bitrate (an MP3 at 320 kbit/s is
- * about 24 MB, YouTube's AAC about 10 MB); uncompressed CD-quality WAV passes
- * it after about six minutes, which is why the refusal suggests MP3 or M4A.
- * It bounds what is read into memory, not what decoding makes of it.
+ * minutes of lossy compressed audio at any usual bitrate (an MP3 at 320 kbit/s
+ * is about 24 MB, YouTube's AAC about 10 MB). Lossless audio may not fit:
+ * CD-quality WAV passes it after about six minutes, and FLAC or Apple
+ * Lossless (which also comes as .m4a) often before ten, which is why the
+ * refusal suggests MP3 or AAC. It bounds what is read into memory, not what
+ * decoding makes of it.
  */
 export const MAX_INPUT_BYTES = 64 * 1024 * 1024;
 
@@ -53,7 +55,7 @@ export async function decodeFile(file, sampleRate = 44100) {
   // size that is missing or not a number is refused too.
   if (!(file.size <= MAX_INPUT_BYTES)) {
     throw new Error(`This file is larger than ${MAX_INPUT_BYTES / (1024 * 1024)} MB. Trim it first, or save it `
-      + "in a smaller format such as MP3 or M4A, then pick it again.");
+      + "in a smaller format such as MP3 or AAC (M4A), then pick it again.");
   }
   const bytes = await file.arrayBuffer();
   let decoded;
