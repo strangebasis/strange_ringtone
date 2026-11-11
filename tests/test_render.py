@@ -990,6 +990,44 @@ print(json.dumps({"outcome": outcome, "started": started, "left": left}))
 """
 
 
+class OutputKindTest(StubTestCase):
+    """Only a regular file is a result: anything else in its place is refused and removed, a link's target untouched."""
+
+    def render_with(self, make_output: str) -> RenderError:
+        # A run that ends like a good one, summary and all, but leaves
+        # something of its own choosing at the output's path.
+        script = f"import os, sys; out = sys.argv[-1]; {make_output}; sys.stderr.write({REAL_SUMMARY!r})"
+        renderer = Renderer((sys.executable, "-I", "-c", script), 20)
+        with self.assertRaises(RenderError) as raised:
+            renderer.render(self.job, params(normalize=False, duration=1.0))
+        return raised.exception
+
+    def test_a_link_as_the_output_is_refused(self) -> None:
+        # The job directory is writable by the UID ffmpeg runs as. A link
+        # there that the store kept would be opened by the server on
+        # download: its own /proc/self/maps, say, which no other process of
+        # its UID may read. The target here is a small regular file, so only
+        # the kind of the output itself can refuse it.
+        target = self.temp / "elsewhere.txt"
+        target.write_bytes(b"not the run's output\n")
+        probe = self.temp / "probe-link"
+        try:
+            os.symlink(target, probe)
+        except (OSError, NotImplementedError):
+            self.skipTest("this account can't create symlinks")
+        probe.unlink()
+        error = self.render_with(f"os.symlink({str(target)!r}, out)")
+        self.assertEqual(error.code, "render_failed")
+        self.assertEqual(self.job_names(), ["in.wav"])
+        self.assertEqual(target.read_bytes(), b"not the run's output\n")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs are POSIX")
+    def test_a_fifo_as_the_output_is_refused(self) -> None:
+        error = self.render_with("os.mkfifo(out)")
+        self.assertEqual(error.code, "render_failed")
+        self.assertEqual(self.job_names(), ["in.wav"])
+
+
 class OutputSizeTest(StubTestCase):
     """An output over the file-size limit is refused and removed, also where prlimit is not in force."""
 
