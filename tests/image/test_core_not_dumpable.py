@@ -49,10 +49,15 @@ mode, port, startup = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
 env = {"PATH": os.environ.get("PATH", ""), "PUBLIC_ORIGIN": os.environ.get("PUBLIC_ORIGIN", ""), "MARKER": "x"}
 if mode == "server":
     command = ["python", "-I", "/app/core"]
+    stdout = subprocess.DEVNULL
 else:
-    command = ["python", "-I", "-c", "import sys; sys.stdin.read()"]
-target = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                          env=env)
+    # The control says when it runs. Popen returns as soon as the exec has
+    # begun, and until the kernel has set the new program up its
+    # /proc/<pid>/environ reads empty, which would look like a failed read.
+    control = "import sys; sys.stdout.write('ready\\n'); sys.stdout.flush(); sys.stdin.read()"
+    command = ["python", "-I", "-c", control]
+    stdout = subprocess.PIPE
+target = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=stdout, stderr=subprocess.DEVNULL, env=env)
 result = {}
 try:
     if mode == "server":
@@ -76,7 +81,7 @@ try:
                 break
             time.sleep(0.1)
     else:
-        result["ready"] = "ready"
+        result["ready"] = target.stdout.readline().decode("ascii", "replace").strip()
     for name in ("environ", "maps"):
         try:
             with open(f"/proc/{target.pid}/{name}", "rb") as handle:
@@ -105,6 +110,8 @@ finally:
             break
     target.returncode = -9
     target.stdin.close()
+    if target.stdout is not None:
+        target.stdout.close()
 print(json.dumps(result))
 '''
 
