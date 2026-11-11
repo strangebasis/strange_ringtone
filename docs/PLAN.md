@@ -133,15 +133,16 @@ The browser is the only bridge. Audio from the fetcher reaches the core only as
 WAV that the browser made, so the core's input surface is the same with or
 without the fetcher.
 
-The browser decodes a picked file and fetched audio alike, after two checks
-in order. Before decoding, `decode.js` refuses input over 64 MiB
-(`MAX_INPUT_BYTES`) without reading any of it, and `fetch.js` refuses a
-fetched audio over the same cap: by its `Content-Length` before reading the
+The browser checks a picked file and fetched audio alike twice: once before
+decoding and once after. Before decoding, `decode.js` refuses input over
+64 MiB (`MAX_INPUT_BYTES`) without reading any of it, and `fetch.js` refuses
+a fetched audio over the same cap: by its `Content-Length` before reading the
 body, and, where the browser offers the body as a stream, by counting it as
 it arrives and stopping at most one chunk past the cap. Where it does not,
 `fetch.js` reads the body whole and checks its size before anything uses
-the bytes. That cap holds whatever `FETCH_MAX_BYTES` allows. After decoding, `decode.js` refuses input over 10 minutes
-(`MAX_INPUT_SECONDS`), which only the decoded duration shows.
+the bytes. That cap holds whatever `FETCH_MAX_BYTES` allows. After decoding,
+`decode.js` refuses input over 10 minutes (`MAX_INPUT_SECONDS`), which only
+the decoded duration shows.
 
 Inside the fetcher, yt-dlp moves to a container of its own whose only way out
 is the image's forwarder (section 6.1, milestone 5's follow-up).
