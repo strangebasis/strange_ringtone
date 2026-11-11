@@ -98,6 +98,16 @@ services:
     ipc: none
     ulimits:
       msgqueue: 0
+    # `ipc: none` still lets any process here create System V shared memory,
+    # message queues and semaphores in the container's own IPC namespace:
+    # state outside /tmp that an exploited ffmpeg could keep between runs.
+    # The server uses none of them. With these at zero, shmget, msgget and
+    # semget fail. They apply to the container's IPC namespace only and
+    # need no capability.
+    sysctls:
+      kernel.shmmni: 0
+      kernel.msgmni: 0
+      kernel.sem: "0 0 0 0"
     tmpfs:
       # The only writable path: uploads and results, gone on restart. noexec
       # and nosuid keep anything written there from running. The size follows
