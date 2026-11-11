@@ -555,7 +555,7 @@ def _collect_group(proc: subprocess.Popen[bytes]) -> None:
     if proc.returncode is None or not _orphans_come_here():
         return
     deadline = time.monotonic() + COLLECT_SECONDS
-    while True:
+    while time.monotonic() < deadline:
         try:
             if os.waitid(os.P_PGID, proc.pid, os.WEXITED | os.WNOHANG) is not None:
                 continue
