@@ -216,7 +216,8 @@ class RunnerClient:
         """The POST's total deadline: timeout_seconds + post_grace."""
         # The runner answers only once yt-dlp is done, which its own
         # FETCH_TIMEOUT_SECONDS bounds; the grace covers its drain, its two
-        # reaps and a margin (POST_GRACE_SECONDS).
+        # reaps, the budget of its clean-up after the run and a margin
+        # (POST_GRACE_SECONDS).
         return self.timeout_seconds + self._post_grace
 
     @property
