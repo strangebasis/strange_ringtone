@@ -586,12 +586,10 @@ class RunnerServerTestCase(unittest.TestCase):
 
     def assertStubsOutsideFile(self) -> None:
         # The stub's symlink mode plants its target next to the job directory
-        # (tests/stubs/ytdlp_stub.py), outside anything the runner made; it
-        # is the stub's own file, removed here so the next case starts clean.
-        outside = self.scratch / "outside.m4a"
-        wait_for(lambda: [n for n in self.scratch_contents() if not n.startswith("job-")] == ["outside.m4a"],
-                 "the stub's planted file to be the only thing left")
-        outside.unlink()
+        # (tests/stubs/ytdlp_stub.py), outside anything the runner made. The
+        # runner's clean-up after the run removes it with everything else a
+        # run left in the scratch directory, before it answers.
+        self.assertFalse(os.path.lexists(self.scratch / "outside.m4a"), "the stub's planted file was left behind")
 
 
 class RunnerFlowTest(RunnerServerTestCase):
