@@ -1084,7 +1084,9 @@ comes before the answer, so all of it shares a budget of 3 s
 past `FETCH_TIMEOUT_SECONDS`, after the drain and the two reaps, with 3 s
 to spare. Without one, a tree a run made of nested directories, each of
 mode 000, near the memory limit, took 22 s at 400,000 levels and 88 s at
-500,000 (measured 2026-11-10), well past the fetcher's deadline. When the
+500,000 (measured 2026-11-10): longer than the 15 s grace, so past the
+fetcher's deadline (`FETCH_TIMEOUT_SECONDS` plus 15 s from the POST) after
+a run that had used its whole timeout. When the
 clean-up overruns its budget, leaves something it should have removed, or
 can't make the scratch directory usable again, that job fails closed, its
 result is discarded and the runner writes one line to stderr; under the
