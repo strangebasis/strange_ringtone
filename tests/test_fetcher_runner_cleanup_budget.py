@@ -377,6 +377,96 @@ class ContractLeftoverOutsideTest(BudgetServerTestCase):
                     self.server.exit_codes.clear()
 
 
+class ContractRefusedIpcRemovalTest(BudgetServerTestCase):
+    """Under the contract, with the real remove_ipc_objects: a removal the kernel refuses fails the job and exits.
+
+    ContractLeftoverOutsideTest fakes the whole removal, and its failure is
+    an exception the test raises itself. Here only libc and the kernel's
+    listing are faked, and libc answers as it does: -1, with nothing
+    raised. The way from that answer to the failed job and the exit is the
+    server's own, whatever the removal raises on it.
+    """
+
+    # The UID of the objects in LISTINGS, and the IDs of all of them.
+    OWNER = 10001
+    IDS = (3, 32771, 7, 2)
+
+    def setUp(self) -> None:
+        super().setUp()
+        # In place of /proc/sysvipc. Next to the scratch directory, where
+        # the clean-up of the rest of /tmp is only recorded, never run.
+        self.listing = self.temp / "sysvipc"
+        self.listing.mkdir()
+        # What a test asks of libc and the kernel: the answer to every
+        # removal, the objects that go although it is -1, and the user the
+        # runner is.
+        self.answer = 0
+        self.gone: tuple[int, ...] = ()
+        self.euid = self.OWNER
+        self.removals: list[list[tuple[str, tuple[Any, ...]]]] = []
+        real = seam(runner_server, "remove_ipc_objects")
+
+        def remove_ipc(*args: Any, **kwargs: Any) -> None:
+            libc = FakeLibc(self.listing, self.answer, self.gone)
+            self.removals.append(libc.calls)
+            with mock.patch.object(runner_server.ctypes, "CDLL", return_value=libc), \
+                    mock.patch.object(runner_server.os, "geteuid", lambda: self.euid, create=True):
+                real(self.listing, *args, **kwargs)
+
+        for name, value in (("remove_ipc_objects", remove_ipc),
+                            ("may_remove_ipc_objects", lambda *args, **kwargs: True)):
+            patcher = mock.patch.object(runner_server, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.under_the_contract()
+
+    def write_listings(self) -> None:
+        for kind, lines in LISTINGS.items():
+            (self.listing / kind).write_text("\n".join(lines) + "\n", encoding="ascii")
+
+    def listed(self) -> int:
+        """How many objects the listings name now."""
+        return sum(len((self.listing / kind).read_text(encoding="ascii").splitlines()) - 1 for kind in LISTINGS)
+
+    def test_a_removal_that_leaves_nothing_of_the_runners_answers_and_the_runner_stays(self) -> None:
+        # Control, and the two answers of -1 that are no failure: for an
+        # object that went away before its call, and for another user's,
+        # which the kernel refuses the runner and which may stay.
+        for label, answer, gone, euid, left in (
+            ("removed", 0, (), self.OWNER, 0),
+            ("already gone", -1, self.IDS, self.OWNER, 0),
+            ("another user's", -1, (), 4242, len(self.IDS)),
+        ):
+            with self.subTest(label):
+                self.write_listings()
+                self.answer, self.gone, self.euid = answer, gone, euid
+                self.removals.clear()
+                response, job = self.post_mode("ok")
+                self.assertEqual(response.json()["status"], "done", response.body)
+                self.assertEqual(self.audio(job).status, 200)
+                self.assertEqual(exits(self.server), [])
+                self.assertEqual(self.other_lines(), [])
+                # The removal ran once, on every object.
+                self.assertEqual([len(calls) for calls in self.removals], [len(self.IDS)])
+                self.assertEqual(self.listed(), left)
+
+    def test_a_removal_the_kernel_refuses_fails_the_job_and_stops_the_runner(self) -> None:
+        self.write_listings()
+        # libc answers -1 and raises nothing, and the runner's own objects
+        # are still listed: their memory stays charged to the container.
+        self.answer = -1
+        # A run that succeeded, and a scratch directory left clean: only the
+        # removal of the IPC objects failed.
+        response, job = self.post_mode("ok")
+        self.assertEqual(response.json(), FAILED)
+        self.assertEqual(exits(self.server), [exit_code()])
+        self.assertOneQuietLine(job)
+        self.assertJsonError(self.audio(job), 404, "not_found")
+        self.assertHealthy()
+        self.assertEqual([len(calls) for calls in self.removals], [len(self.IDS)])
+        self.assertEqual(self.listed(), len(self.IDS))
+
+
 class ContractDeadlineWiringTest(BudgetServerTestCase):
     """Under the contract: every step of the clean-up is given the one deadline, so it stops there, not later.
 
