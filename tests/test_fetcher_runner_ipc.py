@@ -181,6 +181,26 @@ def ipc_objects() -> dict[str, list[str]]:
     return {kind: (SYSV_IPC / kind).read_text(encoding="ascii").splitlines()[1:] for kind in KINDS}
 
 
+def ipc_limits_at_zero() -> list[str]:
+    """The limits of this IPC namespace that are 0, so that no object of their kind can be created at all.
+
+    kernel.shmmni and kernel.msgmni are the most segments and queues;
+    kernel.sem is the most semaphores in a set, in all sets, per call and
+    the most sets. A container started with the sysctls the compose
+    example gives the runner has all of them at 0 but the per-call one.
+    """
+    kernel = Path("/proc/sys/kernel")
+    sem = (kernel / "sem").read_text(encoding="ascii").split()
+    limits = {
+        "kernel.shmmni": (kernel / "shmmni").read_text(encoding="ascii").strip(),
+        "kernel.msgmni": (kernel / "msgmni").read_text(encoding="ascii").strip(),
+        "kernel.sem SEMMSL": sem[0],
+        "kernel.sem SEMMNS": sem[1],
+        "kernel.sem SEMMNI": sem[3],
+    }
+    return [name for name, value in limits.items() if int(value) == 0]
+
+
 @unittest.skipUnless(IN_IMAGE, "the removal runs only in the fetcher image's test container")
 class RealIpcCleanupTest(unittest.TestCase):
     """In the image, as PID 1 with the contract's scratch directory: a run's IPC objects go."""
@@ -188,6 +208,13 @@ class RealIpcCleanupTest(unittest.TestCase):
     def setUp(self) -> None:
         # A failure, not a skip: see test_fetcher_runner_sweep.IN_IMAGE.
         self.assertEqual(os.getpid(), 1, "the in-image suite must run as its container's PID 1, with no init")
+        # A container started with the runner's sysctls of the compose
+        # example lets nobody create these objects, this test's stub run
+        # included, so there is nothing to remove. Only that is a skip: a
+        # stub run that cannot create them for any other reason fails below.
+        at_zero = ipc_limits_at_zero()
+        if at_zero:
+            self.skipTest(f"this container's sysctls allow no System V IPC object ({', '.join(at_zero)} at 0)")
         self.addCleanup(force_remove, SCRATCH_DIR)
         remove = getattr(runner_server, "remove_ipc_objects", None)
         if remove is not None:
