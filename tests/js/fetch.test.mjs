@@ -420,6 +420,9 @@ const MIB = 1024 * 1024;
 const TOO_LARGE = "audio_too_large";
 const CAP = 10_000;
 const CHUNK = 1000;
+// The tests' own arrays, whatever a test puts in place of the global to count
+// what fetch.js allocates.
+const Bytes = Uint8Array;
 
 // A body handed out one CHUNK per read and never ahead of the reader
 // (highWaterMark 0), so `seen.bytes` is exactly what fetchAudio was given.
@@ -435,7 +438,7 @@ function countedBody(total) {
         return;
       }
       seen.bytes += size;
-      controller.enqueue(new Uint8Array(size).fill(7));
+      controller.enqueue(new Bytes(size).fill(7));
     },
     cancel() {
       seen.cancelled = true;
@@ -554,4 +557,83 @@ test("without a readable body stream the size is checked before the bytes are us
   broken.response.arrayBuffer = () => Promise.reject(new TypeError("reset"));
   fakeFetch(t, () => broken.response);
   await rejectsWith(fetchAudio(JOB, { maxBytes: CAP }), "network");
+});
+
+// Every new buffer fetch.js asks for while a test runs, in bytes. A view on a
+// buffer that exists holds nothing more, so it is not counted.
+function countAllocations(t) {
+  const counted = { bytes: 0 };
+  globalThis.Uint8Array = class extends Bytes {
+    constructor(...args) {
+      super(...args);
+      if (typeof args[0] === "number") counted.bytes += args[0];
+    }
+  };
+  t.after(() => {
+    globalThis.Uint8Array = Bytes;
+  });
+  return counted;
+}
+
+// A body whose producer overwrites each piece once the next is asked for, as
+// one that reuses its buffers would. Only a reader that has copied a piece
+// by then still has its bytes: one that keeps the pieces to join them at the
+// end finds them overwritten.
+function recycledBody(total) {
+  let sent = 0;
+  let last = null;
+  return new ReadableStream({
+    pull(controller) {
+      if (last !== null) last.fill(9);
+      const size = Math.min(CHUNK, total - sent);
+      if (size <= 0) {
+        controller.close();
+        return;
+      }
+      sent += size;
+      last = new Bytes(size).fill(7);
+      controller.enqueue(last);
+    },
+  }, { highWaterMark: 0 });
+}
+
+test("a fetched audio is gathered in one buffer, never held twice", async (t) => {
+  // Keeping the pieces of a body until its end and then copying them into a
+  // buffer of their sum holds the audio twice for a moment: 128 MiB for a
+  // download at the cap. The body goes into one buffer as it arrives, as long
+  // as its Content-Length says, or as long as the cap where that header is
+  // missing or no plain number.
+  const allocated = countAllocations(t);
+  for (const [size, length, buffer] of [
+    [CAP - 500, CAP - 500, CAP - 500],
+    [CAP, CAP, CAP],
+    [3 * CHUNK + 1, null, CAP],
+    [3 * CHUNK + 1, "soon", CAP],
+    [0, 0, 0],
+  ]) {
+    fakeFetch(t, () => audioResponse(recycledBody(size), length));
+    allocated.bytes = 0;
+    const bytes = await fetchAudio(JOB, { maxBytes: CAP });
+    assert.equal(bytes.length, size, `Content-Length ${length}`);
+    assert.ok(bytes.every((byte) => byte === 7), `Content-Length ${length}: a piece was kept, not copied, until the end`);
+    assert.equal(allocated.bytes, buffer, `Content-Length ${length}: bytes allocated for a body of ${size}`);
+  }
+});
+
+test("a body longer than its Content-Length is returned whole, inside the cap", async (t) => {
+  // A header that understates the body, as after a proxy changed it on the
+  // way: the bytes so far move to a buffer of the cap's size, once.
+  const allocated = countAllocations(t);
+  const body = countedBody(5 * CHUNK);
+  fakeFetch(t, () => audioResponse(body.stream, 2 * CHUNK));
+  const bytes = await fetchAudio(JOB, { maxBytes: CAP });
+  assert.equal(bytes.length, 5 * CHUNK);
+  assert.ok(bytes.every((byte) => byte === 7));
+  assert.equal(allocated.bytes, 2 * CHUNK + CAP);
+  // A body shorter than its header says is what arrived, and no more.
+  const short = countedBody(2 * CHUNK);
+  fakeFetch(t, () => audioResponse(short.stream, 5 * CHUNK));
+  const fewer = await fetchAudio(JOB, { maxBytes: CAP });
+  assert.equal(fewer.length, 2 * CHUNK);
+  assert.ok(fewer.every((byte) => byte === 7));
 });

@@ -302,7 +302,8 @@ export async function pollJob(jobId, { intervalMs = POLL_INTERVAL_MS, maxPolls =
  * FETCH_MAX_BYTES lets the fetcher hand over: a Content-Length over it is
  * refused before the body is read, and because that header can be missing or
  * wrong, the body is counted as it arrives and dropped once past the cap, at
- * most one chunk after it.
+ * most one chunk after it. What arrives goes straight into one buffer, so
+ * the page holds the audio once, not once in pieces and once joined.
  * @param {string} jobId
  * @param {{maxBytes?: number}} [options] the cap, MAX_INPUT_BYTES unless a
  *   test passes a smaller one
@@ -336,7 +337,12 @@ export async function fetchAudio(jobId, { maxBytes = MAX_INPUT_BYTES } = {}) {
     return new Uint8Array(buffer);
   }
   const reader = body.getReader();
-  const chunks = [];
+  // One buffer for the whole body, filled as it arrives, so the audio is
+  // never held twice: as long as the Content-Length says, or as long as the
+  // cap where that header is missing or no plain number. Keeping the pieces
+  // to join them at the end would hold a download at the cap twice over.
+  const announced = declared !== null && /^[0-9]+$/.test(declared);
+  let bytes = new Uint8Array(announced ? Number(declared) : maxBytes);
   let total = 0;
   for (;;) {
     let chunk;
@@ -347,19 +353,23 @@ export async function fetchAudio(jobId, { maxBytes = MAX_INPUT_BYTES } = {}) {
       throw new FetchError("network");
     }
     if (chunk.done) break;
-    total += chunk.value.byteLength;
+    const end = total + chunk.value.byteLength;
     // Written so that a count that is not a number is refused too.
-    if (!(total <= maxBytes)) {
+    if (!(end <= maxBytes)) {
       reader.cancel().catch(() => {});
       throw new FetchError("audio_too_large");
     }
-    chunks.push(chunk.value);
+    if (end > bytes.length) {
+      // More than the header announced, as after a proxy changed the body on
+      // the way: the bytes so far move to a buffer of the cap's size, once.
+      const larger = new Uint8Array(maxBytes);
+      larger.set(bytes.subarray(0, total));
+      bytes = larger;
+    }
+    bytes.set(chunk.value, total);
+    total = end;
   }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const part of chunks) {
-    bytes.set(part, offset);
-    offset += part.byteLength;
-  }
-  return bytes;
+  // A view where the body was shorter than its buffer. The caller copies
+  // what it is given into a File, and the buffer goes with this array.
+  return total === bytes.length ? bytes : bytes.subarray(0, total);
 }
