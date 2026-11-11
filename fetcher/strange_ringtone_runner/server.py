@@ -19,6 +19,7 @@ a video ID, a title, a token, an address or yt-dlp's output.
 """
 from __future__ import annotations
 
+import ctypes
 import http.server
 import json
 import os
@@ -543,12 +544,64 @@ def may_clean_all_of_tmp(scratch_dir: Path, sweep_strays: bool) -> bool:
     developer's machine and the tests above all, /tmp may hold other
     programs' files, and nothing outside the scratch directory is touched.
     """
+    return _under_the_contract(scratch_dir, sweep_strays)
+
+
+def may_remove_ipc_objects(scratch_dir: Path, sweep_strays: bool) -> bool:
+    """Whether the clean-up after a run may also remove the System V IPC objects of the runner's IPC namespace.
+
+    Under the same contract as may_clean_all_of_tmp, whose `ipc: none` gives
+    the container an IPC namespace of its own, and whose sweep leaves
+    nothing of a run running to use an object. Anywhere else the namespace
+    may be a developer's, shared with other programs of this user, and
+    nothing in it is touched.
+    """
+    return _under_the_contract(scratch_dir, sweep_strays)
+
+
+def _under_the_contract(scratch_dir: Path, sweep_strays: bool) -> bool:
     return (
         sys.platform.startswith("linux")
         and os.getpid() == 1
         and sweep_strays is True
         and scratch_dir == SCRATCH_DIR
     )
+
+
+# Where Linux lists the System V IPC objects of the caller's IPC namespace,
+# one file per kind, and the command that removes an object (IPC_RMID, 0 on
+# every Linux architecture).
+SYSV_IPC = Path("/proc/sysvipc")
+_IPC_RMID = 0
+
+
+def _ipc_ids(listing: Path) -> list[int]:
+    """The objects a /proc/sysvipc listing names: the second column of every line after the first."""
+    try:
+        lines = listing.read_text(encoding="ascii", errors="replace").splitlines()[1:]
+    except OSError:
+        return []
+    return [int(fields[1]) for fields in (line.split() for line in lines) if len(fields) > 1 and fields[1].isdigit()]
+
+
+def remove_ipc_objects(listing: Path = SYSV_IPC) -> None:
+    """Remove every System V shared memory segment, message queue and semaphore set this user may remove.
+
+    A run has the runner's UID and can leave such objects: neither a file
+    nor a process, they outlive it, and a segment's pages stay charged to
+    the container's memory limit until it is removed, enough to make every
+    later run fail for want of memory. Only under the container's contract
+    (may_remove_ipc_objects). The kernel refuses another user's object,
+    which stays; one already gone is no error.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    for ident in _ipc_ids(listing / "shm"):
+        libc.shmctl(ident, _IPC_RMID, None)
+    for ident in _ipc_ids(listing / "msg"):
+        libc.msgctl(ident, _IPC_RMID, None)
+    for ident in _ipc_ids(listing / "sem"):
+        # The second argument, a semaphore's number, means nothing to IPC_RMID.
+        libc.semctl(ident, 0, _IPC_RMID)
 
 
 def _unlink(path: Path) -> None:
@@ -1023,6 +1076,8 @@ class RunnerServer(http.server.ThreadingHTTPServer):
         # Decided once, here: whether the clean-up after each run may clear
         # the rest of /tmp too, which only the container's contract allows.
         self._clean_all_of_tmp = may_clean_all_of_tmp(settings.scratch_dir, sweep_strays)
+        # And whether it may empty the IPC namespace, under the same contract.
+        self._remove_ipc_objects = may_remove_ipc_objects(settings.scratch_dir, sweep_strays)
         # Held by a run or a stream: the one-job-at-a-time rule (R1, R3).
         self.busy = threading.Lock()
         self._workers = threading.BoundedSemaphore(self.MAX_WORKERS)
@@ -1095,7 +1150,8 @@ class RunnerServer(http.server.ThreadingHTTPServer):
         file where results/ should be, a directory it took the permissions
         off, a full tmpfs. All of it in the scratch directory goes, except
         the result the runner holds for this job, and under the container's
-        contract the rest of /tmp too, so no later job fails because of it.
+        contract the rest of /tmp and the run's System V IPC objects too, so
+        no later job fails because of it.
         """
         scratch = self.settings.scratch_dir
         keep = scratch / RESULTS_DIR / f"{job}.m4a" if job is not None else None
@@ -1112,6 +1168,13 @@ class RunnerServer(http.server.ThreadingHTTPServer):
             # directory is made again, so a tmpfs the run filled has room.
             try:
                 remove_leftovers(scratch.parent, keep=scratch)
+            except Exception:
+                pass
+        if self._remove_ipc_objects:
+            # What the run left that is no file: its System V IPC objects,
+            # which would keep their memory charged to this container.
+            try:
+                remove_ipc_objects()
             except Exception:
                 pass
         try:

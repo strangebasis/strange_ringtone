@@ -59,6 +59,10 @@ what tools/dev_fetch_stack.py relies on.
                   the child of PID 1 on Linux (a throwaway container), and
                   refused (exit 2) anywhere else, where it would fill a
                   developer's disk
+    sysv          both files as "ok", then a System V shared memory segment,
+                  a message queue holding a message and a semaphore set,
+                  left behind when it exits 0. Only as the child of PID 1 on
+                  Linux, like fill, so no developer's machine keeps them
 
 STRANGE_RINGTONE_YTDLP_STUB_LOG names a file each run appends one JSON line
 to: argv, working directory, environment and (on POSIX) resource limits.
@@ -83,7 +87,7 @@ DURATION_VAR = "STRANGE_RINGTONE_YTDLP_STUB_DURATION"
 MODES = (
     "ok", "too_long", "blocked", "not_found", "fail", "oversize", "no_audio", "ctrl_title", "huge_heatmap",
     "bad_heatmap", "bare_info", "not_a_dict", "symlink", "files_101", "files_1", "hang", "grandchild",
-    "survivor", "loud", "loud_ok", "litter", "wedge", "lock_scratch", "displace", "strand", "fill",
+    "survivor", "loud", "loud_ok", "litter", "wedge", "lock_scratch", "displace", "strand", "fill", "sysv",
 )
 # Eleven characters each, so they pass the fetcher's ID check.
 BY_ID = {
@@ -283,13 +287,36 @@ def fill_above(job: Path) -> None:
                 pass
 
 
+def leave_ipc_objects() -> None:
+    """A System V shared memory segment, a message queue with a message in it and a semaphore set.
+
+    None of them is a file or a process: they stay in the IPC namespace
+    after this process exits, until something removes them.
+    """
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.shmget.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.c_int]
+    libc.msgsnd.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    # IPC_PRIVATE (0) as the key, IPC_CREAT (0o1000) with the owner's
+    # permissions.
+    create = 0o1000 | 0o600
+    made = (libc.shmget(0, 1024 * 1024, create), libc.msgget(0, create), libc.semget(0, 4, create))
+    # A message is its type (a long, here 1) followed by its text.
+    text = 16
+    message = ctypes.create_string_buffer(ctypes.sizeof(ctypes.c_long) + text)
+    ctypes.c_long.from_buffer(message).value = 1
+    if -1 in made or libc.msgsnd(made[1], message, text, 0) != 0:
+        refuse(f"could not leave the IPC objects: errno {ctypes.get_errno()}")
+
+
 def main(argv: list[str]) -> int:
     video_id, max_bytes, directory = parse(argv)
     mode = os.environ.get(MODE_VAR) or BY_ID.get(video_id, "ok")
     if mode not in MODES:
         refuse(f"unknown mode {mode!r}")
-    if mode == "fill" and (not sys.platform.startswith("linux") or os.getppid() != 1):
-        refuse("fill runs only as the child of PID 1 in a throwaway container")
+    if mode in ("fill", "sysv") and (not sys.platform.startswith("linux") or os.getppid() != 1):
+        refuse(f"{mode} runs only as the child of PID 1 in a throwaway container")
     log_run(argv)
     title = title_for(video_id)
     # yt-dlp prints the destination filename and errors that quote the title;
@@ -411,6 +438,9 @@ def main(argv: list[str]) -> int:
         return 1
     if mode == "fill":
         fill_above(directory)
+        return 0
+    if mode == "sysv":
+        leave_ipc_objects()
         return 0
     # A failed run that still left both files behind: the exit status wins.
     if mode == "files_101":
