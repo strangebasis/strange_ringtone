@@ -183,8 +183,10 @@ server, and the fetch counts against the rate limit like any other.
   replace other users' uploads and finished tones, and stay until the
   container restarts. It has no route out: in `compose.example.yaml`'s
   layout the `core` network reaches nothing but the reverse proxy. The
-  example gives the core no memory or process cap yet (docs/PLAN.md,
-  section 8).
+  example caps the container's memory and processes (`mem_limit` and
+  `pids_limit`). The image sets no process limit of its own, so a
+  deployment that drops `pids_limit` leaves ffmpeg no bound on its
+  processes (docs/PLAN.md, section 8).
 - *yt-dlp, yt-dlp-ejs or Deno*, through a bad release or a crafted video:
   it runs in the runner's container, which is given no secret and nothing
   of `.env` but three limits. Its only way out is the forwarder: YouTube's
