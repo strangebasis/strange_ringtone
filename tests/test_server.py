@@ -2128,8 +2128,12 @@ class EntryPointTest(unittest.TestCase):
 
         env = {name: value for name, value in os.environ.items() if name not in MainTest.CONTRACT}
         env["PUBLIC_ORIGIN"] = ORIGIN
+        # main() would make the test process itself non-dumpable on Linux,
+        # for every test that runs after it; tests/test_core_not_dumpable.py
+        # tests that step.
         for patcher in (mock.patch.dict(os.environ, env, clear=True),
-                        mock.patch.object(entry, "RingtoneServer", FakeServer)):
+                        mock.patch.object(entry, "RingtoneServer", FakeServer),
+                        mock.patch.object(entry, "make_not_dumpable")):
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -2226,8 +2230,10 @@ class SigtermTest(unittest.TestCase):
 
         env = {name: value for name, value in os.environ.items() if name not in MainTest.CONTRACT}
         env["PUBLIC_ORIGIN"] = ORIGIN
+        # Not the test process: see EntryPointTest.
         with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(entry, "RingtoneServer", FakeServer), \
+                mock.patch.object(entry, "make_not_dumpable"), \
                 contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as raised:
                 entry.main(["--bind", "127.0.0.1"])
