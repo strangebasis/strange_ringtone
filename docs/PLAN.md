@@ -1297,8 +1297,9 @@ risks" list of the core's own, with its reason. The fetcher image's list is
   neither attach to it, whatever the host's `kernel.yama.ptrace_scope` says,
   nor read its `/proc/<pid>/environ`, maps, open files or memory. A download
   opens the stored tone without following a link in its name and without
-  blocking, reads it only if it is a regular file, and no more than the
-  4 MiB an output may hold; anything else answers as a missing result.
+  blocking, and serves it only if it is a regular file of at most the 4 MiB
+  an output may hold, reading at most one byte more to find out; anything
+  else answers as a missing result.
   `compose.example.yaml` gives the core service a `pids_limit` and a
   `mem_limit` and turns System V IPC off (5.7); the image sets no process
   limit of its own, so a deployment that drops `pids_limit` has no bound on
