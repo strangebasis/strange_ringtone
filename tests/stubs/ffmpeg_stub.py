@@ -22,6 +22,15 @@ STRANGE_RINGTONE_FFMPEG_STUB selects a behaviour:
     hang        sleep 60 s
     grandchild  start a sleeping grandchild, write its PID to grandchild.pid in
                 the working directory, then sleep 60 s
+    survivor    everything ok does, then start a sleeping grandchild in its
+                own process group with its standard streams on the null
+                device, append its PID to survivors.pid in the working
+                directory, and exit 0: a child left behind by a run that
+                succeeded, which the pipes alone never reveal
+    flood       write FLOOD_BYTES to stdout and as many to stderr, in
+                alternating chunks, then everything ok does: a run whose
+                output would fill memory if it were kept, and which blocks
+                on a full pipe unless both are read at once
 STRANGE_RINGTONE_FFMPEG_STUB_LOG, when set, names a file that each run appends
 one JSON line to: its argv, working directory and (on POSIX) resource limits.
 """
@@ -37,7 +46,13 @@ from pathlib import Path
 
 MODE_VAR = "STRANGE_RINGTONE_FFMPEG_STUB"
 LOG_VAR = "STRANGE_RINGTONE_FFMPEG_STUB_LOG"
-MODES = ("ok", "offset", "stubborn", "silence", "unparsable", "fail", "late_fail", "hang", "grandchild")
+MODES = (
+    "ok", "offset", "stubborn", "silence", "unparsable", "fail", "late_fail", "hang", "grandchild", "survivor", "flood",
+)
+# What "flood" writes to each stream: far more than any bound on what the
+# renderer keeps, and more than a pipe's buffer many times over.
+FLOOD_BYTES = 24 * 1024 * 1024
+FLOOD_CHUNK = 64 * 1024
 INPUT_LUFS = -23.0
 INPUT_PEAK = -20.0
 OUTPUT_MAGIC = b"STUB-IPOD\n"
@@ -163,6 +178,8 @@ def main(argv: list[str]) -> int:
     if mode == "fail":
         sys.stderr.write("ffmpeg stub: failing as asked\n")
         return 1
+    if mode == "flood":
+        flood()
     err = sys.stderr.buffer
     # Real ffmpeg echoes the output's metadata, title included, on stderr; the
     # renderer must never pass that on.
@@ -184,7 +201,40 @@ def main(argv: list[str]) -> int:
         peak = min(peak + gain, -1.5)
     err.write(summary(integrated, peak).encode("ascii"))
     err.flush()
+    if mode == "survivor":
+        leave_survivor()
     return 1 if mode == "late_fail" else 0
+
+
+def flood() -> None:
+    # Alternating, so a reader that drains one stream to its end before it
+    # reads the other leaves this process blocked on the full second pipe.
+    line = b"[Parsed_ebur128_4 @ 0x5581d1e0c040] flood of output nobody needs\n"
+    chunk = (line * (FLOOD_CHUNK // len(line) + 1))[:FLOOD_CHUNK]
+    out, err = sys.stdout.buffer, sys.stderr.buffer
+    for _ in range(FLOOD_BYTES // FLOOD_CHUNK):
+        out.write(chunk)
+        out.flush()
+        err.write(chunk)
+        err.flush()
+
+
+def leave_survivor() -> None:
+    # Same process group (no new session) and no inherited pipe, so the run
+    # looks finished to the renderer while the child keeps running. The
+    # Popen object is dropped: nothing here waits for it.
+    child = subprocess.Popen(
+        [sys.executable, "-I", "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    # One line per run, appended: a render with a measure pass leaves two.
+    handle = open("survivors.pid", "a", encoding="ascii")
+    try:
+        handle.write(f"{child.pid}\n")
+    finally:
+        handle.close()
 
 
 if __name__ == "__main__":
