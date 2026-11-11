@@ -735,7 +735,9 @@ class LeftoverServerTest(LeftoverServerTestCase):
         scratch = self.temp / "sweeping"
         with Syscalls(pid=1).installed():
             settings = Settings(scratch_dir=scratch)
-            ytdlp = StubYtDlp(600, MIB, 30, sweep_strays=True)
+            # The run's log lies beside this scratch directory, so it is one
+            # more file the clean-up must leave (assertOutsideUntouched).
+            ytdlp = StubYtDlp(600, MIB, 30, sweep_strays=True, log=self.runs_log)
             server = _TestRunnerServer(("127.0.0.1", 0), settings, ytdlp=ytdlp, sweep_strays=True)
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
             thread.start()

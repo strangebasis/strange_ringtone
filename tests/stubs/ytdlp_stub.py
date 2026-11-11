@@ -324,7 +324,11 @@ def main(argv: list[str]) -> int:
         flood()
         if mode == "loud":
             # Last, as yt-dlp prints its error: the runner keeps the tail.
-            sys.stderr.write(f"ERROR: [youtube] {video_id}: Sign in to confirm you're not a bot\n")
+            # As bytes, like the flood: the text stream would end the line
+            # with CR LF on Windows, and the tail's last bytes are compared.
+            line = f"ERROR: [youtube] {video_id}: Sign in to confirm you're not a bot\n"
+            sys.stderr.buffer.write(line.encode("ascii"))
+            sys.stderr.buffer.flush()
             return 1
 
     duration: float = float(os.environ.get(DURATION_VAR) or DURATION)
