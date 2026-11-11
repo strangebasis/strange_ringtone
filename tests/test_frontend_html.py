@@ -385,6 +385,16 @@ class TemplateTest(unittest.TestCase):
         ):
             self.assertIn(phrase, text)
 
+    def test_youtube_hint_states_no_size_as_the_servers(self) -> None:
+        # The server fetches up to FETCH_MAX_BYTES, which a deployment sets
+        # anywhere from 1 MiB to 512 MiB, so the YouTube section gives the
+        # server no byte size. The page's own 64 MB limit on fetched audio
+        # has a message of its own when it refuses.
+        text = re.sub(r"\s+", " ", self.text)
+        section = text[text.index('id="youtube"'):text.index('id="pick"')]
+        self.assertIn("The server fetches the audio (up to 10 minutes) from YouTube.", section)
+        self.assertNotRegex(section, r"\b\d+(?:\.\d+)? ?(?:[KMG]i?B|bytes?)\b")
+
 
 def css_declarations(text: str, selector: str) -> dict[str, str]:
     """The declarations every rule naming exactly `selector` sets, later ones winning."""
