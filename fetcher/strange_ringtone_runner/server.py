@@ -41,7 +41,7 @@ from typing import Any
 from strange_ringtone.http_guard import GuardError, body_length, require_content_type
 from strange_ringtone_fetch.metadata import VIDEO_ID_RE, FetchError, metadata_to_info
 
-from strange_ringtone_runner.config import Settings
+from strange_ringtone_runner.config import SCRATCH_DIR, Settings
 from strange_ringtone_runner.ytdlp import YtDlp, default_prlimit
 
 SERVER_NAME = "strange_ringtone_runner"
@@ -162,6 +162,393 @@ def prepare_scratch(directory: Path) -> None:
                 child.unlink()
             except OSError:
                 pass
+
+
+# Opened only to be listed or entered: never through a symlink, and
+# O_NONBLOCK, so a FIFO swapped in for a directory can't make the open wait
+# for a writer (O_DIRECTORY refuses it first where it exists).
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+# Linux (the container) works relative to open directory descriptors;
+# Windows, a development platform only, has none and works by path.
+_BY_DESCRIPTOR = (
+    {os.open, os.stat, os.unlink, os.rmdir, os.chmod} <= os.supports_dir_fd and os.listdir in os.supports_fd
+)
+# How many times one directory is listed and emptied before whatever is
+# still in it counts as left behind. Each listing reads the whole directory,
+# so one pass removes everything a finished run left; another only matters
+# if something still adds entries, which the sweep rules out.
+_LISTINGS = 3
+
+
+def _plain_directory(info: os.stat_result) -> bool:
+    # A directory itself, never a link to one; on Windows a junction or other
+    # reparse point counts as a link.
+    return stat.S_ISDIR(info.st_mode) and not getattr(info, "st_reparse_tag", 0)
+
+
+def _is_link(info: os.stat_result) -> bool:
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_reparse_tag", 0))
+
+
+def _identity(info: os.stat_result) -> tuple[int, int]:
+    return info.st_dev, info.st_ino
+
+
+def _chmod_no_follow(path: Path, mode: int) -> None:
+    if sys.platform == "win32":
+        # Development only: chmod there only sets or clears the read-only
+        # flag, and the caller has just seen a plain directory at the path.
+        os.chmod(path, mode)
+        return
+    os.chmod(path, mode, follow_symlinks=False)
+
+
+class _DescriptorTree:
+    """remove_leftovers' steps relative to an open directory (Linux, the container).
+
+    A name is resolved in the directory already open, never through a link
+    swapped in above it, and no path grows past PATH_MAX however deep a run
+    nested its directories. One descriptor is open at a time, so depth costs
+    no open files.
+    """
+
+    def open_root(self, root: Path) -> Any:
+        return os.open(root, _DIR_FLAGS)
+
+    def open(self, handle: Any, name: str) -> Any:
+        return os.open(name, _DIR_FLAGS, dir_fd=handle)
+
+    def open_parent(self, handle: Any) -> Any:
+        return os.open("..", _DIR_FLAGS, dir_fd=handle)
+
+    def stat(self, handle: Any) -> os.stat_result:
+        return os.fstat(handle)
+
+    def lstat(self, handle: Any, name: str) -> os.stat_result:
+        return os.stat(name, dir_fd=handle, follow_symlinks=False)
+
+    def listdir(self, handle: Any) -> list[str]:
+        return os.listdir(handle)
+
+    def unlink(self, handle: Any, name: str) -> None:
+        os.unlink(name, dir_fd=handle)
+
+    def rmdir(self, handle: Any, name: str) -> None:
+        os.rmdir(name, dir_fd=handle)
+
+    def chmod_self(self, handle: Any, mode: int) -> None:
+        os.fchmod(handle, mode)
+
+    def chmod(self, handle: Any, name: str, mode: int) -> None:
+        # fchmodat with AT_SYMLINK_NOFOLLOW: a link swapped in is never
+        # followed (NotImplementedError where the platform can't promise it).
+        os.chmod(name, mode, dir_fd=handle, follow_symlinks=False)
+
+    def close(self, handle: Any) -> None:
+        os.close(handle)
+
+
+class _PathTree(_DescriptorTree):
+    """The same steps by path, for Windows, which has no directory descriptors (development only)."""
+
+    def open_root(self, root: Path) -> Any:
+        return str(root)
+
+    def open(self, handle: Any, name: str) -> Any:
+        return os.path.join(handle, name)
+
+    def open_parent(self, handle: Any) -> Any:
+        return os.path.dirname(handle)
+
+    def stat(self, handle: Any) -> os.stat_result:
+        return os.lstat(handle)
+
+    def lstat(self, handle: Any, name: str) -> os.stat_result:
+        return os.lstat(os.path.join(handle, name))
+
+    def unlink(self, handle: Any, name: str) -> None:
+        # Windows' unlink removes a link to a directory as a link, too.
+        os.unlink(os.path.join(handle, name))
+
+    def rmdir(self, handle: Any, name: str) -> None:
+        os.rmdir(os.path.join(handle, name))
+
+    def chmod_self(self, handle: Any, mode: int) -> None:
+        os.chmod(handle, mode)
+
+    def chmod(self, handle: Any, name: str, mode: int) -> None:
+        # Only ever called for an entry lstat saw as no link.
+        os.chmod(os.path.join(handle, name), mode)
+
+    def close(self, handle: Any) -> None:
+        pass
+
+
+class _Frame:
+    """One directory on remove_leftovers' way down, and what is left to do in it."""
+
+    __slots__ = ("identity", "name", "keep", "remove", "pending", "skip", "listings")
+
+    def __init__(self, identity: tuple[int, int], name: str, keep: tuple[str, ...] | None, remove: bool) -> None:
+        self.identity = identity
+        # Its name in its parent, and whether it goes once it is empty: not
+        # the root, and not a directory on the way to keep.
+        self.name = name
+        self.remove = remove
+        # The rest of the kept path below it, when keep lies below it.
+        self.keep = keep
+        self.pending: list[str] = []
+        # Names kept, or that could not be removed, which a new listing skips.
+        self.skip: set[str] = set()
+        self.listings = 0
+
+
+def _make_usable(tree: _DescriptorTree, handle: Any, info: os.stat_result) -> None:
+    # The owner's read, write and search back on a directory of this user, so
+    # its entries can be listed, looked at and removed. Another user's (/tmp
+    # itself) is left as it is.
+    getuid = getattr(os, "getuid", None)
+    mode = stat.S_IMODE(info.st_mode)
+    if getuid is not None and info.st_uid == getuid() and mode & 0o700 != 0o700:
+        tree.chmod_self(handle, mode | 0o700)
+
+
+def _enter(tree: _DescriptorTree, handle: Any, name: str, entry: os.stat_result) -> Any:
+    """The directory name in handle, opened and made usable; None when it can't be."""
+    try:
+        child = tree.open(handle, name)
+    except PermissionError:
+        # A run took the owner's permissions away: given back, never through
+        # a link, and tried once more.
+        try:
+            tree.chmod(handle, name, stat.S_IMODE(entry.st_mode) | 0o700)
+            child = tree.open(handle, name)
+        except (OSError, NotImplementedError):
+            return None
+    except OSError:
+        return None
+    try:
+        info = tree.stat(child)
+        # The directory the listing showed, not one swapped in since.
+        if _plain_directory(info) and _identity(info) == _identity(entry):
+            _make_usable(tree, child, info)
+            return child
+    except OSError:
+        pass
+    tree.close(child)
+    return None
+
+
+def _remove(tree: _DescriptorTree, handle: Any, name: str, entry: os.stat_result | None) -> bool:
+    """Remove name from handle, an emptied directory when entry is None; whether it is gone."""
+    remove = tree.rmdir if entry is None else tree.unlink
+    for attempt in range(2):
+        try:
+            remove(handle, name)
+            return True
+        except FileNotFoundError:
+            return True
+        except PermissionError:
+            if attempt:
+                return False
+        except OSError:
+            return False
+        # The owner's permissions back on the directory it is in and on the
+        # entry itself (on Windows a read-only file can't be deleted), never
+        # on a link; then once more.
+        try:
+            _make_usable(tree, handle, tree.stat(handle))
+            if entry is None or not _is_link(entry):
+                tree.chmod(handle, name, 0o700 if entry is None else stat.S_IMODE(entry.st_mode) | 0o700)
+        except (OSError, NotImplementedError):
+            pass
+    return False
+
+
+def remove_leftovers(root: Path, keep: Path | None = None) -> bool:
+    """Remove everything inside root but keep and the directories on the way to it; whether nothing else is left.
+
+    root itself stays. keep is kept whole as a plain directory, or kept as a
+    regular file, and only below plain directories: a link on the way to it,
+    or anywhere else, is removed as a link and nothing it points to is
+    touched. A root that is no plain directory (a link a run put in its
+    place) is left alone: False. An entry a run made unreadable or
+    unwritable gets the owner's permissions back, never through a link and
+    never on root's parent, which lies outside. Nothing but a directory is
+    ever opened, so a FIFO can't block it; another filesystem mounted
+    inside is never entered; it works iteratively, so neither a deep tree
+    nor a large directory defeats it.
+    """
+    try:
+        info = os.lstat(root)
+    except OSError:
+        return False
+    if not _plain_directory(info):
+        return False
+    path_to_keep: tuple[str, ...] | None = None
+    if keep is not None:
+        try:
+            path_to_keep = Path(keep).relative_to(root).parts
+        except ValueError:
+            path_to_keep = None
+        if path_to_keep == ():
+            return True
+    tree = _DescriptorTree() if _BY_DESCRIPTOR else _PathTree()
+    try:
+        handle = tree.open_root(root)
+    except PermissionError:
+        try:
+            _chmod_no_follow(root, stat.S_IMODE(info.st_mode) | 0o700)
+            handle = tree.open_root(root)
+        except (OSError, NotImplementedError):
+            return False
+    except OSError:
+        return False
+    device = info.st_dev
+    clean = True
+    try:
+        opened = tree.stat(handle)
+        if not _plain_directory(opened) or _identity(opened) != _identity(info):
+            return False
+        _make_usable(tree, handle, opened)
+        stack = [_Frame(_identity(info), "", path_to_keep, remove=False)]
+        while stack:
+            frame = stack[-1]
+            if not frame.pending:
+                try:
+                    left = [name for name in tree.listdir(handle) if name not in frame.skip]
+                except OSError:
+                    left, clean = [], False
+                if left and frame.listings < _LISTINGS:
+                    frame.listings += 1
+                    frame.pending = left
+                    continue
+                if left:
+                    clean = False
+                # Done with this directory: back up to its parent, checked to
+                # be the one it came from, and remove it there.
+                stack.pop()
+                if not stack:
+                    break
+                parent = tree.open_parent(handle)
+                try:
+                    moved = _identity(tree.stat(parent)) != stack[-1].identity
+                finally:
+                    tree.close(handle)
+                    handle = parent
+                if moved:
+                    # Something moved the tree during the clean-up: stop
+                    # rather than remove anything from a directory not seen
+                    # on the way down.
+                    return False
+                if frame.remove and not _remove(tree, handle, frame.name, None):
+                    stack[-1].skip.add(frame.name)
+                    clean = False
+                continue
+            name = frame.pending.pop()
+            try:
+                entry = tree.lstat(handle, name)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                frame.skip.add(name)
+                clean = False
+                continue
+            if entry.st_dev != device:
+                # A mount inside the tree: another filesystem is never
+                # entered or removed.
+                frame.skip.add(name)
+                clean = False
+                continue
+            on_the_way = frame.keep is not None and name == frame.keep[0]
+            directory = _plain_directory(entry)
+            if on_the_way and len(frame.keep) == 1 and (directory or stat.S_ISREG(entry.st_mode)):
+                frame.skip.add(name)
+                continue
+            if directory:
+                child = _enter(tree, handle, name, entry)
+                if child is None:
+                    frame.skip.add(name)
+                    clean = False
+                    continue
+                tree.close(handle)
+                handle = child
+                if on_the_way:
+                    frame.skip.add(name)
+                below = frame.keep[1:] if on_the_way else None
+                stack.append(_Frame(_identity(entry), name, below, remove=not on_the_way))
+                continue
+            # A file, a link, a FIFO, a socket or a device node: removed as
+            # itself, never opened or followed.
+            if not _remove(tree, handle, name, entry):
+                frame.skip.add(name)
+                clean = False
+    except OSError:
+        return False
+    finally:
+        tree.close(handle)
+    return clean
+
+
+def restore_scratch(directory: Path) -> None:
+    """Make directory and its results/ plain directories of this user, mode 0o700, again; RuntimeError when it can't.
+
+    The check prepare_scratch makes at start-up, after every run: a run has
+    this UID and may have put a file, a FIFO or a link in place of either,
+    or changed its mode. Whatever is there instead is removed as itself,
+    never followed, and the directory made again; a held result in
+    results/ stays.
+    """
+    for path in (directory, directory / RESULTS_DIR):
+        info: os.stat_result | None
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            info = None
+        except OSError as error:
+            raise RuntimeError(f"cannot check {path}") from error
+        if info is not None and not _plain_directory(info):
+            try:
+                os.unlink(path)
+            except OSError as error:
+                raise RuntimeError(f"cannot remove what is in place of {path}") from error
+            info = None
+        if info is None:
+            try:
+                # No parents: if the directory above is gone too, making it
+                # is not this check's job (prepare_scratch).
+                path.mkdir(mode=0o700)
+                info = os.lstat(path)
+            except OSError as error:
+                raise RuntimeError(f"cannot make {path} again") from error
+            if not _plain_directory(info):
+                raise RuntimeError(f"{path} is not a plain directory")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise RuntimeError(f"{path} is owned by another user")
+        try:
+            # Owner-only, as at start-up: only this user lists, enters or
+            # writes it.
+            _chmod_no_follow(path, 0o700)
+        except (OSError, NotImplementedError) as error:
+            raise RuntimeError(f"cannot set the mode of {path}") from error
+
+
+def may_clean_all_of_tmp(scratch_dir: Path, sweep_strays: bool) -> bool:
+    """Whether the clean-up after a run may also remove everything else in the scratch directory's parent, /tmp.
+
+    Only under the container's contract: on Linux, as PID 1 of its PID
+    namespace, so /tmp is the container's own tmpfs; sweeping, so nothing of
+    a run is still running to write there; and with exactly the contract's
+    scratch directory, /tmp/strange_ringtone_runner. Anywhere else, a
+    developer's machine and the tests above all, /tmp may hold other
+    programs' files, and nothing outside the scratch directory is touched.
+    """
+    return (
+        sys.platform.startswith("linux")
+        and os.getpid() == 1
+        and sweep_strays is True
+        and scratch_dir == SCRATCH_DIR
+    )
 
 
 def _unlink(path: Path) -> None:
@@ -633,6 +1020,9 @@ class RunnerServer(http.server.ThreadingHTTPServer):
                 sweep_strays=sweep_strays,
             )
         )
+        # Decided once, here: whether the clean-up after each run may clear
+        # the rest of /tmp too, which only the container's contract allows.
+        self._clean_all_of_tmp = may_clean_all_of_tmp(settings.scratch_dir, sweep_strays)
         # Held by a run or a stream: the one-job-at-a-time rule (R1, R3).
         self.busy = threading.Lock()
         self._workers = threading.BoundedSemaphore(self.MAX_WORKERS)
@@ -656,7 +1046,11 @@ class RunnerServer(http.server.ThreadingHTTPServer):
             raise
 
     def _run(self, video_id: str, job: str) -> dict[str, Any]:
-        """One run under the caller's hold of busy: the answer's payload. The job directory never survives it."""
+        """One run under the caller's hold of busy: the answer's payload. Nothing the run left survives it.
+
+        Only the job's own result, when the run produced one, is still in
+        the scratch directory once this returns.
+        """
         results = self.results
         # Before yt-dlp writes anything: no uncollected result exists while a
         # download arrives, so the tmpfs holds one audio file at most (R3).
@@ -665,26 +1059,82 @@ class RunnerServer(http.server.ThreadingHTTPServer):
             return {"status": "failed", "error": "failed"}
         # Owner-only (mkdtemp's 0o700), fresh, with a server-made name.
         job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=self.settings.scratch_dir))
+        held: str | None = None
         try:
             try:
                 download = self.ytdlp.fetch(video_id, job_dir)
                 results.hold(job, download.audio)
+                held = job
             except FetchError as error:
-                return {"status": "failed", "error": error.code}
+                payload: dict[str, Any] = {"status": "failed", "error": error.code}
             except Exception:
                 # Anything else is "failed" with nothing of its text: an
                 # exception could quote a title or a path.
-                return {"status": "failed", "error": "failed"}
-            # The whitelist on the runner's side: only the three cleaned
-            # values, in yt-dlp's names, ever leave this container.
-            return {"status": "done", "info": metadata_to_info(download.metadata)}
+                payload = {"status": "failed", "error": "failed"}
+            else:
+                # The whitelist on the runner's side: only the three cleaned
+                # values, in yt-dlp's names, ever leave this container.
+                payload = {"status": "done", "info": metadata_to_info(download.metadata)}
         finally:
-            # Every path, success included: the audio was moved out above.
-            # ignore_errors covers Windows development only, where a killed
-            # run's children may still hold the directory for a moment; on
-            # Linux killpg ends the whole group first, and in the container
-            # the sweep ends anything that left it.
-            shutil.rmtree(job_dir, ignore_errors=True)
+            # Every path, success included (the audio was moved out above),
+            # after the run and its sweep and before the answer, so no other
+            # job starts next to what this run left: the job directory and
+            # everything else the run could write.
+            usable = self._clean_up(held)
+        if not usable:
+            # Fail closed: a result is only ever served from a scratch
+            # directory that is the runner's again.
+            results.discard_all()
+            return {"status": "failed", "error": "failed"}
+        return payload
+
+    def _clean_up(self, job: str | None) -> bool:
+        """Remove everything a run left; whether the scratch directory is usable and holds job's result, if any.
+
+        A run has the runner's UID and could write anywhere in its /tmp: a
+        file where results/ should be, a directory it took the permissions
+        off, a full tmpfs. All of it in the scratch directory goes, except
+        the result the runner holds for this job, and under the container's
+        contract the rest of /tmp too, so no later job fails because of it.
+        """
+        scratch = self.settings.scratch_dir
+        keep = scratch / RESULTS_DIR / f"{job}.m4a" if job is not None else None
+        try:
+            remove_leftovers(scratch, keep=keep)
+        except Exception:
+            # What is left is retried after the next run; whether the
+            # directory is usable is decided below.
+            pass
+        if self._clean_all_of_tmp:
+            # The rest of the container's own tmpfs, only under the contract
+            # (may_clean_all_of_tmp): anything of the run's outside the
+            # scratch directory, which stays whole. Before the scratch
+            # directory is made again, so a tmpfs the run filled has room.
+            try:
+                remove_leftovers(scratch.parent, keep=scratch)
+            except Exception:
+                pass
+        try:
+            restore_scratch(scratch)
+            usable = True
+        except Exception:
+            usable = False
+        if not usable:
+            # One line, with no token, ID or title in it. The runner keeps
+            # serving and /healthz stays as it is; docs/PLAN.md 6.1 says what
+            # that leaves.
+            sys.stderr.write("after a run the scratch directory could not be made usable again: the job failed\n")
+            return False
+        if keep is not None:
+            # A run that put a link in place of the scratch directory or of
+            # results/ had the result moved through it, away from where it
+            # is served from; the clean-up removed the link. Only a result
+            # that is where it should be counts.
+            try:
+                return stat.S_ISREG(os.lstat(keep).st_mode)
+            except OSError:
+                return False
+        return True
 
     def _sweep_forever(self, interval: float) -> None:
         while not self._sweeper_stop.wait(interval):
