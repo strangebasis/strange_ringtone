@@ -8,6 +8,7 @@ those files must be revalidated on every use.
 from __future__ import annotations
 
 import ast
+import re
 import unittest
 
 import helpers
@@ -72,6 +73,18 @@ class DefaultVersionTest(unittest.TestCase):
                 1 for node in ast.walk(tree) if isinstance(node, ast.Constant) and node.value == "dev"
             )
         self.assertEqual(counts, {"config.py": 1, "server.py": 0, "static.py": 0})
+
+
+class DockerfileVersionTest(unittest.TestCase):
+    def test_the_image_default_is_the_default_version(self) -> None:
+        # An image built without a VERSION build argument (as the compose
+        # example builds it) gets the Dockerfile's default. If that default
+        # drifted from config.DEFAULT_VERSION, such an image would serve its
+        # assets as immutable for a year under URLs a rebuild reuses.
+        text = (helpers.ROOT / "core" / "Dockerfile").read_text(encoding="utf-8")
+        defaults = re.findall(r"^ARG VERSION=(.*)$", text, flags=re.MULTILINE)
+        self.assertEqual(defaults, [config.DEFAULT_VERSION])
+        self.assertRegex(text, r"(?m)^ENV VERSION=\$\{VERSION\}")
 
 
 if __name__ == "__main__":
