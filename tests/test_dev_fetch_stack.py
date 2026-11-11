@@ -21,7 +21,8 @@ def load_stack():
 
 class DevVersionTest(unittest.TestCase):
     def test_each_start_gets_a_new_valid_version(self) -> None:
-        # The core serves /static/<version>/ as immutable. The stack's version
+        # The core serves /static/<version>/ as immutable for every version
+        # but the default "dev". The stack's version is never "dev" and
         # changes on every start, or a browser that saw an earlier start keeps
         # running its modules after the code changed.
         stack = load_stack()

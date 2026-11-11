@@ -29,6 +29,7 @@ from corpus.build import (
     corpus_cases,
     cut_off_body,
     oversized_body,
+    pcm_header,
     silent_bytes,
     valid_wav,
 )
@@ -206,6 +207,19 @@ class ServerTestCase(unittest.TestCase):
 
     def render_headers(self, length: int) -> list[tuple[str, str]]:
         return [("Origin", ORIGIN), ("Content-Type", "audio/wav"), ("Content-Length", str(length))]
+
+    @staticmethod
+    def valid_body(frames: int = 26460, channels: int = 1) -> bytes:
+        """A WAV the validator accepts (0.6 s at 44.1 kHz by default).
+
+        A render hook only ever sees an upload that has passed validation, so
+        a test whose hook stands in for the render sends one of these.
+        """
+        return silent_bytes(frames, channels=channels)
+
+    def post_valid(self, extra: list[tuple[str, str]] | None = None) -> Response:
+        body = self.valid_body()
+        return self.post_render(self.render_headers(len(body)) + (extra or []), body)
 
     def post_render(self, headers: list[tuple[str, str]], body: bytes = b"", path: str = "/api/render") -> Response:
         return self.request("POST", path, headers, body)
@@ -481,7 +495,10 @@ class StaticTest(ServerTestCase):
                 response = self.request("GET", f"/static/dev/{name}")
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.headers.get("Content-Type"), content_type)
-                self.assertEqual(response.headers.get("Cache-Control"), "public, max-age=31536000, immutable")
+                # The default version "dev" names no release: a rebuild keeps
+                # the same URLs, so the browser must revalidate every time.
+                # Released versions are immutable (test_server_static_cache).
+                self.assertEqual(response.headers.get("Cache-Control"), "no-cache")
                 self.assertEqual(response.body, (static.STATIC_DIR / name).read_bytes())
 
     def test_query_is_ignored(self) -> None:
@@ -802,10 +819,19 @@ class LengthTest(ServerTestCase):
         self.start(render_hook=hook)
         size = self.settings.max_body_bytes
         self.assertEqual(size, 1 * 48000 * 2 * 2 + 4096)
-        body = bytes(range(256)) * (size // 256) + b"x" * (size % 256)
-        response = self.post_render(self.render_headers(size), body)
+        # The largest WAV the validator takes, MAX_CLIP_SECONDS of 48 kHz
+        # stereo, is 4052 bytes under the limit, which allows 4 KiB for
+        # headers. A body of exactly the limit passes the length check and is
+        # read whole: the validator finds the padding after the data chunk.
+        largest = silent_bytes(48000, rate=48000, channels=2)
+        # The RIFF size covers the padding, so only the padding itself is wrong.
+        padded = largest[:4] + (size - 8).to_bytes(4, "little") + largest[8:] + bytes(size - len(largest))
+        self.assertEqual(len(padded), size)
+        self.assertBadWav(self.post_render(self.render_headers(size), padded), "trailing_data")
+        self.assertEqual(hook.calls, [])
+        response = self.post_render(self.render_headers(len(largest)), largest)
         self.assertEqual(response.status, 200)
-        self.assertEqual(hook.calls[0][2], body)
+        self.assertEqual(hook.calls[0][2], largest)
         self.wait_for_log("POST /api/render 200")
         self.assertScratchEmpty()
 
@@ -833,8 +859,10 @@ class CheckOrderTest(ServerTestCase):
         self.assertJsonError(self.post_render(headers), 415, "unsupported_media_type")
 
     def test_length_checks_before_rate_limit(self) -> None:
-        self.start(rate_limit_renders_per_minute=1)
-        self.assertBadWav(self.post_render(self.render_headers(4), b"RIFF"), "truncated")
+        # A render that ran uses the client's one render; the refusals below
+        # come before the rate limit is even asked.
+        self.start(render_hook=RenderHook(), rate_limit_renders_per_minute=1)
+        self.assertEqual(self.post_valid().status, 200)
         refusals = [
             ([("Content-Type", "audio/wav"), ("Content-Length", "4")], 403),
             ([("Origin", ORIGIN), ("Content-Type", "text/plain"), ("Content-Length", "4")], 415),
@@ -858,10 +886,12 @@ class CheckOrderTest(ServerTestCase):
 
 class RateLimitTest(ServerTestCase):
     def test_limit_per_client(self) -> None:
-        self.start(rate_limit_renders_per_minute=2)
+        hook = RenderHook()
+        self.start(render_hook=hook, rate_limit_renders_per_minute=2)
         for _ in range(2):
-            self.assertBadWav(self.post_render(self.render_headers(4), b"RIFF"), "truncated")
+            self.assertEqual(self.post_valid().status, 200)
         response = self.post_render(self.render_headers(4))
+        self.assertEqual(len(hook.calls), 2)
         self.assertJsonError(response, 429, "rate_limited")
         retry_after = response.headers.get("Retry-After")
         assert retry_after is not None
@@ -870,27 +900,25 @@ class RateLimitTest(ServerTestCase):
         self.assertScratchEmpty()
 
     def test_forwarded_for_is_ignored_from_untrusted_peers(self) -> None:
-        self.start(rate_limit_renders_per_minute=1)
-        first = self.render_headers(4) + [("X-Forwarded-For", "192.0.2.1")]
+        self.start(render_hook=RenderHook(), rate_limit_renders_per_minute=1)
         second = self.render_headers(4) + [("X-Forwarded-For", "192.0.2.2")]
-        self.assertEqual(self.post_render(first, b"RIFF").status, 400)
+        self.assertEqual(self.post_valid([("X-Forwarded-For", "192.0.2.1")]).status, 200)
         # Same socket peer, so the same client whatever the header claims.
         self.assertJsonError(self.post_render(second), 429, "rate_limited")
         self.assertScratchEmpty()
 
     def test_forwarded_for_is_honoured_from_trusted_proxies(self) -> None:
-        self.start(rate_limit_renders_per_minute=1, trusted_proxies=(ipaddress.ip_network("127.0.0.0/8"),))
-        first = self.render_headers(4) + [("X-Forwarded-For", "192.0.2.1")]
-        second = self.render_headers(4) + [("X-Forwarded-For", "198.51.100.7, 192.0.2.2")]
-        self.assertEqual(self.post_render(first, b"RIFF").status, 400)
-        self.assertEqual(self.post_render(second, b"RIFF").status, 400)
+        self.start(render_hook=RenderHook(), rate_limit_renders_per_minute=1,
+                   trusted_proxies=(ipaddress.ip_network("127.0.0.0/8"),))
+        self.assertEqual(self.post_valid([("X-Forwarded-For", "192.0.2.1")]).status, 200)
+        self.assertEqual(self.post_valid([("X-Forwarded-For", "198.51.100.7, 192.0.2.2")]).status, 200)
         # 192.0.2.1 again, now behind a client-written hop on the left.
         again = self.render_headers(4) + [("X-Forwarded-For", "203.0.113.9, 192.0.2.1")]
         self.assertJsonError(self.post_render(again), 429, "rate_limited")
         # Garbage falls back to the peer, which has its own budget.
-        garbage = self.render_headers(4) + [("X-Forwarded-For", "not-an-address")]
-        self.assertEqual(self.post_render(garbage, b"RIFF").status, 400)
-        self.assertEqual(self.post_render(garbage).status, 429)
+        garbage = [("X-Forwarded-For", "not-an-address")]
+        self.assertEqual(self.post_valid(garbage).status, 200)
+        self.assertEqual(self.post_render(self.render_headers(4) + garbage).status, 429)
         self.assertScratchEmpty()
 
 
@@ -907,11 +935,11 @@ class GateTest(ServerTestCase):
         hook = RenderHook(block)
         self.start(render_hook=hook, render_concurrency=1)
         results: list[Response] = []
-        first = threading.Thread(target=lambda: results.append(self.post_render(self.render_headers(4), b"RIFF")))
+        first = threading.Thread(target=lambda: results.append(self.post_valid()))
         first.start()
         try:
             self.assertTrue(entered.wait(DEADLINE))
-            response = self.post_render(self.render_headers(4), b"RIFF")
+            response = self.post_valid()
             self.assertJsonError(response, 503, "busy")
             self.assertEqual(response.headers.get("Retry-After"), "1")
         finally:
@@ -921,7 +949,7 @@ class GateTest(ServerTestCase):
         self.assertEqual(len(hook.calls), 1)
         # The slot is free again.
         release.set()
-        self.assertEqual(self.post_render(self.render_headers(4), b"RIFF").status, 200)
+        self.assertEqual(self.post_valid().status, 200)
         self.wait_for_log("POST /api/render 200", count=2)
         self.assertScratchEmpty()
 
@@ -937,7 +965,7 @@ class GateTest(ServerTestCase):
 
         self.start(render_hook=RenderHook(block), render_concurrency=1, **overrides)
         results: list[Response] = []
-        first = threading.Thread(target=lambda: results.append(self.post_render(self.render_headers(4), b"RIFF")))
+        first = threading.Thread(target=lambda: results.append(self.post_valid()))
         first.start()
         self.addCleanup(first.join, DEADLINE)
         self.addCleanup(release.set)
@@ -949,12 +977,12 @@ class GateTest(ServerTestCase):
         # Retry-After: 1 burn its budget and then meet 429 for up to a minute.
         release, first, results = self.hold_the_slot(rate_limit_renders_per_minute=2)
         for _ in range(3):
-            self.assertJsonError(self.post_render(self.render_headers(4), b"RIFF"), 503, "busy")
+            self.assertJsonError(self.post_valid(), 503, "busy")
         release.set()
         first.join(DEADLINE)
         self.assertEqual(results[0].status, 200)
         # One render ran, so one of the two is left.
-        self.assertEqual(self.post_render(self.render_headers(4), b"RIFF").status, 200)
+        self.assertEqual(self.post_valid().status, 200)
         self.assertJsonError(self.post_render(self.render_headers(4)), 429, "rate_limited")
         self.wait_for_log("POST /api/render 200", count=2)
         self.assertScratchEmpty()
@@ -963,7 +991,7 @@ class GateTest(ServerTestCase):
         # The rate limit is still asked first: a client out of renders learns
         # how long to wait, not that a retry in a second might work.
         release, first, results = self.hold_the_slot(rate_limit_renders_per_minute=1)
-        response = self.post_render(self.render_headers(4), b"RIFF")
+        response = self.post_valid()
         self.assertJsonError(response, 429, "rate_limited")
         self.assertIsNotNone(response.headers.get("Retry-After"))
         release.set()
@@ -979,7 +1007,7 @@ class GateTest(ServerTestCase):
         hook = RenderHook(fail)
         self.start(render_hook=hook, render_concurrency=1)
         for _ in range(3):
-            self.assertJsonError(self.post_render(self.render_headers(4), b"RIFF"), 500, "internal_error")
+            self.assertJsonError(self.post_valid(), 500, "internal_error")
         self.assertEqual(len(hook.calls), 3)
         self.wait_for_log("POST /api/render 500", count=3)
         self.assertScratchEmpty()
@@ -1003,7 +1031,7 @@ class GateTest(ServerTestCase):
                 self.start(render_hook=hook, render_concurrency=1)
                 with mock.patch("shutil.rmtree", slow_rmtree):
                     for _ in range(3):
-                        response = self.post_render(self.render_headers(4), b"RIFF")
+                        response = self.post_valid()
                         self.assertEqual(response.status, status, response.body)
                         self.assertFalse(hook.calls[-1][0].exists())
                 self.assertEqual(len(hook.calls), 3)
@@ -1016,7 +1044,7 @@ class GateTest(ServerTestCase):
             raise RuntimeError("boom")
 
         self.start(render_hook=RenderHook(fail_halfway))
-        self.assertJsonError(self.post_render(self.render_headers(4), b"RIFF"), 500, "internal_error")
+        self.assertJsonError(self.post_valid(), 500, "internal_error")
         self.assertScratchEmpty()
 
 
@@ -1031,8 +1059,10 @@ class BodyTest(ServerTestCase):
     def test_hook_gets_in_wav_with_the_exact_bytes(self) -> None:
         hook = RenderHook()
         self.start(render_hook=hook)
-        # Several chunks' worth, so the streaming loop runs more than once.
-        body = os.urandom(150_000)
+        # Several chunks' worth, so the streaming loop runs more than once;
+        # random samples, so a byte out of place would show.
+        data = os.urandom(150_000)
+        body = pcm_header(len(data)) + data
         headers = self.render_headers(len(body)) + [("X-Tone-Name", "../../escape")]
         response = self.post_render(headers, body)
         self.assertEqual(response.status, 200)
@@ -1086,7 +1116,7 @@ class BodyTest(ServerTestCase):
 
         hook = RenderHook(fail)
         self.start(render_hook=hook)
-        response = self.post_render(self.render_headers(4), b"RIFF")
+        response = self.post_valid()
         self.assertJsonError(response, 500, "internal_error")
         self.wait_for_log("POST /api/render 500")
         self.assertEqual(len(hook.calls), 1)
@@ -1100,7 +1130,7 @@ class BodyTest(ServerTestCase):
             raise GuardError(422, "bad_wav")
 
         self.start(render_hook=RenderHook(refuse))
-        self.assertJsonError(self.post_render(self.render_headers(4), b"RIFF"), 422, "bad_wav")
+        self.assertJsonError(self.post_valid(), 422, "bad_wav")
         self.wait_for_log("POST /api/render 422")
         self.assertScratchEmpty()
 
@@ -1112,7 +1142,7 @@ class BodyTest(ServerTestCase):
             raise GuardError(422, "bad_wav")
 
         self.start(render_hook=RenderHook(refuse_halfway))
-        response = self.post_render(self.render_headers(4), b"RIFF")
+        response = self.post_valid()
         self.assertJsonError(response, 422, "bad_wav")
         self.assertNotIn(b"partial", response.body)
         self.wait_for_log("POST /api/render 422")
@@ -1191,7 +1221,8 @@ class BodyTest(ServerTestCase):
         hook = RenderHook()
         with mock.patch.object(Handler, "setup", spying_setup):
             self.start(render_hook=hook, max_clip_seconds=2)
-            body = os.urandom(3 * CHUNK_BYTES + 123)
+            data = os.urandom(3 * CHUNK_BYTES + 120)
+            body = pcm_header(len(data)) + data
             response = self.post_render(self.render_headers(len(body)), body)
         self.assertEqual(response.status, 200, response.body)
         self.assertEqual(hook.calls[0][2], body)
@@ -1244,7 +1275,7 @@ class BodyTest(ServerTestCase):
                 self.wait_for_log("POST /api/render 408")
                 self.assertLess(time.monotonic() - started, 0.5 + 1.5)
             # The slot is free again for everyone else.
-            self.assertEqual(self.post_render(self.render_headers(4), b"RIFF").status, 200)
+            self.assertEqual(self.post_valid().status, 200)
         self.assertEqual(len(hook.calls), 1)
         self.wait_for_log("POST /api/render 200")
         self.assertScratchEmpty()
@@ -1311,8 +1342,8 @@ class BodyTest(ServerTestCase):
     def test_body_longer_than_length(self) -> None:
         hook = RenderHook()
         self.start(render_hook=hook)
-        body = b"a" * 100
-        data = build_request("POST", "/api/render", self.render_headers(100), body + b"b" * 50)
+        body = self.valid_body()
+        data = build_request("POST", "/api/render", self.render_headers(len(body)), body + b"b" * 50)
         response = exchange(self.port, data, tolerate_reset=True)
         if response is not None:
             self.assertEqual(response.status, 200)
@@ -1345,7 +1376,7 @@ class ScratchTest(ServerTestCase):
         self.assertNotIn("error while handling a request", self.log.getvalue())
         # The render slot was given back each time.
         self.scratch.mkdir()
-        self.assertEqual(self.post_render(self.render_headers(4), b"RIFF").status, 200)
+        self.assertEqual(self.post_valid().status, 200)
         self.wait_for_log("POST /api/render 200")
         self.assertScratchEmpty()
 
