@@ -114,15 +114,17 @@ class ArgumentsTest(unittest.TestCase):
     def test_measure_args(self) -> None:
         self.assertEqual(
             measure_args(Path("job") / "in.wav"),
-            ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-protocol_whitelist", "file",
-             "-f", "wav", "-i", str(Path("job") / "in.wav"), "-af", "ebur128=peak=true", "-f", "null", "-"],
+            ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-filter_threads", "1",
+             "-protocol_whitelist", "file", "-f", "wav", "-i", str(Path("job") / "in.wav"),
+             "-af", "ebur128=peak=true", "-f", "null", "-"],
         )
 
     def test_render_args(self) -> None:
         source, output = Path("job") / "in.wav", Path("job") / "out.m4a"
         self.assertEqual(
             render_args(source, output, params(), 9.0),
-            ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-protocol_whitelist", "file", "-y",
+            ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-filter_threads", "1",
+             "-protocol_whitelist", "file", "-y",
              "-f", "wav", "-i", str(source), "-af", CHAIN, "-ar", "44100", "-map_metadata", "-1",
              "-fflags", "+bitexact", "-metadata", "title=My Tone", "-c:a", "aac", "-b:a", "256k",
              "-movflags", "+faststart", "-f", "ipod", str(output)],
@@ -174,8 +176,11 @@ class ArgumentsTest(unittest.TestCase):
     def test_every_run_is_local_files_only_without_stdin(self) -> None:
         for args in (measure_args(Path("in.wav")), render_args(Path("in.wav"), Path("out.m4a"), params(), 0.0)):
             with self.subTest(args=args[-1]):
-                self.assertEqual(args[:7], ["-nostdin", "-hide_banner", "-nostats", "-threads", "1",
-                                            "-protocol_whitelist", "file"])
+                # One thread for the codecs and one for the filter graph,
+                # which would otherwise start a thread per usable CPU: the
+                # core's pids_limit counts a fixed number of threads per run.
+                self.assertEqual(args[:9], ["-nostdin", "-hide_banner", "-nostats", "-threads", "1",
+                                            "-filter_threads", "1", "-protocol_whitelist", "file"])
                 # The demuxer is named, never guessed from the content.
                 self.assertEqual(args[args.index("-i") - 2: args.index("-i")], ["-f", "wav"])
         self.assertNotIn("-y", measure_args(Path("in.wav")))
