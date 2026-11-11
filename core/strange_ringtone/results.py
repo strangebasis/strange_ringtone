@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import threading
 import time
 from collections.abc import Callable
@@ -23,6 +24,8 @@ from pathlib import Path
 # client-chosen string never gets near the index or the filesystem.
 RESULT_ID_RE = re.compile(r"[0-9a-f]{32}")
 TONE_FILE = "tone.m4a"
+# The most read_tone reads from a file at once.
+_READ_BYTES = 64 * 1024
 
 
 class StoreFull(Exception):
@@ -108,6 +111,49 @@ class ResultStore:
         if result is None or self._clock() - result.created >= self.ttl_seconds:
             return None
         return result
+
+    def read_tone(self, result: Result, max_bytes: int) -> bytes | None:
+        """The tone's bytes, or None unless it is a regular file of at most max_bytes.
+
+        The results directory belongs to the server's UID, which every
+        render's ffmpeg runs as, so a process a render left behind can
+        replace a stored tone. It is opened without following a link (one
+        to /proc/self/maps would serve the server's memory map, one to
+        /dev/zero would read until the server runs out of memory) and
+        without blocking (a FIFO would hold the handler thread), refused
+        unless it is a regular file, and read to at most max_bytes and the
+        one byte more that shows it grew past them. Read whole and closed
+        at once: the sweeper may delete the file meanwhile, and Windows
+        can't delete an open file.
+        """
+        path = result.path
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        try:
+            if not nofollow and stat.S_ISLNK(os.lstat(path).st_mode):
+                # Windows (development only) has no O_NOFOLLOW, so a link
+                # is looked for first; no contained ffmpeg runs there.
+                return None
+            # O_BINARY (Windows only): the bytes exactly, never text mode.
+            fd = os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+        except OSError:
+            return None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
+                return None
+            chunks: list[bytes] = []
+            total = 0
+            while total <= max_bytes:
+                chunk = os.read(fd, min(_READ_BYTES, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+        return b"".join(chunks) if total <= max_bytes else None
 
     def sweep(self) -> int:
         """Delete every result older than the TTL; return how many went."""

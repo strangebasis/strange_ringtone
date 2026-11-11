@@ -107,6 +107,16 @@ class ReadToneTest(unittest.TestCase):
         self.assertIsNone(self.read_quickly())
         self.assertEqual(target.read_bytes(), b"not a tone\n")
 
+    def test_a_link_is_refused_where_there_is_no_nofollow_flag(self) -> None:
+        # Windows has no O_NOFOLLOW; the link is looked for before the open.
+        if not _can_symlink(self.temp):
+            self.skipTest("this account can't create symlinks")
+        target = self.temp / "elsewhere.txt"
+        target.write_bytes(b"not a tone\n")
+        self.replace_with(lambda path: os.symlink(target, path))
+        with mock.patch.object(results_module.os, "O_NOFOLLOW", 0, create=True):
+            self.assertIsNone(self.read_quickly())
+
     def test_a_directory_or_nothing_is_refused(self) -> None:
         self.replace_with(lambda path: path.mkdir())
         self.assertIsNone(self.read_quickly())

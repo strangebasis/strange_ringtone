@@ -14,8 +14,8 @@ ffmpeg is the largest attack surface in the core, so every run is fenced in:
   anything of the run is used; where the server inherits orphans (as its
   container's PID 1), the members that kill killed are then collected;
 - a job directory the server created, holding only server-chosen names;
-- an output larger than the file-size limit is refused, also where prlimit
-  is not in force;
+- only a regular file is an output, never a link or a FIFO, and one larger
+  than the file-size limit is refused, also where prlimit is not in force;
 - both pipes read to their end, but only a bounded tail of stderr kept in
   memory and nothing of stdout.
 
@@ -32,6 +32,7 @@ import os
 import re
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -323,13 +324,23 @@ class Renderer:
 
     def _render_once(self, source: Path, output: Path, params: RenderParams, gain: float, job_dir: Path) -> _Loudness:
         loudness = self._run(render_args(source, output, params, gain), job_dir, "render_failed")
-        if not output.is_file():
+        # Only a regular file is a result. lstat, not stat or is_file(): the
+        # job directory is writable by the UID ffmpeg runs as, and a link
+        # left there would be followed by the size check here and opened by
+        # the server on download (its own /proc/self/maps, say). A FIFO or
+        # anything else is refused too. render() removes what is refused,
+        # and removing a link never touches its target.
+        try:
+            info = os.lstat(output)
+        except OSError:
+            raise RenderError("render_failed") from None
+        if not stat.S_ISREG(info.st_mode):
             raise RenderError("render_failed")
         # prlimit's RLIMIT_FSIZE stops ffmpeg writing past the limit, but only
         # where prlimit runs (not on Windows, for development). Checked here
         # too, so an oversized file is never a result anywhere; render()
         # removes it. Equal to the limit is what RLIMIT_FSIZE itself allows.
-        if output.stat().st_size > self.limits.file_size_bytes:
+        if info.st_size > self.limits.file_size_bytes:
             raise RenderError("render_failed")
         return loudness
 

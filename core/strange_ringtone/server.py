@@ -480,17 +480,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _send_result(self, result_id: str, extension: str) -> None:
         # Unknown, expired and swept IDs all get the same 404, so a client
-        # learns nothing about which IDs ever existed.
+        # learns nothing about which IDs ever existed. So does a stored tone
+        # that is no longer a regular file within an output's size limit
+        # (ResultStore.read_tone says why).
         result = self.server.results.get(result_id)
         body: bytes | None = None
         if result is not None:
-            try:
-                # Read whole and closed at once: the sweeper may delete the file
-                # between get() and here, and Windows can't delete an open file.
-                with open(result.path, "rb") as handle:
-                    body = handle.read()
-            except OSError:
-                body = None
+            body = self.server.results.read_tone(result, self.server.renderer.limits.file_size_bytes)
         if result is None or body is None:
             self.send_json_error(404, "not_found")
             return
