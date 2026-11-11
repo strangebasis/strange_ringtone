@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Callable
@@ -126,7 +127,18 @@ class ReadToneTest(unittest.TestCase):
     @unittest.skipUnless(POSIX_SPECIALS, "FIFOs and /dev/zero are POSIX")
     def test_a_fifo_is_refused_without_blocking(self) -> None:
         self.replace_with(os.mkfifo)
-        self.assertIsNone(self.read_quickly())
+        # Read on a thread of its own: an open that blocks on the FIFO (the
+        # defect) makes the test fail instead of hanging the suite.
+        found: list[bytes | None] = []
+        reader = threading.Thread(target=lambda: found.append(self.store.read_tone(self.result, 4096)), daemon=True)
+        reader.start()
+        reader.join(QUICK_SECONDS)
+        if reader.is_alive():
+            # Releases the blocked open, so the thread ends too.
+            StoredToneDownloadTest.release(self.result.path)
+            reader.join(QUICK_SECONDS)
+            self.fail("reading a FIFO blocked")
+        self.assertEqual(found, [None])
 
     @unittest.skipUnless(POSIX_SPECIALS, "FIFOs and /dev/zero are POSIX")
     def test_a_link_to_an_endless_device_is_refused(self) -> None:
