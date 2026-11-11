@@ -350,22 +350,38 @@ services:
       # One download in flight or one audio waiting to be collected (never
       # both: a new job discards an uncollected one before it starts), the
       # info JSON and Deno's cache: FETCH_MAX_BYTES + 16 MB, 56 MB with the
-      # defaults. noexec: nothing downloaded can be run.
+      # defaults. noexec: nothing downloaded can be run. Nothing a run writes
+      # here outlives it: after each run the runner, as PID 1, removes
+      # everything the run left in /tmp but the one audio file it holds for
+      # the fetcher, or, when it can't within its budget of 3 s, fails that
+      # job and exits (code 5) for the restart policy below to start it
+      # with an empty /tmp (docs/PLAN.md 6.1). So the runner treats all of
+      # this /tmp as its own: keep nothing here, and mount nothing inside
+      # it, which it never enters and would count as left over after every
+      # run.
       - /tmp:rw,noexec,nosuid,size=56m,mode=1777
     # prlimit bounds yt-dlp's CPU time, file size, open files and processes,
     # but not its address space, because Deno reserves a huge virtual range
     # at startup. This cgroup limit is what bounds the runner's memory, its
-    # /tmp pages included.
+    # /tmp pages included, and the kernel's memory for the files and
+    # directories on that tmpfs too, empty ones included: a run that makes
+    # enough of them (about half a million, measured) reaches the limit, the
+    # kernel kills the runner, and the restart policy below starts it again
+    # with an empty /tmp. System V shared memory would count too, but the
+    # `sysctls` below leave a run none to make. yt-dlp's output doesn't add
+    # to it: the runner sends its stdout to /dev/null and keeps only the
+    # last 64 KiB of its stderr, however much a run prints.
     mem_limit: 512m
     # The cgroup's cap on processes and threads. prlimit's --nproc for yt-dlp
     # is RLIMIT_NPROC, which the kernel counts per UID across every container
     # that runs as 10001, so it bounds nothing per container; this does, and
     # a thread that can't start fails its request closed. The worst case: the
     # main thread, 4 request workers (RunnerServer.MAX_WORKERS), the result
-    # sweeper, the health check, and one yt-dlp run (one job at a time),
+    # sweeper, the thread that reads a run's stderr, the health check, and one
+    # yt-dlp run (one job at a time),
     # which is yt-dlp's Python (1 thread) and Deno (its main thread, 2 tokio
     # threads and V8's workers: 4 at most as measured, counted here as 63 for
-    # a host that reports 64 CPUs), so 1 + 4 + 1 + 1 + 67 = 74. 160 is more
+    # a host that reports 64 CPUs), so 1 + 4 + 1 + 1 + 1 + 67 = 75. 160 is more
     # than twice that. Nothing of a run is left over to add to it: the runner
     # kills each run's process group when the run ends, and, as this
     # container's PID 1, sweeps before and after every run: kill(-1) ends
@@ -411,12 +427,25 @@ services:
     # already 0 in these containers, these networks give them no IPv6, and an
     # IPv6 sysctl would stop the container from starting on a kernel without
     # IPv6.
+    #
+    # System V IPC off. `ipc: none` gives this container an IPC namespace of
+    # its own, but a run could still create shared memory segments, message
+    # queues and semaphore sets in it: neither files nor processes, they
+    # outlive the run, and a segment's pages count against mem_limit. With
+    # these three at 0, shmget, msgget and semget fail, so a run can make
+    # none. Neither the runner nor yt-dlp or Deno uses them. They belong to
+    # the container's IPC namespace, so they too need no capability. The
+    # runner still removes any it finds after each run (docs/PLAN.md 6.1),
+    # for a layout without them.
     sysctls:
       net.ipv4.conf.default.forwarding: "0"
       net.ipv4.conf.lo.forwarding: "0"
       net.ipv4.conf.all.accept_redirects: "0"
       net.ipv4.conf.default.accept_redirects: "0"
       net.ipv4.conf.lo.accept_redirects: "0"
+      kernel.shmmni: "0"
+      kernel.msgmni: "0"
+      kernel.sem: "0 0 0 0"
     # Internal networks only, so the runner has no default route and its DNS
     # resolves service names but no external name; it refuses to start where
     # it finds a default route (FETCH_ALLOW_DEFAULT_ROUTE). `jobs` for the

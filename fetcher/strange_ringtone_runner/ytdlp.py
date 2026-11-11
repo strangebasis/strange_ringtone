@@ -29,9 +29,10 @@ core's ffmpeg (strange_ringtone.render):
 - a job directory the caller created, holding only names yt-dlp derives from
   the validated ID.
 
-yt-dlp's stdout and stderr never leave this module and are never logged:
-they carry the destination filename and the title. stderr is only matched
-against a few fixed phrases to choose an error code. The metadata whitelist
+yt-dlp's output never leaves this module and is never logged: it carries
+the destination filename and the title. stdout goes to /dev/null, and only
+the last STDERR_TAIL_BYTES of stderr are kept, to be matched against a few
+fixed phrases that choose an error code. The metadata whitelist
 and the result types live in strange_ringtone_fetch.metadata, shared with the
 fetcher, which applies the same whitelist again to whatever the runner
 answers. tests/test_fetcher_ytdlp.py pins each guard.
@@ -41,6 +42,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import signal
 import stat
 import subprocess
@@ -49,6 +51,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 # ERROR_CODES and Metadata are re-exported, not used here: the tests that
 # moved with the run code (tests/test_fetcher_ytdlp.py) read them through this
@@ -56,6 +59,12 @@ from pathlib import Path
 from strange_ringtone_fetch.metadata import ERROR_CODES as ERROR_CODES
 from strange_ringtone_fetch.metadata import VIDEO_ID_RE, Download, FetchError, parse_info
 from strange_ringtone_fetch.metadata import Metadata as Metadata
+
+if sys.platform == "win32":
+    # Windows development only: the stderr reader's way to see what a pipe
+    # holds (_readable).
+    import _winapi
+    import msvcrt
 
 # Fixed paths, never taken from a setting or a request: what the image ships
 # (fetcher/Dockerfile).
@@ -81,8 +90,15 @@ _BLOCKED_RE = re.compile(
 )
 _NOT_FOUND_RE = re.compile(r"video unavailable|private video|has been removed|does not exist", re.IGNORECASE)
 
-# How long to wait for the pipes after a timeout kill (see render.py).
+# How long to wait for stderr's end and the exit after a kill (see render.py).
 DRAIN_SECONDS = 5.0
+# How much of the end of a run's stderr is kept: the lines map_failure reads
+# are the last yt-dlp prints. A run can print without limit, and the runner,
+# its container's PID 1, must not hold all of it in memory.
+STDERR_TAIL_BYTES = 64 * 1024
+_READ_BYTES = 64 * 1024
+# How long the stderr reader waits for data before it checks whether to stop.
+_POLL_SECONDS = 0.05
 SOCKET_TIMEOUT_SECONDS = 20
 # A real info JSON is a few hundred kB; this bounds what json.load reads.
 INFO_MAX_BYTES = 4 * 1024 * 1024
@@ -401,7 +417,10 @@ class YtDlp:
             proc = subprocess.Popen(
                 command,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
+                # Nothing reads stdout: map_failure looks at stderr and
+                # read_result at the files. Discarded, it costs no memory and
+                # can't fill a pipe.
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 cwd=job_dir,
                 env=self.child_env(job_dir),
@@ -414,35 +433,41 @@ class YtDlp:
             raise FetchError("failed") from None
         with self._lock:
             self._running.add(proc)
+        tail: _Tail | None = None
         try:
             try:
-                # stdout is read only to keep the pipe from filling. Both
-                # streams are held in memory until the run ends, bounded only
-                # by the container's memory limit; neither is logged, and
-                # neither leaves this module.
-                _stdout, stderr = proc.communicate(timeout=self.timeout_seconds)
+                # Read to its end while the run goes on, so the child never
+                # blocks on a full pipe, keeping only the last
+                # STDERR_TAIL_BYTES: however much a run prints, the runner
+                # holds a bounded tail. It is never logged and never leaves
+                # this module.
+                tail = _Tail(proc.stderr, STDERR_TAIL_BYTES)
+                proc.wait(timeout=self.timeout_seconds)
             except subprocess.TimeoutExpired:
                 _kill_group(proc)
+                # A bounded drain: stderr's end and the exit, for at most
+                # DRAIN_SECONDS, so a survivor holding the pipe can't hang us.
+                deadline = time.monotonic() + DRAIN_SECONDS
+                if tail is not None:
+                    tail.join(DRAIN_SECONDS)
                 try:
-                    # Drain, not wait(): the pipes must be read to EOF to free
-                    # them, and the bound keeps a survivor from hanging us.
-                    proc.communicate(timeout=DRAIN_SECONDS)
+                    proc.wait(timeout=max(0.0, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
                 finally:
-                    _close_pipes(proc)
+                    _stop_reading(tail, proc)
                 raise FetchError("timeout") from None
             except BaseException:
                 try:
                     _kill_group(proc)
                     proc.wait()
                 finally:
-                    _close_pipes(proc)
+                    _stop_reading(tail, proc)
                 raise
             # A run that ended by itself, success included, may have left a
-            # child behind that closed its pipes (so communicate() returned):
-            # it would keep the runner's reach between jobs, could edit the
+            # child behind (wait() returns once yt-dlp itself exits): it
+            # would keep the runner's reach between jobs, could edit the
             # next job's directory or results/ (same UID), and would count
             # against pids_limit. The group is killed before the result is
             # read, so nothing of the run can touch the files read_result
@@ -464,13 +489,24 @@ class YtDlp:
             # (returncode set), so waitpid(-1) never steals yt-dlp's status;
             # a run whose wait itself failed is swept at the next boundary.
             swept = not self.sweep_strays or (proc.returncode is not None and self._sweep())
-        if not swept:
-            # A stray may still be running next to the files read_result
-            # would check: the result can't be trusted.
-            raise FetchError("failed")
-        if proc.returncode != 0:
-            raise FetchError(map_failure(proc.returncode, stderr))
-        return read_result(job_dir, video_id, self.max_bytes)
+        try:
+            if not swept:
+                # A stray may still be running next to the files read_result
+                # would check: the result can't be trusted.
+                raise FetchError("failed")
+            if proc.returncode != 0:
+                # The last lines yt-dlp printed are the ones that name the
+                # error. Waited for after the kills above, which ended
+                # everything else that could hold the pipe; still bounded,
+                # for a survivor where no sweep runs.
+                stderr = b""
+                if tail is not None:
+                    tail.join(DRAIN_SECONDS)
+                    stderr = tail.value()
+                raise FetchError(map_failure(proc.returncode, stderr))
+            return read_result(job_dir, video_id, self.max_bytes)
+        finally:
+            _stop_reading(tail, proc)
 
     def cancel(self) -> None:
         """Kill every running yt-dlp and what it started; used when the server stops."""
@@ -501,18 +537,97 @@ def _kill_group(proc: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _close_pipes(proc: subprocess.Popen[bytes]) -> None:
-    for name in ("stdout", "stderr"):
-        pipe = getattr(proc, name)
-        if pipe is None or pipe.closed:
-            continue
-        # On Windows communicate() reads through helper threads that hold the
-        # pipe's lock while blocked; such a thread closes its pipe itself at
-        # EOF, so a live one is left alone (see strange_ringtone.render).
-        reader = getattr(proc, f"{name}_thread", None)
-        if reader is not None and reader.is_alive():
-            continue
+def _stop_reading(tail: _Tail | None, proc: subprocess.Popen[bytes]) -> None:
+    # The run is over: stderr is closed now, or by its reader within
+    # _POLL_SECONDS, whoever still holds its other end.
+    if tail is not None:
+        tail.stop()
+    else:
+        # No reader was started to close it.
+        _close_quietly(proc.stderr)
+
+
+def _close_quietly(pipe: IO[bytes] | None) -> None:
+    if pipe is None:
+        return
+    try:
+        pipe.close()
+    except OSError:
+        pass
+
+
+class _Tail:
+    """Reads a pipe to its end on a thread of its own, keeping only its last `limit` bytes, then closes it.
+
+    The reader never blocks in a read: it waits for data a short while at a
+    time and reads only what is there, so stop() ends it within
+    _POLL_SECONDS even while a process the kills did not reach (on Windows,
+    where there are no process groups, or a survivor where no sweep runs)
+    keeps the pipe open. The pipe is closed by the reader alone, so it is
+    never closed under a read of another thread.
+    """
+
+    def __init__(self, pipe: IO[bytes] | None, limit: int) -> None:
+        if pipe is None:
+            raise ValueError("no pipe to read")
+        self._pipe = pipe
+        self._limit = limit
+        self._data = bytearray()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._read, name="ytdlp-stderr", daemon=True)
+        self._thread.start()
+
+    def _read(self) -> None:
         try:
-            pipe.close()
-        except OSError:
+            fd = self._pipe.fileno()
+            while not self._stop.is_set():
+                available = _readable(fd, _POLL_SECONDS)
+                if not available:
+                    continue
+                # At most _READ_BYTES at a time, so a flood is never gathered
+                # in one buffer; never more than is there, so it never waits.
+                chunk = os.read(fd, min(available, _READ_BYTES))
+                if not chunk:
+                    return
+                with self._lock:
+                    self._data += chunk
+                    excess = len(self._data) - self._limit
+                    if excess > 0:
+                        del self._data[:excess]
+        except (OSError, ValueError):
+            # The pipe's end on Windows (a broken pipe), or a broken pipe:
+            # what was read so far is the tail.
             pass
+        finally:
+            _close_quietly(self._pipe)
+
+    def join(self, timeout: float) -> bool:
+        """Wait up to timeout for the pipe's end; whether it came."""
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def stop(self) -> None:
+        """Stop reading and close the pipe, at its end or within _POLL_SECONDS."""
+        self._stop.set()
+
+    def value(self) -> bytes:
+        """The last `limit` bytes read so far (all of them, when fewer)."""
+        with self._lock:
+            return bytes(self._data)
+
+
+def _readable(fd: int, timeout: float) -> int:
+    """How much may be read from the pipe fd without waiting (at its end, a read returns b""); 0 after timeout."""
+    if sys.platform == "win32":
+        # Development only. Windows has no poll() for pipes; PeekNamedPipe
+        # says how much is waiting, and raises BrokenPipeError at the end.
+        available, _left = _winapi.PeekNamedPipe(msvcrt.get_osfhandle(fd))
+        if available:
+            return available
+        time.sleep(timeout)
+        return 0
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    # Readable, or hung up: the read that follows returns the data or b"".
+    return _READ_BYTES if poller.poll(timeout * 1000) else 0

@@ -138,6 +138,17 @@ class _TestRunnerServer(RunnerServer):
     # scratch directory when the temporary directory is removed.
     block_on_close = True
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.exit_codes: list[int] = []
+        super().__init__(*args, **kwargs)
+
+    def exit_for_restart(self, code: int) -> None:
+        # Never the real exit: a server that would end its process so that
+        # it is restarted (under the container's contract, which the image's
+        # tests really meet as PID 1) records the code instead, and no test
+        # ends its own process.
+        self.exit_codes.append(code)
+
 
 class _CappedRunnerServer(_TestRunnerServer):
     MAX_WORKERS = 1
@@ -586,12 +597,10 @@ class RunnerServerTestCase(unittest.TestCase):
 
     def assertStubsOutsideFile(self) -> None:
         # The stub's symlink mode plants its target next to the job directory
-        # (tests/stubs/ytdlp_stub.py), outside anything the runner made; it
-        # is the stub's own file, removed here so the next case starts clean.
-        outside = self.scratch / "outside.m4a"
-        wait_for(lambda: [n for n in self.scratch_contents() if not n.startswith("job-")] == ["outside.m4a"],
-                 "the stub's planted file to be the only thing left")
-        outside.unlink()
+        # (tests/stubs/ytdlp_stub.py), outside anything the runner made. The
+        # runner's clean-up after the run removes it with everything else a
+        # run left in the scratch directory, before it answers.
+        self.assertFalse(os.path.lexists(self.scratch / "outside.m4a"), "the stub's planted file was left behind")
 
 
 class RunnerFlowTest(RunnerServerTestCase):

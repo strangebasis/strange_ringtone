@@ -57,10 +57,13 @@ CONNECT_TIMEOUT_SECONDS = 10.0
 READ_TIMEOUT_SECONDS = 30.0
 # On top of FETCH_TIMEOUT_SECONDS for the POST's total deadline. The runner's
 # worst case before it answers is FETCH_TIMEOUT_SECONDS, its DRAIN_SECONDS (5)
-# after a timeout kill, and two bounded reaps of REAP_SECONDS (2) each, one
-# at each run boundary of its sweep (strange_ringtone_runner.ytdlp): 9 s past
-# the timeout, so this leaves a margin of 6 s. PostGraceTest in
-# tests/test_fetcher_runner_client_hardening.py keeps at least 3 s.
+# after a timeout kill, two bounded reaps of REAP_SECONDS (2) each, one at
+# each run boundary of its sweep (strange_ringtone_runner.ytdlp), and the
+# clean-up after the run, bounded by CLEANUP_BUDGET_SECONDS (3,
+# strange_ringtone_runner.server): 12 s past the timeout, so this leaves a
+# margin of 3 s. PostGraceTest in tests/test_fetcher_runner_client_hardening.py
+# and BudgetConstantsTest in tests/test_fetcher_runner_cleanup_budget.py keep
+# at least 3 s.
 POST_GRACE_SECONDS = 15.0
 # The audio GET's total deadline is this plus one second per MiB of the cap
 # (70 s with the default 40 MiB).
@@ -213,7 +216,8 @@ class RunnerClient:
         """The POST's total deadline: timeout_seconds + post_grace."""
         # The runner answers only once yt-dlp is done, which its own
         # FETCH_TIMEOUT_SECONDS bounds; the grace covers its drain, its two
-        # reaps and a margin (POST_GRACE_SECONDS).
+        # reaps, the budget of its clean-up after the run and a margin
+        # (POST_GRACE_SECONDS).
         return self.timeout_seconds + self._post_grace
 
     @property

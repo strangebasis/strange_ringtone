@@ -1060,12 +1060,11 @@ class FlowTest(ServerTestCase):
                     self.assertScratchEmpty()
                     if video_id == "symlinked__":
                         # The stub plants its symlink's target beside the job
-                        # directory, as a hostile yt-dlp could; it must still
-                        # hold the stub's bytes (nothing was written through
-                        # the link) and is the stub's to remove, not the runner's.
+                        # directory, as a hostile yt-dlp could; the runner's
+                        # clean-up after the run removes it with everything
+                        # else the run left in its scratch directory.
                         planted = self.runner_scratch / "outside.m4a"
-                        self.assertEqual(planted.read_bytes(), b"STUB-M4A\n")
-                        planted.unlink()
+                        self.assertFalse(os.path.lexists(planted), "the stub's planted file was left behind")
                     self.assertRunnerScratchEmpty()
 
     def test_the_fetchers_job_id_never_reaches_the_runner(self) -> None:

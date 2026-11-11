@@ -466,8 +466,10 @@ bullets below describe the image as of PR B, with yt-dlp in the runner.
     validated ID only, then `--` and the URL the server built
 
   It runs in the runner container under `prlimit` and a wall-clock timeout
-  (`communicate()`; on timeout the whole process group is killed and the
-  pipes drained), in its own session, with every leftover killed and reaped
+  (on timeout the whole process group is killed and stderr drained for at
+  most 5 s), with its stdout sent to `/dev/null` and only the last 64 KiB of
+  its stderr kept, however much it prints, in its own session, with every
+  leftover killed and reaped
   at both run boundaries (6.1, the runner bullet), one job at a time: the fetcher's queue
   (`FETCH_CONCURRENCY=1`, with 4 more queued and 503 `busy` beyond, and its
   own per-IP rate limit) and the runner's own lock. The runner's `prlimit`
@@ -479,9 +481,10 @@ bullets below describe the image as of PR B, with yt-dlp in the runner.
   which the contract documents as the operator's job. yt-dlp's environment
   is built from scratch by the runner: fixed values, `HOME` and `DENO_DIR`
   inside the job directory under `/tmp` (the root filesystem is read-only,
-  and the job directory is removed after every run; what a run writes
-  elsewhere on `/tmp` stays until the container restarts, 6.1, Accepted
-  risks), and `HTTPS_PROXY`, `HTTP_PROXY` and
+  and after every run the runner removes what the run wrote in its scratch
+  directory and, under the container's contract, elsewhere on `/tmp`,
+  6.1, Accepted risks), and
+  `HTTPS_PROXY`, `HTTP_PROXY` and
   `NO_PROXY` when set (`compose.example.yaml` points the runner's
   `HTTPS_PROXY` at the forwarder), never the runner's own environment. That
   environment is not handed to yt-dlp, but yt-dlp can read what the
@@ -759,8 +762,9 @@ source of abuse.
   yt-dlp runs it, starts its main thread, 2 tokio threads and one V8 worker
   per usable CPU up to 4 (7 threads with 4 CPUs or more, measured offline in
   the image), and yt-dlp's Python 1 thread. The runner's `pids_limit: 160`
-  is at least twice its worst case of 74: the main thread, 4 request workers
-  (`RunnerServer.MAX_WORKERS`), the result sweeper, the health check, and
+  is at least twice its worst case of 75: the main thread, 4 request workers
+  (`RunnerServer.MAX_WORKERS`), the result sweeper, the thread that reads a
+  run's stderr while the run goes on, the health check, and
   one yt-dlp run counted as 67 (V8's workers as 63, for a host that reports
   64 CPUs, in case the cap of 4 doesn't hold there). The fetcher, which
   runs no yt-dlp, has `pids_limit: 64`, at least twice its worst case of
@@ -779,8 +783,9 @@ source of abuse.
 - Python 3.12's `ipaddress` calls `64:ff9b::a9fe:a9fe` (NAT64 for
   169.254.169.254) and `::169.254.169.254` global.
 - A child with the same UID can read its parent's `/proc/<pid>/environ`, and
-  it can ptrace the parent where Yama's `ptrace_scope` is 0 (the kernel's
-  default; Docker's default seccomp profile allows `ptrace` on kernels 4.8
+  it can ptrace the parent where Yama's `ptrace_scope` is 0 (some
+  distributions' default, and how a kernel without Yama behaves; Docker's
+  default seccomp profile allows `ptrace` on kernels 4.8
   and newer).
 - A non-dumpable process (`prctl(PR_SET_DUMPABLE, 0)`) can't be ptraced,
   and its `/proc/<pid>/environ`, `maps` and `mem` can't be read, by a
@@ -1101,12 +1106,73 @@ kill-and-reap sweep at both run boundaries ends and reaps what left the
 group, so a run's child can't keep the runner's reach between jobs, touch
 the next job's files or hold a share of `pids_limit`; and the runner is
 non-dumpable, so such a child can't hide in it by ptrace either, whatever
-the host's `ptrace_scope`. What a run can leave behind is files: the runner
-removes the job directory and the results it tracks, not what a run wrote
-elsewhere on its `/tmp`. Nothing reads such a file back and `noexec` keeps
-it from running, but it can fill the tmpfs, and every later fetch then
-fails, while `/healthz` still answers, until the runner is restarted;
-clearing `/tmp` at the run boundary is not built yet. The sweep's cost is
+the host's `ptrace_scope`. Nor does a file it wrote: after every run and
+its sweep, before it answers, the runner removes everything the run left in
+its scratch directory but the result it holds for that job (entries the run
+made unreadable or unwritable included; a link is removed as a link and
+never followed; another filesystem mounted inside would never be entered),
+and makes the scratch directory and `results/` owner-only plain directories
+again, so a file a run put in place of either doesn't fail the next fetch.
+As PID 1, sweeping, with the contract's scratch directory, it also
+removes everything else in its `/tmp`, so a full tmpfs doesn't fail the
+next fetch either. So under the contract the runner treats its whole
+`/tmp` as its own: after every run nothing is left there but its scratch
+directory and the one audio file it holds, and nothing else can be kept or
+mounted there: a mount inside it is never entered, so every clean-up
+counts as leaving something, fails its job and ends in the exit below.
+Under the same contract it also removes the System V shared
+memory segments, message queues and semaphore sets a run left in the
+container's IPC namespace, which `ipc: none` makes the container's own.
+They are neither files nor processes, and a segment's pages stay charged
+to the memory limit: measured in the image (2026-11-10), before this
+removal, one run that left 448 MiB of segments and 30,000 full queues made
+every later run that needed 100 MB or more fail for want of memory, while
+`/healthz` answered 200. Anywhere else (`FETCH_ALLOW_NO_SWEEP=true`, a
+local run) the rest of `/tmp` and the IPC namespace are left alone,
+because they may hold other programs' files and objects. The example's
+runner also sets three sysctls of its IPC namespace, `kernel.shmmni: 0`,
+`kernel.msgmni: 0` and `kernel.sem: "0 0 0 0"` (owner, 2026-11-10), which
+need no capability and make `shmget`, `msgget` and `semget` fail, so a run
+there can create none of these objects at all (R11); the removal stays for
+a layout without them. The clean-up
+comes before the answer, so all of it shares a budget of 3 s
+(`CLEANUP_BUDGET_SECONDS`), which fits inside the 15 s the fetcher waits
+past `FETCH_TIMEOUT_SECONDS`, after the drain and the two reaps, with 3 s
+to spare. Without one, a tree a run made of nested directories, each of
+mode 000, near the memory limit, took 22 s at 400,000 levels and 88 s at
+500,000 (measured 2026-11-10): longer than the 15 s grace, so past the
+fetcher's deadline (`FETCH_TIMEOUT_SECONDS` plus 15 s from the POST) after
+a run that had used its whole timeout. When the
+clean-up overruns its budget, leaves something it should have removed, or
+can't make the scratch directory usable again, that job fails closed, its
+result is discarded and the runner writes one line to stderr; under the
+contract it then exits with code 5 once the answer is written (or could
+not be), and the example's restart policy starts it again with an empty
+`/tmp`. So a run can force a restart that way too. What a run can still do
+is stop the runner: a container's PID 1 receives only the signals it has a
+handler for, and the runner handles SIGTERM, so that `docker stop` works,
+and, through Python, SIGINT. A run has the runner's UID, so it can send
+either, and the runner exits; the example's restart policy
+(`restart: unless-stopped`) starts it again with an empty `/tmp`, and the
+fetch in flight fails. It can also end the runner's container through its
+memory limit, which counts the kernel's memory for the files and
+directories on its tmpfs, empty ones included, not only their pages.
+Measured in the image with the 512 MB limit (2026-11-10): between 500,000
+and 600,000 empty files, or a chain of 600,000 nested directories, ended
+the container, the kernel killing the runner (exit 137). Before the
+clean-up had its budget, so did, once in two tries, the runner's own
+clean-up of a 450,000-level tree of mode-000 directories, which holds a
+little memory for each level it is down; with the budget, seven runs that
+each left such a tree (in the job directory or beside the scratch
+directory) put the container at its memory limit and each ended in the
+budget's exit 5, none in the kernel's kill (measured 2026-11-10, on a
+Docker host with swap). The outcome is the signal's: the restart policy
+starts the runner again with an empty `/tmp`, and the fetch in flight
+fails. Anywhere but under the contract (a local run,
+`FETCH_ALLOW_NO_SWEEP=true`) a clean-up that overruns its budget, leaves
+something or can't make the scratch directory usable again fails the job
+the same way, but the runner keeps serving: `/healthz` still answers, and later
+fetches can keep failing until the runner is restarted. The sweep's cost is
 accepted (owner, 2026-11-05): a `docker exec` or health check running in
 the runner's container at a run boundary is killed too, and the runner must
 be that container's PID 1. The health check's retries absorb a coincidence,
@@ -1150,10 +1216,15 @@ test to fail.
 | R2 | The runner builds yt-dlp's environment from scratch: fixed values, `HOME` and `DENO_DIR` in the job directory, and exactly the proxy variables its own settings read (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, uppercase, `http://` only, no credentials); the fetcher reads no proxy variable | unit (the fetcher's former tests move) | PR B |
 | R3 | The runner deletes its job directory in `finally` on every path; the audio is served once and deleted, deleted when a new job starts, `COLLECT_DEADLINE_SECONDS` (60) after the run if uncollected, and on shutdown, so at most one audio file is on its `/tmp` at any time | unit; in-image | PR B |
 | R4 | The runner's log holds method, path with the token masked, status and duration only; never a video ID, a title, a token, an address or yt-dlp's output | unit | PR B |
-| S1 | The fetcher sends the runner only the validated ID and a token it minted, never its job ID, and consults no proxy variable; it fails the job (nothing left behind, never retried) on any answer that is not status 200 with exactly one `Content-Type` and `Content-Length`, no `Transfer-Encoding`, JSON of at most 256 KiB of the shape `{status, info}` or `{status, error}`, or audio of 1 to `FETCH_MAX_BYTES` bytes of `audio/mp4` within the per-read and total deadlines; it re-validates the metadata with `parse_info`, follows no redirect, accepts nothing past the declared length, and ends each exchange only at the runner's close, which comes after the runner let go of its one-job lock, so its next request never finds it busy | unit, with a fake runner; the fetcher's flow against a real runner with the stub yt-dlp | PR B |
+| S1 | The fetcher sends the runner only the validated ID and a token it minted, never its job ID, and consults no proxy variable; it fails the job (nothing left behind, never retried) on any answer that is not status 200 with exactly one `Content-Type` and `Content-Length`, no `Transfer-Encoding`, JSON of at most 256 KiB of the shape `{status, info}` or `{status, error}`, or audio of 1 to `FETCH_MAX_BYTES` bytes of `audio/mp4` within the per-read and total deadlines; it re-validates the metadata with `parse_info`, follows no redirect, accepts nothing past the declared length, and ends each exchange only at the runner's close, which comes after the runner let go of its one-job lock, so its next request never finds it busy; the budget of the runner's clean-up after a run keeps its answer inside the fetcher's deadline (R10) | unit, with a fake runner; the fetcher's flow against a real runner with the stub yt-dlp | PR B |
 | S2 | The fetcher (PR A) and the runner (PR B) refuse to start with a default route, or an unreadable or unparsable route table, unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`), in-image and Compose topology tests | PR A (the fetcher), PR B (the runner) |
 | R5 | The runner's kill-and-reap sweep runs only as its container's PID 1, at both run boundaries, never while a `Popen` is in flight; where it can't run, the entry exits 4 before building the server unless `FETCH_ALLOW_NO_SWEEP=true` (parsed like `FETCH_ALLOW_DEFAULT_ROUTE`; a bad value exits 2), which never turns the sweep off as PID 1; the example runs the runner as PID 1 and never sets the override | unit (fake `kill`, `waitpid` and `getpid` that never pass -1 on); in-image as PID 1 (a real sweep of a run's leftovers); Compose topology tests (no init, the exact command, no override, `/proc/1/cmdline` in the running runner) | PR B |
 | R6 | The example gives the runner's container only the runner's own settings: no `env_file`, the three limits `FETCH_MAX_SECONDS`, `FETCH_MAX_BYTES` and `FETCH_TIMEOUT_SECONDS` from `.env` by name, and `HTTPS_PROXY` on the service, so that a health check or `docker exec` there, whose environment yt-dlp can read, holds no `PUBLIC_ORIGIN`, no setting of the core and nothing else from `.env` | Compose topology tests (static: no `env_file` in the runner's block, and the exact names of its resolved environment against an env file that also sets `PUBLIC_ORIGIN`, `TRUSTED_PROXIES` and a stand-in for an operator's own variable; running: what a process started in the runner's container sees) | PR B |
+| R7 | After every run and its sweep, before it answers, the runner removes everything the run left in its scratch directory but that job's held result, which is never moved there through a link in place of `results/`, whatever the run did to it (a file in place of a directory, permissions taken away at any depth, FIFOs, which are never opened, links, which are removed and never followed, a tree deeper than the recursion limit or past `PATH_MAX`, a directory with very many entries), never entering another filesystem; makes the scratch directory and `results/` owner-only plain directories again, failing the job closed with one line on stderr when it can't; and removes the rest of `/tmp` only as PID 1 on Linux, sweeping, with exactly `/tmp/strange_ringtone_runner` as its scratch directory, never otherwise | unit (temporary directories; the decision on its own; the server with a stub run that leaves each kind of litter, then a job that succeeds); in-image as PID 1 (litter, a full tmpfs, a file in place of `results/`, a moved and a locked scratch directory); the other-filesystem rule with one directory reported on another device, since no test container can make a mount | after PR B |
+| R8 | yt-dlp's stdout goes to `/dev/null`, and of its stderr, read to the end while the run goes on, only the last 64 KiB are kept for choosing the error code; the wall-clock timeout, the group kill and the drain bounded to 5 s stay | unit (a stub run that prints 16 MiB on each stream: the runner's memory stays bounded and the error code is the same; a grandchild holding stderr can't stretch the drain; a slowed reader: the tail is complete before the error code is chosen) | after PR B |
+| R9 | Under the same contract as R7's clearing of `/tmp`, after every run and its sweep, before it answers, the runner removes every System V shared memory segment, message queue and semaphore set it may remove (`IPC_RMID` on what `/proc/sysvipc` lists), and never touches the IPC namespace otherwise; an object it owns or created that is still listed afterwards counts as left behind (R10), whatever the call answered, while another user's may stay | unit (the decision on its own; the call for each listed object; a removal that answers -1 with the object still listed, with the object gone, and for another user's object; the server asks for it after every run under the contract and never otherwise); in-image as PID 1 (a stub run that leaves one object of each kind, first with the removal patched out to show they outlive the run, then with it, and a next job that succeeds) | after PR B |
+| R10 | The whole clean-up after a run (the scratch directory, the rest of `/tmp`, the System V IPC objects, the restore of the scratch directory) shares one budget of 3 s, which fits inside the fetcher's grace past `FETCH_TIMEOUT_SECONDS` after the drain and the two reaps, with 3 s to spare; when the budget is overrun, something is left that should be gone, or the scratch directory can't be made usable again, the job fails closed, its result is discarded and one line goes to stderr; under R7's contract the runner then exits with code 5 once the answer is written, or could not be, its one-job lock still held, so the restart policy starts a clean container; anywhere else it keeps serving; `/healthz` is unchanged | unit (the deadline stops `remove_leftovers` and the IPC removal; the budget against the client's grace; under a faked contract an overrun, a leftover and a failed restore each fail the job and ask for the exit, after the answer and when it can't be written, with the exit itself faked; off the contract the runner keeps serving); in-image as PID 1 (a stub run's tree past a budget made small, and the same tree within the real one) | after PR B |
+| R11 | The example's runner sets `kernel.shmmni` and `kernel.msgmni` to 0 and `kernel.sem` to `0 0 0 0`, so that no process in its container, a run included, can create a System V shared memory segment, message queue or semaphore set, which `ipc: none` alone allows | Compose topology tests (static: the runner's block declares the three values; running: a process in the runner's container reads them and its `shmget`, `msgget` and `semget` fail, against a container of the image with `ipc: none` and without them, where the same probe creates one of each) | after PR B |
 | I1 | The base interpreter's site-packages hold no third-party distribution and no `.pth` file, and its `sys.path` leaves out the venv; no build step after the wheels' install starts the venv's interpreter or compiles the venv with site enabled, and the venv's bytecode is current for the image's interpreter | in-image; unit (static read of `fetcher/Dockerfile`) | PR A |
 | I2 | The venv is filled by the base interpreter's `pip install --prefix /opt/yt-dlp`; no build step, the install included, runs pip under the venv's interpreter (`--python`) or starts it; no second install into the venv follows the first; the wheels' scripts land in `/opt/yt-dlp/bin`, none in the base prefix | unit (static read of `fetcher/Dockerfile`); in-image | PR B |
 | K1 | Every container of the fetcher image (fetcher, runner, forwarder) has `forwarding` 0 for `default`, `lo` and each attachment's interface, never the global switch, `accept_redirects` 0 for `all`, `default`, `lo` and each interface, no IPv6 sysctl, and a `pids_limit` of at least twice its worst case from the code's caps | Compose topology tests (static and running; a container with the forwarder's settings routes no datagram between two networks, against a control router that does) | PR A (the fetcher and the forwarder), PR B (the runner) |

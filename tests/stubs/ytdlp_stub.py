@@ -36,6 +36,38 @@ what tools/dev_fetch_stack.py relies on.
                   process group with its standard streams closed, write its
                   PID to survivor.pid in the working directory, and exit 0:
                   a child yt-dlp left behind after a successful run
+    loud          LOUD_BYTES on stdout and as many on stderr, then "Sign in
+                  to confirm you're not a bot" on stderr, exit 1: far more
+                  output than the runner keeps
+    loud_ok       the same floods, then both files as "ok", exit 0
+    litter        both files as "ok", then leave_litter(): files, FIFOs,
+                  links and mode-000 trees in the job directory, the
+                  scratch directory above it, its results/ and the
+                  directory above that; exit 0
+    wedge         both files as "ok", then a file where the scratch
+                  directory's results/ was and a mode-000 tree in the job
+                  directory; exit 0
+    lock_scratch  both files as "ok", then every permission taken off the
+                  scratch directory; exit 0
+    displace      the scratch directory moved aside (LITTER_NAME_scratch
+                  beside it) and a file put in its place; exit 1
+    strand        as displace, then the write permission taken off the
+                  directory above, so the scratch directory can't be made
+                  again there; for tests on temporary directories only
+    fill          both files as "ok", then files beside the scratch
+                  directory until its filesystem is full; exit 0. Only as
+                  the child of PID 1 on Linux (a throwaway container), and
+                  refused (exit 2) anywhere else, where it would fill a
+                  developer's disk
+    sysv          both files as "ok", then a System V shared memory segment,
+                  a message queue holding a message and a semaphore set,
+                  left behind when it exits 0. Only as the child of PID 1 on
+                  Linux, like fill, so no developer's machine keeps them
+    tree          both files as "ok", then TREE_DIRECTORIES directories of
+                  TREE_FILES empty files each, in the job directory and
+                  beside the scratch directory; exit 0: a tree whose
+                  clean-up takes a while. Only as the child of PID 1 on
+                  Linux, like fill
 
 STRANGE_RINGTONE_YTDLP_STUB_LOG names a file each run appends one JSON line
 to: argv, working directory, environment and (on POSIX) resource limits.
@@ -60,7 +92,8 @@ DURATION_VAR = "STRANGE_RINGTONE_YTDLP_STUB_DURATION"
 MODES = (
     "ok", "too_long", "blocked", "not_found", "fail", "oversize", "no_audio", "ctrl_title", "huge_heatmap",
     "bad_heatmap", "bare_info", "not_a_dict", "symlink", "files_101", "files_1", "hang", "grandchild",
-    "survivor",
+    "survivor", "loud", "loud_ok", "litter", "wedge", "lock_scratch", "displace", "strand", "fill", "sysv",
+    "tree",
 )
 # Eleven characters each, so they pass the fetcher's ID check.
 BY_ID = {
@@ -88,6 +121,20 @@ HEATMAP_POINTS = 100
 URL_RE = re.compile(r"https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})", re.ASCII)
 FILTER_RE = re.compile(r"duration <= [0-9]+ & !is_live", re.ASCII)
 DIGITS_RE = re.compile(r"[0-9]+", re.ASCII)
+# What "loud" writes to each stream: far past the runner's stderr tail and
+# enough that keeping it whole shows up in the runner's memory.
+LOUD_BYTES = 16 * 1024 * 1024
+LOUD_LINE = b"yt-dlp stub: noise to fill the pipe\n"
+# The prefix of every name the litter modes leave outside the job directory.
+LITTER_NAME = "strange_ringtone_leftover"
+# "fill" writes files of at most this size, and at most FILL_FILES of them.
+FILL_FILE_BYTES = 8 * 1024 * 1024
+FILL_FILES = 512
+# "tree" leaves this many directories of this many empty files, twice: far
+# more than a clean-up removes in a few milliseconds, far less than it
+# removes in a second.
+TREE_DIRECTORIES = 50
+TREE_FILES = 100
 
 # The pinned list, with None where the value depends on the run.
 EXPECTED = [
@@ -176,11 +223,122 @@ def write_bytes(path: Path, data: bytes) -> None:
         handle.close()
 
 
+def flood() -> None:
+    """LOUD_BYTES of noise on stdout, then as many on stderr, as a hostile yt-dlp could print."""
+    chunk = LOUD_LINE * (65536 // len(LOUD_LINE))
+    for stream in (sys.stdout.buffer, sys.stderr.buffer):
+        written = 0
+        while written < LOUD_BYTES:
+            stream.write(chunk)
+            written += len(chunk)
+        stream.flush()
+
+
+def locked_tree(top: Path, depth: int) -> None:
+    """top/d1/.../d<depth-1>, a file in each, then every one of them mode 000, the innermost first."""
+    directories = [top]
+    for level in range(1, depth):
+        directories.append(directories[-1] / f"d{level}")
+    for directory in directories:
+        directory.mkdir()
+        write_bytes(directory / "file", b"left behind")
+    for directory in reversed(directories):
+        os.chmod(directory, 0)
+
+
+def try_symlink(target: Path, link: Path) -> None:
+    # Windows lets only some accounts create symlinks; the rest of the
+    # litter still counts there.
+    try:
+        os.symlink(target, link, target_is_directory=target.is_dir())
+    except (OSError, NotImplementedError):
+        pass
+
+
+def leave_litter(job: Path) -> None:
+    """What a hostile run could leave: in the job directory, the scratch directory, results/ and above."""
+    scratch = job.parent
+    above = scratch.parent
+    locked_tree(job / "locked", 3)
+    write_bytes(scratch / "stray", b"left behind")
+    (scratch / "job-planted").mkdir()
+    write_bytes(scratch / "job-planted" / "file", b"left behind")
+    locked_tree(scratch / "planted", 3)
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(scratch / "fifo")
+    # A link out of the scratch directory: whatever removes the litter must
+    # remove the link, never what it points to.
+    try_symlink(above, scratch / "up")
+    results = scratch / "results"
+    write_bytes(results / ("f" * 32 + ".m4a"), b"not a held result")
+    locked_tree(results / "locked", 2)
+    write_bytes(above / LITTER_NAME, b"left behind")
+    locked_tree(above / f"{LITTER_NAME}_dir", 2)
+
+
+def fill_above(job: Path) -> None:
+    """Files beside the scratch directory until the filesystem refuses more."""
+    above = job.parent.parent
+    block = b"\0" * (1024 * 1024)
+    for index in range(FILL_FILES):
+        try:
+            handle = open(above / f"{LITTER_NAME}_fill_{index}", "wb")
+        except OSError:
+            return
+        try:
+            for _ in range(FILL_FILE_BYTES // len(block)):
+                handle.write(block)
+                handle.flush()
+        except OSError:
+            return
+        finally:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+def leave_ipc_objects() -> None:
+    """A System V shared memory segment, a message queue with a message in it and a semaphore set.
+
+    None of them is a file or a process: they stay in the IPC namespace
+    after this process exits, until something removes them.
+    """
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.shmget.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.c_int]
+    libc.msgsnd.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    # IPC_PRIVATE (0) as the key, IPC_CREAT (0o1000) with the owner's
+    # permissions.
+    create = 0o1000 | 0o600
+    made = (libc.shmget(0, 1024 * 1024, create), libc.msgget(0, create), libc.semget(0, 4, create))
+    # A message is its type (a long, here 1) followed by its text.
+    text = 16
+    message = ctypes.create_string_buffer(ctypes.sizeof(ctypes.c_long) + text)
+    ctypes.c_long.from_buffer(message).value = 1
+    if -1 in made or libc.msgsnd(made[1], message, text, 0) != 0:
+        refuse(f"could not leave the IPC objects: errno {ctypes.get_errno()}")
+
+
+def leave_tree(job: Path) -> None:
+    """TREE_DIRECTORIES directories of TREE_FILES empty files, in the job directory and beside the scratch directory."""
+    for top in (job / "tree", job.parent.parent / f"{LITTER_NAME}_tree"):
+        top.mkdir()
+        for index in range(TREE_DIRECTORIES):
+            directory = top / f"d{index}"
+            directory.mkdir()
+            for name in range(TREE_FILES):
+                write_bytes(directory / f"f{name}", b"")
+
+
 def main(argv: list[str]) -> int:
     video_id, max_bytes, directory = parse(argv)
     mode = os.environ.get(MODE_VAR) or BY_ID.get(video_id, "ok")
     if mode not in MODES:
         refuse(f"unknown mode {mode!r}")
+    if mode in ("fill", "sysv", "tree") and (not sys.platform.startswith("linux") or os.getppid() != 1):
+        refuse(f"{mode} runs only as the child of PID 1 in a throwaway container")
     log_run(argv)
     title = title_for(video_id)
     # yt-dlp prints the destination filename and errors that quote the title;
@@ -211,6 +369,16 @@ def main(argv: list[str]) -> int:
     if mode == "fail":
         sys.stderr.write("ERROR: something else went wrong\n")
         return 1
+    if mode in ("loud", "loud_ok"):
+        flood()
+        if mode == "loud":
+            # Last, as yt-dlp prints its error: the runner keeps the tail.
+            # As bytes, like the flood: the text stream would end the line
+            # with CR LF on Windows, and the tail's last bytes are compared.
+            line = f"ERROR: [youtube] {video_id}: Sign in to confirm you're not a bot\n"
+            sys.stderr.buffer.write(line.encode("ascii"))
+            sys.stderr.buffer.flush()
+            return 1
 
     duration: float = float(os.environ.get(DURATION_VAR) or DURATION)
     info: object = {
@@ -266,6 +434,38 @@ def main(argv: list[str]) -> int:
         )
         Path("survivor.pid.tmp").write_text(str(child.pid), encoding="ascii")
         os.replace("survivor.pid.tmp", "survivor.pid")
+        return 0
+    scratch = directory.parent
+    if mode == "litter":
+        leave_litter(directory)
+        return 0
+    if mode == "wedge":
+        # results/ is empty while a run writes (the runner discards every
+        # held result first); a file in its place leaves nowhere to hold one.
+        results = scratch / "results"
+        for child in results.iterdir():
+            child.unlink()
+        results.rmdir()
+        write_bytes(results, b"not a directory")
+        locked_tree(directory / "locked", 2)
+        return 0
+    if mode == "lock_scratch":
+        os.chmod(scratch, 0)
+        return 0
+    if mode in ("displace", "strand"):
+        os.rename(scratch, scratch.parent / f"{LITTER_NAME}_scratch")
+        write_bytes(scratch, b"not a directory")
+        if mode == "strand":
+            os.chmod(scratch.parent, 0o500)
+        return 1
+    if mode == "fill":
+        fill_above(directory)
+        return 0
+    if mode == "sysv":
+        leave_ipc_objects()
+        return 0
+    if mode == "tree":
+        leave_tree(directory)
         return 0
     # A failed run that still left both files behind: the exit status wins.
     if mode == "files_101":

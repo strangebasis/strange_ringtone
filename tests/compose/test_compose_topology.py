@@ -72,6 +72,12 @@ FETCHER_HEALTH_PATH = "/fetch/healthz"
 # never both, plus the info JSON and Deno's cache (FETCH_MAX_BYTES + 16 MB).
 FETCHER_TMPFS_SIZE = "size=80m"
 RUNNER_TMPFS_SIZE = "size=56m"
+# System V IPC off in the runner's container: `ipc: none` gives it an IPC
+# namespace of its own, but a run could still create shared memory segments,
+# message queues and semaphore sets there, which are neither files nor
+# processes and outlive it. With these three at zero, shmget, msgget and
+# semget fail. As /proc/sys/kernel reads them, whitespace collapsed.
+RUNNER_SYSV_IPC_SYSCTLS = {"kernel.shmmni": "0", "kernel.msgmni": "0", "kernel.sem": "0 0 0 0"}
 # The engine release that added the bridge driver's `isolated` gateway mode,
 # which the internal networks use so the Docker host has no address on them:
 # Docker Engine 28.0.0 (release notes, moby/moby#49262), which accepts it on
@@ -97,6 +103,8 @@ IP_FORWARD = "net.ipv4.ip_forward"
 # process (Docker runs one at a time). The fetcher also: the job worker and
 # the sweeper (Jobs.start), and the runner client's deadline timer for the
 # one exchange the job worker has open. The runner also: its result sweeper,
+# the thread that reads a run's stderr while the run goes on (both counted
+# from the code in tests/test_fetcher_runner_threads.py),
 # and one yt-dlp run, measured offline in the image under the contract
 # flags: yt-dlp's Python 1 thread, Deno's main thread, 2 tokio threads and
 # V8's workers, at most 4 there (one per usable CPU up to 4), counted as 63
@@ -104,7 +112,7 @@ IP_FORWARD = "net.ipv4.ip_forward"
 SERVICE_FIXED_THREADS = 1 + 1
 JOB_THREADS = 2
 CLIENT_THREADS = 1
-RUNNER_THREADS = 1
+RUNNER_THREADS = 1 + 1
 YTDLP_RUN_THREADS = 1 + 1 + 2 + 63
 # The core's worst case, besides its request workers
 # (RingtoneServer.MAX_WORKERS): its main thread, the health check, the result
@@ -497,6 +505,33 @@ for name in sorted(os.listdir(base)):
     with open(base + '/' + name + '/accept_redirects') as handle:
         values[name] = handle.read().strip()
 print(json.dumps(values))
+"""
+
+# System V IPC as the container's own kernel reports it: the three limits the
+# runner's sysctls set, and whether a process of the container's user can
+# create a shared memory segment, a message queue and a semaphore set
+# (IPC_PRIVATE, IPC_CREAT and the owner's permissions). Whatever it does create
+# it removes again at once (IPC_RMID), so the probe leaves nothing behind.
+_SYSV_IPC_PROBE = r"""
+import ctypes, json
+libc = ctypes.CDLL(None, use_errno=True)
+libc.shmget.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.c_int]
+limits = {}
+for name in ('shmmni', 'msgmni', 'sem'):
+    with open('/proc/sys/kernel/' + name) as handle:
+        limits[name] = ' '.join(handle.read().split())
+create = 0o1000 | 0o600
+made = {}
+for kind, call, remove in (
+    ('shm', lambda: libc.shmget(0, 4096, create), lambda ident: libc.shmctl(ident, 0, None)),
+    ('msg', lambda: libc.msgget(0, create), lambda ident: libc.msgctl(ident, 0, None)),
+    ('sem', lambda: libc.semget(0, 1, create), lambda ident: libc.semctl(ident, 0, 0)),
+):
+    ident = call()
+    made[kind] = ident != -1
+    if ident != -1:
+        remove(ident)
+print(json.dumps({'limits': limits, 'made': made}))
 """
 
 # A UDP listener on a copy of `outside`: it says `ready`, then prints each
@@ -1212,6 +1247,15 @@ class LayoutTest(unittest.TestCase):
         # the key, so test_the_runners_container_is_given_only_its_own_settings
         # reads compose.example.yaml's own text for it (R6).
 
+    def test_the_runner_turns_system_v_ipc_off(self) -> None:
+        """R11 (static): the runner's sysctls leave a run no System V IPC object to create; `ipc: none` doesn't."""
+        sysctls = self._service("fetcher-runner").get("sysctls") or {}
+        self.assertIsInstance(sysctls, dict, sysctls)
+        for key, value in RUNNER_SYSV_IPC_SYSCTLS.items():
+            with self.subTest(sysctl=key):
+                self.assertIn(key, sysctls, f"fetcher-runner: no {key} in {sysctls!r}")
+                self.assertEqual(" ".join(str(sysctls[key]).split()), value, f"fetcher-runner: {key} in {sysctls!r}")
+
     def test_forwarder_command_and_hardening(self) -> None:
         """Supporting: the forwarder command of the fetcher image, with the contract's flags and nothing writable."""
         forwarder = self._service("fetcher-forwarder")
@@ -1700,6 +1744,24 @@ class StackTest(unittest.TestCase):
         self.assertIn("HTTPS_PROXY", runner)
         for name in ("PUBLIC_ORIGIN", "TRUSTED_PROXIES"):
             self.assertNotIn(name, runner, f"the runner's container is given {name}")
+
+    def test_a_process_in_the_runners_container_can_create_no_system_v_ipc_object(self) -> None:
+        """R11 (running): the runner's kernel reads the example's three limits, and shmget, msgget and semget fail."""
+        # `compose exec` runs as the service's user, 10001, like yt-dlp.
+        state = self._probe_output(self._stack.exec_in("fetcher-runner", _SYSV_IPC_PROBE), "runner System V probe")
+        expected = {key.removeprefix("kernel."): value for key, value in RUNNER_SYSV_IPC_SYSCTLS.items()}
+        self.assertEqual(state["limits"], expected, state)
+        self.assertEqual(state["made"], {"shm": False, "msg": False, "sem": False}, state)
+        # Control: the same probe in a container of the image with `--ipc
+        # none` and the contract's flags, but without the sysctls, creates
+        # (and removes) one object of each kind, so the probe can see one.
+        control = self._stack.docker_run(
+            "--rm", "--name", self._stack.container_name("sysv-control"), "--network", "none", "--ipc", "none",
+            *HARDENING, IMAGE, "python", "-I", "-c", _SYSV_IPC_PROBE,
+        )
+        unset = self._probe_output(control, "System V control probe")
+        self.assertEqual(unset["made"], {"shm": True, "msg": True, "sem": True}, unset)
+        self.assertNotEqual(unset["limits"], expected, unset)
 
     def test_t2_the_running_services_forward_nothing_and_have_the_examples_pids_cap(self) -> None:
         """K1/T2: in the three running services, IPv4 and IPv6 forwarding read 0, and pids.max is the example's."""

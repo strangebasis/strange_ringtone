@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import unittest
 from pathlib import Path
 from typing import Any
@@ -714,7 +715,9 @@ class SubprocessGuardsTest(StubTestCase):
         self.assertNotIn("executable", kwargs)
         self.assertNotIn("preexec_fn", kwargs)
         self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
-        self.assertIs(kwargs["stdout"], subprocess.PIPE)
+        # Nothing reads yt-dlp's stdout (map_failure looks at stderr, and
+        # read_result at the files), so it is never piped to the runner.
+        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
         self.assertIs(kwargs["stderr"], subprocess.PIPE)
         self.assertIs(kwargs["start_new_session"], True)
         self.assertEqual(kwargs["cwd"], self.job)
@@ -746,17 +749,14 @@ class SubprocessGuardsTest(StubTestCase):
         self.assertNotIn(sys.executable, YtDlp(600, MIB, 30).command)
         self.assertNotIn(sys.executable, YtDlp(600, MIB, 30, prlimit=(PRLIMIT,)).full_command([]))
 
-    def test_communicate_has_the_wall_clock_timeout(self) -> None:
-        timeouts: list[float | None] = []
-        real = subprocess.Popen.communicate
-
-        def recording(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None) -> Any:
-            timeouts.append(timeout)
-            return real(proc, input, timeout)
-
-        with mock.patch.object(subprocess.Popen, "communicate", recording):
-            self.runner(timeout=17).fetch(VIDEO_ID, self.job)
-        self.assertEqual(timeouts, [17])
+    def test_the_run_has_the_wall_clock_timeout(self) -> None:
+        # Pinned by what happens, not by the call that waits: the run is
+        # given exactly timeout_seconds, neither less nor unbounded.
+        started = time.monotonic()
+        self.assertEqual(self.fetch_error("hanging____", timeout=2), "timeout")
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 2)
+        self.assertLess(elapsed, 2 + ytdlp.DRAIN_SECONDS + 3)
 
 
 class TimeoutTest(StubTestCase):
@@ -782,11 +782,13 @@ class TimeoutTest(StubTestCase):
         proc = self.procs[0]
         self.assertIsNotNone(proc.returncode, "the timed-out run was never reaped")
         if pipes_closed:
-            assert proc.stdout is not None and proc.stderr is not None
+            # stdout is not a pipe at all (SubprocessGuardsTest); stderr is,
+            # and must be closed once the run is over.
+            self.assertIsNone(proc.stdout)
+            assert proc.stderr is not None
             deadline = time.monotonic() + 5
-            while not (proc.stdout.closed and proc.stderr.closed) and time.monotonic() < deadline:
+            while not proc.stderr.closed and time.monotonic() < deadline:
                 time.sleep(0.05)
-            self.assertTrue(proc.stdout.closed, "stdout left open")
             self.assertTrue(proc.stderr.closed, "stderr left open")
 
     def test_a_hung_run_times_out(self) -> None:
@@ -796,16 +798,22 @@ class TimeoutTest(StubTestCase):
         self.assertReaped()
 
     def test_the_kill_is_followed_by_a_bounded_drain(self) -> None:
-        timeouts: list[float | None] = []
-        real = self.popen.communicate
-
-        def recording(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None) -> Any:
-            timeouts.append(timeout)
-            return real(proc, input, timeout)
-
-        with mock.patch.object(self.popen, "communicate", recording):
-            self.assertEqual(self.fetch_error("hanging____", timeout=1), "timeout")
-        self.assertEqual(timeouts, [1, 0.5])
+        # A grandchild that holds stderr open past the kill (here the kill
+        # reaches the direct child only) keeps the pipe from ever reaching
+        # EOF: the drain gives up after DRAIN_SECONDS (0.5 here) and the run
+        # still ends as a timeout.
+        pid_file = self.job / "grandchild.pid"
+        started = time.monotonic()
+        with mock.patch.object(ytdlp, "_kill_group", lambda proc: proc.kill()):
+            self.assertEqual(self.fetch_error("grandchild_", timeout=1), "timeout")
+        elapsed = time.monotonic() - started
+        grandchild = read_pid(pid_file, timeout=5)
+        self.assertIsNotNone(grandchild, "the stub never started its grandchild")
+        assert grandchild is not None
+        kill_quietly(grandchild)
+        self.assertGreaterEqual(elapsed, 1)
+        self.assertLess(elapsed, 1 + 0.5 + 3)
+        # Once the grandchild is gone, the pipe reaches EOF and is closed.
         self.assertReaped()
 
     def test_the_whole_process_group_dies(self) -> None:
@@ -827,18 +835,35 @@ class TimeoutTest(StubTestCase):
 
     def test_an_interrupted_wait_kills_the_group_and_propagates(self) -> None:
         pid_file = self.job / "grandchild.pid"
+        real_wait = self.popen.wait
+        real_communicate = self.popen.communicate
         for error in (KeyboardInterrupt, OSError):
             with self.subTest(error=error.__name__):
                 self.procs.clear()
                 pid_file.unlink(missing_ok=True)
 
+                # The first wait for the run, whichever call makes it
+                # (communicate() or wait()), is interrupted; the waits of the
+                # clean-up after it are the real ones.
+                interruptions = [error]
+
                 def interrupted(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None,
-                                error: type[BaseException] = error) -> Any:
-                    read_pid(pid_file)
-                    raise error()
+                                interruptions: list[type[BaseException]] = interruptions) -> Any:
+                    if interruptions:
+                        read_pid(pid_file)
+                        raise interruptions.pop()()
+                    return real_communicate(proc, input, timeout)
+
+                def interrupted_wait(proc: subprocess.Popen[bytes], timeout: float | None = None,
+                                     interruptions: list[type[BaseException]] = interruptions) -> Any:
+                    if interruptions:
+                        read_pid(pid_file)
+                        raise interruptions.pop()()
+                    return real_wait(proc, timeout)
 
                 started = time.monotonic()
-                with mock.patch.object(self.popen, "communicate", interrupted):
+                with mock.patch.object(self.popen, "communicate", interrupted), \
+                        mock.patch.object(self.popen, "wait", interrupted_wait):
                     with self.assertRaises(error):
                         self.runner().fetch("grandchild_", self.job)
                 grandchild = read_pid(pid_file, timeout=0)
@@ -978,6 +1003,77 @@ class PrlimitTest(StubTestCase):
             "RLIMIT_NOFILE": 256,
             "RLIMIT_NPROC": 512,
         })
+
+
+class OutputBoundTest(StubTestCase):
+    """What a run prints costs the runner a bounded tail of stderr, never the whole output.
+
+    The runner is its container's PID 1 under a 512 MB memory limit: holding
+    a run's whole output, as communicate() does, lets a run that prints a few
+    hundred megabytes end the runner. The stub's loud modes print far more
+    than the tail on both streams.
+    """
+
+    BLOCKED_LINE = b"Sign in to confirm you're not a bot\n"
+
+    def tail_bytes(self) -> int:
+        tail = getattr(ytdlp, "STDERR_TAIL_BYTES", None)
+        if tail is None:
+            raise AssertionError("strange_ringtone_runner.ytdlp.STDERR_TAIL_BYTES is missing")
+        return tail
+
+    def test_the_tail_is_64_kib(self) -> None:
+        # Enough for the last lines map_failure reads, which yt-dlp prints
+        # last; far less than the stub's floods.
+        self.assertEqual(self.tail_bytes(), 64 * 1024)
+        self.assertGreater(_stub_module().LOUD_BYTES, 100 * self.tail_bytes())
+
+    def test_memory_stays_bounded_and_the_failure_is_mapped_as_before(self) -> None:
+        self.tail_bytes()
+        tracemalloc.start()
+        try:
+            code = self.fetch_error(VIDEO_ID, mode="loud")
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(code, "blocked")
+        # The stub printed 16 MiB on each stream; the run may keep about
+        # the tail plus a read buffer or two.
+        self.assertLess(peak, 4 * MIB, f"the run held {peak} bytes of a run's output")
+
+    def test_map_failure_sees_only_the_tail_and_its_end(self) -> None:
+        tail = self.tail_bytes()
+        seen: list[bytes] = []
+        real = ytdlp.map_failure
+
+        def recording(returncode: int, stderr: bytes) -> str:
+            seen.append(bytes(stderr))
+            return real(returncode, stderr)
+
+        with mock.patch.object(ytdlp, "map_failure", recording):
+            self.assertEqual(self.fetch_error(VIDEO_ID, mode="loud"), "blocked")
+        self.assertEqual(len(seen), 1)
+        # Exactly the last STDERR_TAIL_BYTES the stub printed: its error
+        # line last, after the flood.
+        self.assertEqual(len(seen[0]), tail)
+        self.assertTrue(seen[0].endswith(self.BLOCKED_LINE), seen[0][-200:])
+        self.assertIn(_stub_module().LOUD_LINE, seen[0])
+
+    def test_a_flood_never_blocks_a_successful_run(self) -> None:
+        # Both pipes are read (or not piped) to the end while the run goes
+        # on: a child that fills a pipe nobody reads would hang until the
+        # timeout.
+        self.tail_bytes()
+        started = time.monotonic()
+        tracemalloc.start()
+        try:
+            download = self.runner(timeout=60, mode="loud_ok").fetch(VIDEO_ID, self.job)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(download.audio.read_bytes(), b"STUB-M4A\n" + VIDEO_ID.encode("ascii"))
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertLess(peak, 4 * MIB, f"the run held {peak} bytes of a run's output")
 
 
 if __name__ == "__main__":

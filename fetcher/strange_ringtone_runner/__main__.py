@@ -12,7 +12,11 @@ As its container's PID 1, it also turns on the sweep that kills and reaps
 whatever a yt-dlp run leaves behind (strange_ringtone_runner.ytdlp). Where
 the sweep can't run (started under an init, say) it refuses to start (exit
 4) unless FETCH_ALLOW_NO_SWEEP=true, and with that override it says on
-stderr that it serves without the sweep.
+stderr that it serves without the sweep. Once serving as PID 1, the runner
+exits with code 5 (strange_ringtone_runner.server.EXIT_CLEAN_UP_FAILED)
+when the clean-up after a run overran its budget, left something behind or
+could not make the scratch directory usable again, so that the restart
+policy starts a clean container.
 
 A mirror of strange_ringtone_fetch.__main__, line for line, under the
 runner's name, plus the non-dumpable step and the sweep decision: the
@@ -71,8 +75,9 @@ def make_not_dumpable() -> None:
     """On Linux, mark this process non-dumpable (prctl PR_SET_DUMPABLE 0), or raise OSError; elsewhere, nothing.
 
     yt-dlp runs as the runner's own UID in the runner's container and is not
-    its ancestor. Where the host's kernel.yama.ptrace_scope is 0 (the
-    kernel's default), a same-UID process may ptrace a dumpable one, and
+    its ancestor. Where the host's kernel.yama.ptrace_scope is 0 (some
+    distributions' default, and how a kernel without Yama behaves), a
+    same-UID process may ptrace a dumpable one, and
     Docker's default seccomp and AppArmor profiles allow it, so a malicious
     yt-dlp could attach to the runner and plant code in it that kill(-1)
     never reaches (it spares the caller): the reach between jobs that the
@@ -184,6 +189,9 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, RuntimeError, ValueError) as error:
         print(f"{PROG}: cannot start: {error}", file=sys.stderr)
         return 1
+    # So `docker stop` works. A run has the runner's UID and can send it too,
+    # or SIGINT, and stop the runner: an accepted risk (docs/PLAN.md 6.1);
+    # the example's restart policy starts it again with an empty /tmp.
     signal.signal(signal.SIGTERM, _stop)
     print(f"{PROG} listening on {args.bind}:{PORT}", file=sys.stderr)
     try:
