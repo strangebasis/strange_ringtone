@@ -5,6 +5,8 @@
 // the deployment's proxy forwards to the fetcher, so connect-src 'self'
 // covers them and the CSP stays exactly as it is.
 
+import { MAX_INPUT_BYTES } from "./audio/decode.js";
+
 /** A YouTube video ID, as the fetcher accepts it. */
 export const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 // The fetcher's job IDs: 128 random bits as lower-case hex. Checked before an
@@ -45,8 +47,8 @@ const MAX_TITLE_CHARACTERS = 200;
 
 // Plain words for every code the fetcher answers with, and for the few this
 // module adds itself (bad_link, network, bad_response, unavailable, expired,
-// gave_up, cancelled). tests/test_frontend_js.py fails when the fetcher gains
-// a code that is missing here.
+// gave_up, cancelled, audio_too_large). tests/test_frontend_js.py fails when
+// the fetcher gains a code that is missing here.
 const MESSAGES = {
   // The job's own outcome.
   blocked: "YouTube would not hand this video to the server. Try again later, or save the audio another way and pick the file.",
@@ -79,6 +81,9 @@ const MESSAGES = {
   expired: "The fetched audio is no longer on the server. Fetch the video again.",
   gave_up: "The fetch is taking far longer than it should. Try again later.",
   cancelled: "The fetch was replaced by a newer one.",
+  // The page's own byte cap (decode.js), which FETCH_MAX_BYTES may exceed.
+  audio_too_large: `This video's audio is larger than the ${MAX_INPUT_BYTES / (1024 * 1024)} MB this page can open. `
+    + "Pick a shorter video, or save the audio another way and pick the file.",
 };
 const GENERIC_MESSAGE = "Something went wrong while fetching the video. Try again.";
 const HTTP_CODE_RE = /^http_(\d{3})$/;
@@ -292,10 +297,18 @@ export async function pollJob(jobId, { intervalMs = POLL_INTERVAL_MS, maxPolls =
  * Fetch a finished job's audio, once: the fetcher deletes it as it sends it,
  * so there is no retry. The bytes stay in memory and are decoded like a
  * picked file.
+ *
+ * The page's byte cap applies before the bytes pile up, whatever
+ * FETCH_MAX_BYTES lets the fetcher hand over: a Content-Length over it is
+ * refused before the body is read, and because that header can be missing or
+ * wrong, the body is counted as it arrives and dropped once past the cap, at
+ * most one chunk after it.
  * @param {string} jobId
- * @returns {Promise<Uint8Array>}
+ * @param {{maxBytes?: number}} [options] the cap, MAX_INPUT_BYTES unless a
+ *   test passes a smaller one
+ * @returns {Promise<Uint8Array>} rejects with "audio_too_large" over the cap
  */
-export async function fetchAudio(jobId) {
+export async function fetchAudio(jobId, { maxBytes = MAX_INPUT_BYTES } = {}) {
   checkJobId(jobId);
   let response;
   try {
@@ -304,10 +317,49 @@ export async function fetchAudio(jobId) {
     throw new FetchError("network");
   }
   if (!response.ok) throw await refusal(response, "expired");
-  try {
-    return new Uint8Array(await response.arrayBuffer());
-  } catch {
-    // The body broke off part-way.
-    throw new FetchError("network");
+  const body = response.body;
+  const declared = response.headers.get("Content-Length");
+  if (declared !== null && Number(declared) > maxBytes) {
+    if (body !== null && body !== undefined) body.cancel().catch(() => {});
+    throw new FetchError("audio_too_large");
   }
+  if (body === null || body === undefined || typeof body.getReader !== "function") {
+    // A browser without a readable body stream: the size is checked before
+    // anything uses the bytes.
+    let buffer;
+    try {
+      buffer = await response.arrayBuffer();
+    } catch {
+      throw new FetchError("network");
+    }
+    if (!(buffer.byteLength <= maxBytes)) throw new FetchError("audio_too_large");
+    return new Uint8Array(buffer);
+  }
+  const reader = body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch {
+      // The body broke off part-way.
+      throw new FetchError("network");
+    }
+    if (chunk.done) break;
+    total += chunk.value.byteLength;
+    // Written so that a count that is not a number is refused too.
+    if (!(total <= maxBytes)) {
+      reader.cancel().catch(() => {});
+      throw new FetchError("audio_too_large");
+    }
+    chunks.push(chunk.value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const part of chunks) {
+    bytes.set(part, offset);
+    offset += part.byteLength;
+  }
+  return bytes;
 }
