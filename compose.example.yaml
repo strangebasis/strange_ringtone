@@ -323,8 +323,8 @@ services:
     # directories on that tmpfs too, empty ones included: a run that makes
     # enough of them (about half a million, measured) reaches the limit, the
     # kernel kills the runner, and the restart policy below starts it again
-    # with an empty /tmp. System V shared memory a run leaves counts too,
-    # until the runner removes it after the run. yt-dlp's output doesn't add
+    # with an empty /tmp. System V shared memory would count too, but the
+    # `sysctls` below leave a run none to make. yt-dlp's output doesn't add
     # to it: the runner sends its stdout to /dev/null and keeps only the
     # last 64 KiB of its stderr, however much a run prints.
     mem_limit: 512m
@@ -383,12 +383,25 @@ services:
     # already 0 in these containers, these networks give them no IPv6, and an
     # IPv6 sysctl would stop the container from starting on a kernel without
     # IPv6.
+    #
+    # System V IPC off. `ipc: none` gives this container an IPC namespace of
+    # its own, but a run could still create shared memory segments, message
+    # queues and semaphore sets in it: neither files nor processes, they
+    # outlive the run, and a segment's pages count against mem_limit. With
+    # these three at 0, shmget, msgget and semget fail, so a run can make
+    # none. Neither the runner nor yt-dlp or Deno uses them. They belong to
+    # the container's IPC namespace, so they too need no capability. The
+    # runner still removes any it finds after each run (docs/PLAN.md 6.1),
+    # for a layout without them.
     sysctls:
       net.ipv4.conf.default.forwarding: "0"
       net.ipv4.conf.lo.forwarding: "0"
       net.ipv4.conf.all.accept_redirects: "0"
       net.ipv4.conf.default.accept_redirects: "0"
       net.ipv4.conf.lo.accept_redirects: "0"
+      kernel.shmmni: "0"
+      kernel.msgmni: "0"
+      kernel.sem: "0 0 0 0"
     # Internal networks only, so the runner has no default route and its DNS
     # resolves service names but no external name; it refuses to start where
     # it finds a default route (FETCH_ALLOW_DEFAULT_ROUTE). `jobs` for the
