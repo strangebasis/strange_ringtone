@@ -1062,7 +1062,9 @@ removes everything else in its `/tmp`, so a full tmpfs doesn't fail the
 next fetch either. So under the contract the runner treats its whole
 `/tmp` as its own: after every run nothing is left there but its scratch
 directory and the one audio file it holds, and nothing else can be kept or
-mounted there. Under the same contract it also removes the System V shared
+mounted there: a mount inside it is never entered, so every clean-up
+counts as leaving something, fails its job and ends in the exit below.
+Under the same contract it also removes the System V shared
 memory segments, message queues and semaphore sets a run left in the
 container's IPC namespace, which `ipc: none` makes the container's own.
 They are neither files nor processes, and a segment's pages stay charged
@@ -1099,13 +1101,19 @@ memory limit, which counts the kernel's memory for the files and
 directories on its tmpfs, empty ones included, not only their pages.
 Measured in the image with the 512 MB limit (2026-11-10): between 500,000
 and 600,000 empty files, or a chain of 600,000 nested directories, ended
-the container, the kernel killing the runner (exit 137); so did, once in
-two tries, the runner's own clean-up of a 450,000-level tree, which also
-holds a little memory for each level it is down. The outcome is the
-signal's: the restart policy starts the runner again with an empty `/tmp`,
-and the fetch in flight fails. Anywhere but under the contract (a local
-run, `FETCH_ALLOW_NO_SWEEP=true`) such a failed clean-up fails the job the
-same way, but the runner keeps serving: `/healthz` still answers, and later
+the container, the kernel killing the runner (exit 137). Before the
+clean-up had its budget, so did, once in two tries, the runner's own
+clean-up of a 450,000-level tree of mode-000 directories, which holds a
+little memory for each level it is down; with the budget, seven runs that
+each left such a tree (in the job directory or beside the scratch
+directory) put the container at its memory limit and each ended in the
+budget's exit 5, none in the kernel's kill (measured 2026-11-10, on a
+Docker host with swap). The outcome is the signal's: the restart policy
+starts the runner again with an empty `/tmp`, and the fetch in flight
+fails. Anywhere but under the contract (a local run,
+`FETCH_ALLOW_NO_SWEEP=true`) a clean-up that overruns its budget, leaves
+something or can't make the scratch directory usable again fails the job
+the same way, but the runner keeps serving: `/healthz` still answers, and later
 fetches can keep failing until the runner is restarted. The sweep's cost is
 accepted (owner, 2026-11-05): a `docker exec` or health check running in
 the runner's container at a run boundary is killed too, and the runner must

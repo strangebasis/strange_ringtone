@@ -313,8 +313,12 @@ services:
       # defaults. noexec: nothing downloaded can be run. Nothing a run writes
       # here outlives it: after each run the runner, as PID 1, removes
       # everything the run left in /tmp but the one audio file it holds for
-      # the fetcher (docs/PLAN.md 6.1). So the runner treats all of this
-      # /tmp as its own: mount nothing else here, and keep nothing here.
+      # the fetcher, or, when it can't within its budget of 3 s, fails that
+      # job and exits (code 5) for the restart policy below to start it
+      # with an empty /tmp (docs/PLAN.md 6.1). So the runner treats all of
+      # this /tmp as its own: keep nothing here, and mount nothing inside
+      # it, which it never enters and would count as left over after every
+      # run.
       - /tmp:rw,noexec,nosuid,size=56m,mode=1777
     # prlimit bounds yt-dlp's CPU time, file size, open files and processes,
     # but not its address space, because Deno reserves a huge virtual range
