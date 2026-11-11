@@ -11,7 +11,8 @@ ffmpeg is the largest attack surface in the core, so every run is fenced in:
   threaded process, and the server is threaded;
 - its own session, so on a wall-clock timeout the whole process group dies,
   not only the direct child, and at the end of every other run too, before
-  anything of the run is used;
+  anything of the run is used; where the server inherits orphans (as its
+  container's PID 1), the members that kill killed are then collected;
 - a job directory the server created, holding only server-chosen names;
 - an output larger than the file-size limit is refused, also where prlimit
   is not in force;
@@ -23,6 +24,8 @@ image has no AAC decoder and so can't measure the encoded file afterwards.
 """
 from __future__ import annotations
 
+import ctypes
+import functools
 import io
 import math
 import os
@@ -56,6 +59,12 @@ FADE_CURVE = "qsin"
 # a process that escaped the group kill and still holds a pipe open can't hang
 # the request; the tests shorten it.
 DRAIN_SECONDS = 5.0
+# How long the collection after a group kill waits for the killed members to
+# die. SIGKILL ends a process at once unless it is stuck in the kernel, so
+# this is headroom, and it keeps such a member from hanging the request.
+COLLECT_SECONDS = 1.0
+# prctl(2) option (linux/prctl.h).
+PR_GET_CHILD_SUBREAPER = 37
 
 # How much of the end of ffmpeg's stderr is kept; everything before it is read
 # and dropped. The summary stands at the end: a 40 s pass of the image's
@@ -360,6 +369,7 @@ class Renderer:
                 # A drain that gave up leaves both pipes open; close them here
                 # rather than whenever the Popen object is collected.
                 _close_pipes(proc)
+                _collect_group(proc)
             raise RenderError("render_timeout") from None
         except BaseException:
             try:
@@ -367,6 +377,7 @@ class Renderer:
                 proc.wait()
             finally:
                 _close_pipes(proc)
+                _collect_group(proc)
             raise
         # A run that ended by itself, success included, may have left a child
         # behind that closed its pipes (so _collect returned). It would run on
@@ -378,11 +389,13 @@ class Renderer:
         # PIDs are handed out in turn, so another render's ffmpeg could hold
         # it only after the PID space wrapped in between. The two paths
         # above that raise have killed the group already, so every run's
-        # group is killed exactly once. A child that called setsid() has
+        # group is killed exactly once, and each kill is followed by the
+        # collection of what it killed. A child that called setsid() has
         # left the group and is not reached; the core runs renders side by
         # side, so it can't sweep its UID's processes as the fetcher's
         # runner does.
         _kill_group(proc)
+        _collect_group(proc)
         if proc.returncode != 0:
             raise RenderError(failure)
         loudness = parse_summary(stderr.decode("utf-8", errors="replace"))
@@ -502,6 +515,72 @@ def _kill_group(proc: subprocess.Popen[bytes]) -> None:
         proc.kill()
     except OSError:
         pass
+
+
+def _collect_group(proc: subprocess.Popen[bytes]) -> None:
+    """Collect the dead members of proc's process group that are this process's children.
+
+    A run's leader is proc itself, which Popen waits for. Its own children
+    become children of whatever process orphans go to: the init of their
+    PID namespace, or the nearest child subreaper. In the compose example
+    the server is its container's PID 1, so each child a run leaves in its
+    group is the server's once the leader is gone, and once the group kill
+    has killed it, it stays a zombie that holds a slot of the container's
+    pids_limit until the server waits for it. Enough of them and no render
+    and no health check can start until the container restarts.
+
+    Only after the leader has been waited for, so this can never take the
+    leader's status from Popen. Only the run's own group (P_PGID): the core
+    runs renders side by side, and another render's ffmpeg, which leads a
+    group of its own, may have exited and not yet been waited for; taking it
+    would hand that render a status of 0. The group's ID is the leader's
+    PID, which Linux doesn't hand out again while any member, a zombie
+    included, is left in the group. Bounded by COLLECT_SECONDS, so a member
+    that doesn't die at once can't hang the request; it then stays until the
+    container restarts, as does a child that left the group with setsid()
+    or setpgid(), alive or dead. Where orphans go to another process, that
+    process collects them, and this does nothing at all.
+    """
+    if proc.returncode is None or not _orphans_come_here():
+        return
+    deadline = time.monotonic() + COLLECT_SECONDS
+    while True:
+        try:
+            if os.waitid(os.P_PGID, proc.pid, os.WEXITED | os.WNOHANG) is not None:
+                continue
+        except OSError:
+            # ECHILD: no child of this process is left in the group.
+            return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.01)
+
+
+@functools.cache
+def _orphans_come_here() -> bool:
+    """Whether a run's orphaned children become this process's children: PID 1, or a child subreaper (Linux)."""
+    if not sys.platform.startswith("linux"):
+        return False
+    if os.getpid() == 1:
+        return True
+    return _is_child_subreaper()
+
+
+def _is_child_subreaper() -> bool:
+    """What prctl(PR_GET_CHILD_SUBREAPER) says; False when it can't be asked."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        # Declared, as variadic prctl needs: the second argument is a
+        # pointer the kernel writes the flag to.
+        prctl.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        prctl.restype = ctypes.c_int
+        flag = ctypes.c_int(0)
+        if prctl(PR_GET_CHILD_SUBREAPER, ctypes.byref(flag), 0, 0, 0) != 0:
+            return False
+        return flag.value != 0
+    except (OSError, AttributeError):
+        return False
 
 
 def _close_pipes(proc: subprocess.Popen[bytes]) -> None:
