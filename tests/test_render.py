@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tracemalloc
 import unittest
@@ -779,6 +780,214 @@ class RunEndKillTest(StubTestCase):
         while any(alive(pid) for pid in survivors) and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertEqual([pid for pid in survivors if alive(pid)], [], "a child of a successful run outlived it")
+
+
+class GroupCollectionTest(StubTestCase):
+    """After each group kill the dead members of that run's own group are collected, and no other process."""
+
+    def record(self) -> list[tuple[str, int | None]]:
+        """Each kill and each collection, with the leader's exit status at that moment; the real ones still run."""
+        events: list[tuple[str, int | None]] = []
+        real_kill, real_collect = render._kill_group, render._collect_group
+
+        def kill(proc: subprocess.Popen[bytes]) -> None:
+            events.append(("kill", proc.returncode))
+            real_kill(proc)
+
+        def collect(proc: subprocess.Popen[bytes]) -> None:
+            events.append(("collect", proc.returncode))
+            real_collect(proc)
+
+        for patcher in (mock.patch.object(render, "_kill_group", kill),
+                        mock.patch.object(render, "_collect_group", collect),
+                        mock.patch.object(render, "DRAIN_SECONDS", 0.5)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return events
+
+    def assertCollectedAfterEachKill(self, events: list[tuple[str, int | None]], runs: int) -> None:
+        self.assertEqual([name for name, _code in events], ["kill", "collect"] * runs, events)
+        for name, code in events:
+            if name == "collect":
+                # Popen has the leader's status already, so no collection can
+                # take it from Popen.
+                self.assertIsNotNone(code, "a group was collected before its leader was waited for")
+
+    def test_every_kill_is_followed_by_a_collection_once_the_leader_is_waited_for(self) -> None:
+        cases = (
+            # mode, timeout, normalize, runs, the error the render ends with
+            ("ok", 20, True, 2, None),
+            ("unparsable", 20, False, 1, "render_failed"),
+            ("fail", 20, False, 1, "render_failed"),
+            ("late_fail", 20, False, 1, "render_failed"),
+            ("hang", 1, False, 1, "render_timeout"),
+        )
+        events = self.record()
+        for mode, timeout, normalize, runs, code in cases:
+            with self.subTest(mode=mode):
+                events.clear()
+                self.set_mode(mode)
+                try:
+                    Renderer(STUB_COMMAND, timeout).render(self.job, params(normalize=normalize, duration=1.0))
+                except RenderError as error:
+                    self.assertEqual(error.code, code)
+                else:
+                    self.assertIsNone(code)
+                self.assertCollectedAfterEachKill(events, runs)
+
+    def test_an_interrupted_run_is_collected_too(self) -> None:
+        events = self.record()
+
+        def interrupted(proc: subprocess.Popen[bytes], timeout: float) -> bytes:
+            raise KeyboardInterrupt()
+
+        self.set_mode("hang")
+        with mock.patch.object(render, "_collect", interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=False, duration=1.0))
+        self.assertCollectedAfterEachKill(events, 1)
+
+    def test_nothing_is_collected_where_orphans_go_elsewhere(self) -> None:
+        # Not PID 1, no child subreaper, or not Linux: what a run leaves
+        # behind is another process's to collect, and the renderer doesn't
+        # even ask.
+        self.set_mode("survivor")
+        with mock.patch.object(render, "_orphans_come_here", return_value=False), \
+                mock.patch.object(render.os, "waitid", side_effect=AssertionError("waitid called"), create=True):
+            Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+        pid_file = self.job / "survivors.pid"
+        if pid_file.is_file():
+            for line in pid_file.read_text(encoding="ascii").split():
+                self.addCleanup(kill_quietly, int(line))
+
+    def test_where_orphans_come_to(self) -> None:
+        probe = render._orphans_come_here.__wrapped__
+        with mock.patch.object(render.sys, "platform", "win32"):
+            self.assertFalse(probe())
+        with mock.patch.object(render.sys, "platform", "linux"):
+            # PID 1 of its namespace (the compose example's server) inherits
+            # every orphan, and nothing else needs asking.
+            with mock.patch.object(render.os, "getpid", return_value=1), \
+                    mock.patch.object(render, "_is_child_subreaper", side_effect=AssertionError("asked")):
+                self.assertTrue(probe())
+            for subreaper in (False, True):
+                with self.subTest(subreaper=subreaper), \
+                        mock.patch.object(render.os, "getpid", return_value=4321), \
+                        mock.patch.object(render, "_is_child_subreaper", return_value=subreaper):
+                    self.assertEqual(probe(), subreaper)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "a child subreaper is Linux's")
+    def test_the_killed_members_are_collected_where_orphans_come_to_the_server(self) -> None:
+        # In the compose example the server is its container's PID 1, so what
+        # a run leaves behind becomes the server's child once the run's
+        # leader exits. Killed, such a child stays a zombie, holding a slot of
+        # pids_limit, until its parent collects it. A child subreaper inherits
+        # orphans the same way, so the render runs in one, which then reports
+        # whatever child the render left it.
+        for mode, timeout, outcome in (("survivor", 20, "ok"), ("grandchild", 1, "render_timeout")):
+            with self.subTest(mode=mode):
+                self.set_mode(mode)
+                for name in ("survivors.pid", "grandchild.pid", "out.m4a"):
+                    (self.job / name).unlink(missing_ok=True)
+                result = subprocess.run(
+                    [sys.executable, "-I", "-c", SUBREAPER_HELPER, str(helpers.CORE), str(self.job),
+                     json.dumps(STUB_COMMAND), str(timeout)],
+                    capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["outcome"], outcome)
+                self.assertTrue(report["started"], "the stub left no child behind")
+                self.assertEqual(report["left"], [], "the render left the server a child it never collected")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "waitid on a process group, as Linux has it")
+    def test_a_render_running_alongside_keeps_its_exit_status(self) -> None:
+        # The core runs renders side by side. Another render's ffmpeg that
+        # has exited and not yet been waited for is a child of the server
+        # too. A collection that took any child could take it, and that
+        # render would then read the status as 0, which is what Popen
+        # answers for a child already gone: a failed run would pass.
+        other = self.temp / "other"
+        other.mkdir()
+        valid_wav(other / "in.wav", 1.0)
+        exited, finished = threading.Event(), threading.Event()
+        outcome: list[str] = []
+        real_collect = render._collect
+
+        def collect(proc: subprocess.Popen[bytes], timeout: float) -> bytes:
+            if threading.current_thread() is alongside and not exited.is_set():
+                # Wait until the run has exited, without collecting it, and
+                # hold it there while the other render runs and collects.
+                os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+                exited.set()
+                finished.wait(60)
+            return real_collect(proc, timeout)
+
+        def render_alongside() -> None:
+            try:
+                Renderer(STUB_COMMAND, 20).render(other, params(normalize=False, duration=1.0))
+            except RenderError as error:
+                outcome.append(error.code)
+            else:
+                outcome.append("ok")
+
+        alongside = threading.Thread(target=render_alongside)
+        # Its run writes a summary and an output, then exits 1: only the
+        # exit status says it failed.
+        self.set_mode("late_fail")
+        with mock.patch.object(render, "_collect", collect), \
+                mock.patch.object(render, "_orphans_come_here", return_value=True):
+            alongside.start()
+            try:
+                self.assertTrue(exited.wait(30), "the render alongside never ran")
+                self.set_mode("survivor")
+                Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+            finally:
+                finished.set()
+                alongside.join(60)
+        pid_file = self.job / "survivors.pid"
+        if pid_file.is_file():
+            for line in pid_file.read_text(encoding="ascii").split():
+                self.addCleanup(kill_quietly, int(line))
+        self.assertEqual(outcome, ["render_failed"], "the render alongside lost its exit status")
+
+
+# Runs one render as a child subreaper (prctl PR_SET_CHILD_SUBREAPER, 36), then
+# reports any child it still has: a zombie the render didn't collect, or a
+# process it didn't kill. Arguments: core/, the job directory, the command as
+# JSON, the timeout in seconds.
+SUBREAPER_HELPER = """
+import ctypes, json, os, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from strange_ringtone.render import Renderer, RenderError, RenderParams
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0:
+    raise SystemExit("prctl(PR_SET_CHILD_SUBREAPER) failed")
+job = Path(sys.argv[2])
+params = RenderParams(fade_in=0.0, fade_out=0.0, normalize=True, target_lufs=-14.0, title="t", duration=1.0)
+try:
+    Renderer(tuple(json.loads(sys.argv[3])), int(sys.argv[4])).render(job, params)
+    outcome = "ok"
+except RenderError as error:
+    outcome = error.code
+started = (job / "survivors.pid").exists() or (job / "grandchild.pid").exists()
+left = []
+deadline = time.monotonic() + 5
+while True:
+    try:
+        found = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        break
+    if found is not None:
+        left.append("zombie")
+        break
+    if time.monotonic() >= deadline:
+        left.append("alive")
+        break
+    time.sleep(0.05)
+print(json.dumps({"outcome": outcome, "started": started, "left": left}))
+"""
 
 
 class OutputSizeTest(StubTestCase):
