@@ -951,6 +951,56 @@ class GroupCollectionTest(StubTestCase):
                 self.addCleanup(kill_quietly, int(line))
         self.assertEqual(outcome, ["render_failed"], "the render alongside lost its exit status")
 
+    def test_a_member_that_stays_alive_does_not_hold_the_request(self) -> None:
+        # A member the group kill hasn't ended yet is never reported by
+        # waitid, which answers None for as long as it lives. The collection
+        # gives up after COLLECT_SECONDS, so such a member can't hang the
+        # request whose run left it.
+        class StillWaiting(Exception):
+            pass
+
+        proc = mock.Mock(spec=subprocess.Popen, pid=4321, returncode=0)
+        # Windows has none of these; their Linux values stand in there.
+        p_pgid = getattr(os, "P_PGID", 2)
+        asked: set[tuple[int, int]] = set()
+        started = time.monotonic()
+
+        def waitid(idtype: int, ident: int, options: int) -> None:
+            asked.add((idtype, ident))
+            if time.monotonic() - started > render.COLLECT_SECONDS + 5:
+                # Ends a collection that has no bound, so the test fails
+                # instead of hanging.
+                raise StillWaiting()
+            return None
+
+        with mock.patch.object(render, "_orphans_come_here", return_value=True), \
+                mock.patch.object(render.os, "waitid", waitid, create=True), \
+                mock.patch.object(render.os, "P_PGID", p_pgid, create=True), \
+                mock.patch.object(render.os, "WEXITED", getattr(os, "WEXITED", 4), create=True), \
+                mock.patch.object(render.os, "WNOHANG", getattr(os, "WNOHANG", 1), create=True):
+            try:
+                render._collect_group(proc)
+            except StillWaiting:
+                self.fail("the collection kept waiting for a live member past its bound")
+        self.assertLess(time.monotonic() - started, render.COLLECT_SECONDS + 0.5)
+        # Only the run's own group was asked about.
+        self.assertEqual(asked, {(p_pgid, 4321)})
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "waitid on a process group, as Linux has it")
+    def test_a_leader_not_yet_waited_for_keeps_its_exit_status(self) -> None:
+        # The leader is a member of its own group. Called before Popen has
+        # waited for it, a collection of the group could take the leader's
+        # status, and Popen would then answer 0 for a child already gone:
+        # a failed run would pass. So the collection leaves such a group alone.
+        proc = subprocess.Popen([sys.executable, "-I", "-c", "raise SystemExit(3)"], start_new_session=True)
+        self.addCleanup(proc.wait, 10)
+        # Exited, and not waited for.
+        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+        self.assertIsNone(proc.returncode)
+        with mock.patch.object(render, "_orphans_come_here", return_value=True):
+            render._collect_group(proc)
+        self.assertEqual(proc.wait(timeout=10), 3)
+
 
 # Runs one render as a child subreaper (prctl PR_SET_CHILD_SUBREAPER, 36), then
 # reports any child it still has: a zombie the render didn't collect, or a
