@@ -133,6 +133,11 @@ FFMPEG_RUN_THREADS = 6
 # bytes) over eight runs, here rounded up to 47.7 MB. The tmpfs pages count
 # against the same cgroup.
 CORE_MEASURED_PEAK_BYTES = 47_700_000
+# System V IPC off in the core's container: `ipc: none` gives it a private
+# IPC namespace but leaves System V shared memory, message queues and
+# semaphores open to create there. With these three at zero, shmget, msgget
+# and semget fail.
+CORE_SYSV_IPC_SYSCTLS = {"kernel.shmmni": "0", "kernel.msgmni": "0", "kernel.sem": "0 0 0 0"}
 # Docker's size suffixes are binary: 64m is 64 MiB.
 _SIZE_UNITS = {"": 1, "b": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
 # ICMP redirects (compose.example.yaml). With forwarding off the kernel takes a
@@ -1335,6 +1340,15 @@ class LayoutTest(unittest.TestCase):
             f"core: mem_limit {limit} is under its tmpfs ({tmpfs_bytes}) plus twice the measured peak "
             f"({CORE_MEASURED_PEAK_BYTES}): a full /tmp and two renders would meet the OOM killer",
         )
+
+    def test_the_core_turns_system_v_ipc_off(self) -> None:
+        """The core's sysctls leave System V IPC no object to create, which `ipc: none` alone does not."""
+        sysctls = self._service("core").get("sysctls") or {}
+        self.assertIsInstance(sysctls, dict, sysctls)
+        for key, value in CORE_SYSV_IPC_SYSCTLS.items():
+            with self.subTest(sysctl=key):
+                self.assertIn(key, sysctls, f"core: no {key} in {sysctls!r}")
+                self.assertEqual(str(sysctls[key]), value, f"core: {key} in {sysctls!r}")
 
     def test_the_fetcher_image_services_refuse_icmp_redirects(self) -> None:
         """T2 (static): accept_redirects 0 for all, default and lo, and on the interface of every network attachment."""
