@@ -190,9 +190,12 @@ server, and the fetch counts against the rate limit like any other.
   of `.env` but three limits. Its only way out is the forwarder: YouTube's
   names on port 443, which Google's shared front ends also answer, within
   the [forwarder's limits](#forwarder-limits). It can reach the fetcher's
-  API like any client, it chooses the audio and the title of the fetches it
-  runs, and it can make fetching fail until the runner is restarted.
-  docs/PLAN.md 6.1, Accepted risks, has the whole list.
+  API like any client, and it chooses the audio and the title of the
+  fetches it runs. What it leaves in the runner's `/tmp` is removed after
+  each run, but it has the runner's user and can stop the runner with a
+  signal (SIGTERM or SIGINT), so that the fetch in flight fails until the
+  restart policy starts the runner again. docs/PLAN.md 6.1, Accepted risks,
+  has the whole list.
 
 **Not checked at start-up.** Docker Engine 28.0 or newer and Docker Compose
 2.27.1 or newer ([Fetcher image](#fetcher-image-opt-in), Networks). The
@@ -403,12 +406,13 @@ starts with no default route, answers `/healthz`, fails an offline fetch and
 leaves its scratch empty, and loads only its own package and the modules it
 shares. They also run the fetcher's, the runner's and the forwarder's unit
 tests (`tests/test_fetcher_*.py`) again under the image's Python 3.12, and
-there, where the test process is the container's PID 1, the one test that
-runs the runner's real sweep: a run's leftovers (in yt-dlp's process group,
+there, where the test process is the container's PID 1, the tests that
+run the runner's real sweep: a run's leftovers (in yt-dlp's process group,
 in a session of their own, and one that keeps forking to a new PID) are all
-killed and reaped. Everywhere else the tests replace `kill` and `waitpid`,
-because `kill(-1)` outside a throwaway container would kill every process
-of the user. Outside the image
+killed and reaped, and the files a run leaves anywhere in `/tmp` are
+removed. Everywhere else the tests replace `kill` and `waitpid`, because
+`kill(-1)` outside a throwaway container would kill every process of the
+user, and no test clears more than its own scratch directory. Outside the image
 (`STRANGE_RINGTONE_FETCHER_IMAGE_TESTS` unset) they are skipped. On any
 Linux, in the image or not, the runner's unit tests also check that a
 process of the same UID can neither read the `/proc` entries of a process

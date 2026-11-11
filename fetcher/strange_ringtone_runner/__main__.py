@@ -184,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, RuntimeError, ValueError) as error:
         print(f"{PROG}: cannot start: {error}", file=sys.stderr)
         return 1
+    # So `docker stop` works. A run has the runner's UID and can send it too,
+    # or SIGINT, and stop the runner: an accepted risk (docs/PLAN.md 6.1);
+    # the example's restart policy starts it again with an empty /tmp.
     signal.signal(signal.SIGTERM, _stop)
     print(f"{PROG} listening on {args.bind}:{PORT}", file=sys.stderr)
     try:

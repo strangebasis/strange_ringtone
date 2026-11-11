@@ -310,12 +310,17 @@ services:
       # One download in flight or one audio waiting to be collected (never
       # both: a new job discards an uncollected one before it starts), the
       # info JSON and Deno's cache: FETCH_MAX_BYTES + 16 MB, 56 MB with the
-      # defaults. noexec: nothing downloaded can be run.
+      # defaults. noexec: nothing downloaded can be run. Nothing a run writes
+      # here outlives it: after each run the runner, as PID 1, removes
+      # everything the run left in /tmp but the one audio file it holds for
+      # the fetcher (docs/PLAN.md 6.1).
       - /tmp:rw,noexec,nosuid,size=56m,mode=1777
     # prlimit bounds yt-dlp's CPU time, file size, open files and processes,
     # but not its address space, because Deno reserves a huge virtual range
     # at startup. This cgroup limit is what bounds the runner's memory, its
-    # /tmp pages included.
+    # /tmp pages included. yt-dlp's output doesn't add to it: the runner
+    # sends its stdout to /dev/null and keeps only the last 64 KiB of its
+    # stderr, however much a run prints.
     mem_limit: 512m
     # The cgroup's cap on processes and threads. prlimit's --nproc for yt-dlp
     # is RLIMIT_NPROC, which the kernel counts per UID across every container
