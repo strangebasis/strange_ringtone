@@ -370,6 +370,98 @@ class ContractLeftoverOutsideTest(BudgetServerTestCase):
                     self.server.exit_codes.clear()
 
 
+class ContractDeadlineWiringTest(BudgetServerTestCase):
+    """Under the contract: every step of the clean-up is given the one deadline, so it stops there, not later.
+
+    The tests above see an overrun only after the clean-up is over; these
+    see that each step of it was told when to stop. A step run without the
+    deadline would hold the answer as long as the step takes.
+    """
+
+    # Entries of the scratch directory a slowed removal takes far longer
+    # than the small budget to remove, and how long each removal takes.
+    STRAYS = 80
+    SLOW_UNLINK_SECONDS = 0.05
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Each call of remove_leftovers and remove_ipc_objects, with the
+        # deadline it was given and when it was called. The clean-up of the
+        # rest of /tmp and the IPC removal stay faked: neither runs here.
+        self.calls: list[tuple[str, float | None, float]] = []
+        self.strays_to_leave = 0
+        self.slow = False
+        faked_remove = runner_server.remove_leftovers
+
+        def remove(root: Path, keep: Path | None = None, **kwargs: Any) -> bool:
+            in_scratch = inside(root, self.scratch)
+            self.calls.append(("scratch" if in_scratch else "wide", kwargs.get("deadline"), time.monotonic()))
+            if in_scratch and self.strays_to_leave:
+                # What a run could leave: many entries, put there as the
+                # clean-up starts, so only its scratch pass meets them.
+                for index in range(self.strays_to_leave):
+                    (self.scratch / f"stray-{index}").write_bytes(LITTER_BYTES)
+                self.strays_to_leave = 0
+            return faked_remove(root, keep, **kwargs)
+
+        def remove_ipc(*args: Any, **kwargs: Any) -> None:
+            self.calls.append(("ipc", kwargs.get("deadline"), time.monotonic()))
+
+        cls = runner_server._DescriptorTree if runner_server._BY_DESCRIPTOR else runner_server._PathTree
+        real_unlink = cls.__dict__["unlink"]
+
+        def unlink(tree_: Any, handle: Any, name: str) -> None:
+            # Slowed as DeadlineTest slows it, but only for the strays.
+            if self.slow and name.startswith("stray-"):
+                time.sleep(self.SLOW_UNLINK_SECONDS)
+            real_unlink(tree_, handle, name)
+
+        for target, name, value in ((runner_server, "remove_leftovers", remove),
+                                    (runner_server, "remove_ipc_objects", remove_ipc),
+                                    (runner_server, "may_remove_ipc_objects", lambda *args, **kwargs: True),
+                                    (cls, "unlink", unlink)):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.under_the_contract()
+
+    def test_each_step_is_given_a_deadline_no_later_than_the_start_plus_the_budget(self) -> None:
+        started = time.monotonic()
+        response, _job = self.post_mode("ok")
+        self.assertEqual(response.json()["status"], "done", response.body)
+        self.assertEqual(exits(self.server), [])
+        self.assertEqual(sorted({step for step, _deadline, _at in self.calls}), ["ipc", "scratch", "wide"],
+                         self.calls)
+        for step, deadline, at in self.calls:
+            with self.subTest(step=step):
+                self.assertIsNotNone(deadline, f"the {step} step was given no deadline")
+                assert deadline is not None
+                # The deadline is the clean-up's own, set once as it starts:
+                # not before this job, and no later than its first step.
+                self.assertGreaterEqual(deadline, started + SMALL_BUDGET_SECONDS)
+                self.assertLessEqual(deadline, at + SMALL_BUDGET_SECONDS)
+
+    def test_a_slow_scratch_pass_stops_at_the_deadline_and_the_answer_comes_in_time(self) -> None:
+        self.log = LogCapture()
+        with contextlib.redirect_stderr(self.log):
+            self.strays_to_leave = self.STRAYS
+            self.slow = True
+            response, job = post_mode(self.port, self.ytdlp, "ok")
+            answered = time.monotonic()
+            at_answer = self.scratch_contents()
+            wait_for(lambda: not self.server.busy.locked(), "the runner to let go of its lock")
+            self.slow = False
+        first = min(at for step, _deadline, at in self.calls if step == "scratch")
+        # Removing every stray would take STRAYS x 0.05 s = 4 s; the answer
+        # comes once the budget is spent, with a margin for a busy machine.
+        self.assertLess(answered - first, SMALL_BUDGET_SECONDS + 1.0)
+        self.assertEqual(response.json(), FAILED)
+        self.assertEqual(exits(self.server), [exit_code()])
+        self.assertOneQuietLine(job)
+        # The pass stopped on its way: strays are still there at the answer.
+        self.assertTrue([name for name in at_answer if name.startswith("stray-")], at_answer)
+
+
 class OffContractTest(BudgetServerTestCase):
     """Anywhere else: the same failures fail the job, and the runner keeps serving."""
 
