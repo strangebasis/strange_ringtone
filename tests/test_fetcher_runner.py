@@ -138,6 +138,17 @@ class _TestRunnerServer(RunnerServer):
     # scratch directory when the temporary directory is removed.
     block_on_close = True
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.exit_codes: list[int] = []
+        super().__init__(*args, **kwargs)
+
+    def exit_for_restart(self, code: int) -> None:
+        # Never the real exit: a server that would end its process so that
+        # it is restarted (under the container's contract, which the image's
+        # tests really meet as PID 1) records the code instead, and no test
+        # ends its own process.
+        self.exit_codes.append(code)
+
 
 class _CappedRunnerServer(_TestRunnerServer):
     MAX_WORKERS = 1

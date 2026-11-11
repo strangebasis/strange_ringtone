@@ -63,6 +63,11 @@ what tools/dev_fetch_stack.py relies on.
                   a message queue holding a message and a semaphore set,
                   left behind when it exits 0. Only as the child of PID 1 on
                   Linux, like fill, so no developer's machine keeps them
+    tree          both files as "ok", then TREE_DIRECTORIES directories of
+                  TREE_FILES empty files each, in the job directory and
+                  beside the scratch directory; exit 0: a tree whose
+                  clean-up takes a while. Only as the child of PID 1 on
+                  Linux, like fill
 
 STRANGE_RINGTONE_YTDLP_STUB_LOG names a file each run appends one JSON line
 to: argv, working directory, environment and (on POSIX) resource limits.
@@ -88,6 +93,7 @@ MODES = (
     "ok", "too_long", "blocked", "not_found", "fail", "oversize", "no_audio", "ctrl_title", "huge_heatmap",
     "bad_heatmap", "bare_info", "not_a_dict", "symlink", "files_101", "files_1", "hang", "grandchild",
     "survivor", "loud", "loud_ok", "litter", "wedge", "lock_scratch", "displace", "strand", "fill", "sysv",
+    "tree",
 )
 # Eleven characters each, so they pass the fetcher's ID check.
 BY_ID = {
@@ -124,6 +130,11 @@ LITTER_NAME = "strange_ringtone_leftover"
 # "fill" writes files of at most this size, and at most FILL_FILES of them.
 FILL_FILE_BYTES = 8 * 1024 * 1024
 FILL_FILES = 512
+# "tree" leaves this many directories of this many empty files, twice: far
+# more than a clean-up removes in a few milliseconds, far less than it
+# removes in a second.
+TREE_DIRECTORIES = 50
+TREE_FILES = 100
 
 # The pinned list, with None where the value depends on the run.
 EXPECTED = [
@@ -310,12 +321,23 @@ def leave_ipc_objects() -> None:
         refuse(f"could not leave the IPC objects: errno {ctypes.get_errno()}")
 
 
+def leave_tree(job: Path) -> None:
+    """TREE_DIRECTORIES directories of TREE_FILES empty files, in the job directory and beside the scratch directory."""
+    for top in (job / "tree", job.parent.parent / f"{LITTER_NAME}_tree"):
+        top.mkdir()
+        for index in range(TREE_DIRECTORIES):
+            directory = top / f"d{index}"
+            directory.mkdir()
+            for name in range(TREE_FILES):
+                write_bytes(directory / f"f{name}", b"")
+
+
 def main(argv: list[str]) -> int:
     video_id, max_bytes, directory = parse(argv)
     mode = os.environ.get(MODE_VAR) or BY_ID.get(video_id, "ok")
     if mode not in MODES:
         refuse(f"unknown mode {mode!r}")
-    if mode in ("fill", "sysv") and (not sys.platform.startswith("linux") or os.getppid() != 1):
+    if mode in ("fill", "sysv", "tree") and (not sys.platform.startswith("linux") or os.getppid() != 1):
         refuse(f"{mode} runs only as the child of PID 1 in a throwaway container")
     log_run(argv)
     title = title_for(video_id)
@@ -441,6 +463,9 @@ def main(argv: list[str]) -> int:
         return 0
     if mode == "sysv":
         leave_ipc_objects()
+        return 0
+    if mode == "tree":
+        leave_tree(directory)
         return 0
     # A failed run that still left both files behind: the exit status wins.
     if mode == "files_101":
