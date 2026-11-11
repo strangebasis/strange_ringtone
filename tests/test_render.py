@@ -986,6 +986,39 @@ class GroupCollectionTest(StubTestCase):
         # Only the run's own group was asked about.
         self.assertEqual(asked, {(p_pgid, 4321)})
 
+    def test_dead_members_without_end_do_not_hold_the_request(self) -> None:
+        # The bound holds while members are being collected, too. A group
+        # that keeps handing over dead members (a process outside it that
+        # keeps putting short-lived ones into it) must not keep the request
+        # past COLLECT_SECONDS either.
+        class StillCollecting(Exception):
+            pass
+
+        proc = mock.Mock(spec=subprocess.Popen, pid=4321, returncode=0)
+        collected = 0
+        started = time.monotonic()
+
+        def waitid(idtype: int, ident: int, options: int) -> object:
+            nonlocal collected
+            if time.monotonic() - started > render.COLLECT_SECONDS + 5:
+                # Ends a collection that has no bound, so the test fails
+                # instead of hanging.
+                raise StillCollecting()
+            collected += 1
+            return object()
+
+        with mock.patch.object(render, "_orphans_come_here", return_value=True), \
+                mock.patch.object(render.os, "waitid", waitid, create=True), \
+                mock.patch.object(render.os, "P_PGID", getattr(os, "P_PGID", 2), create=True), \
+                mock.patch.object(render.os, "WEXITED", getattr(os, "WEXITED", 4), create=True), \
+                mock.patch.object(render.os, "WNOHANG", getattr(os, "WNOHANG", 1), create=True):
+            try:
+                render._collect_group(proc)
+            except StillCollecting:
+                self.fail("the collection kept collecting dead members past its bound")
+        self.assertLess(time.monotonic() - started, render.COLLECT_SECONDS + 0.5)
+        self.assertGreater(collected, 0)
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "waitid on a process group, as Linux has it")
     def test_a_leader_not_yet_waited_for_keeps_its_exit_status(self) -> None:
         # The leader is a member of its own group. Called before Popen has
