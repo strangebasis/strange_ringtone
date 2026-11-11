@@ -104,6 +104,32 @@ services:
       # the contract's formula (docs/PLAN.md 5.7): 64 MB fits the default
       # settings; MAX_CLIP_SECONDS=40 needs 84 MB.
       - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    # ffmpeg runs as the server's UID in this container, so this cgroup limit
+    # is what bounds the memory of the server, of every ffmpeg run and of
+    # anything an exploited run starts, the tmpfs pages above included.
+    # Measured in the image under the contract's flags: with two renders of
+    # a 30 s clip at once (the default MAX_CLIP_SECONDS and
+    # RENDER_CONCURRENCY), the cgroup's memory.current less its tmpfs pages
+    # and less the measuring client's own anonymous memory peaked at 41.1 MB,
+    # and the same with 40 s clips. Twice that, taken as 42 MiB, plus the 64m
+    # tmpfs is 148m, rounded up to 160m. Raise it with the tmpfs
+    # (MAX_CLIP_SECONDS=40's 84m tmpfs needs 168m or more), and measure again
+    # before raising RENDER_CONCURRENCY or MAX_WORKERS.
+    mem_limit: 160m
+    # The cgroup's cap on processes and threads. The image sets no process
+    # limit of its own: prlimit's --nproc would be RLIMIT_NPROC, which the
+    # kernel counts per UID across every container that runs as 10001, so
+    # this is the only bound on what ffmpeg starts. The worst case: the main
+    # thread, the health check, 16 request workers
+    # (RingtoneServer.MAX_WORKERS), the result sweeper, and one ffmpeg run
+    # for each of RENDER_CONCURRENCY renders (default 2; prlimit execs into
+    # ffmpeg). A run has 6 threads, as measured, because the renderer holds
+    # the filter graph to one: its main thread, demuxer, decoder, filter
+    # graph, encoder and muxer. So 1 + 1 + 16 + 1 + 2 x 6 = 31, and 64 is
+    # more than twice that. RENDER_CONCURRENCY has no upper bound in the
+    # settings: each render added adds 6 to the worst case, and this must
+    # stay at least twice it.
+    pids_limit: 64
     networks:
       - core
     # json-file with rotation: Docker keeps every line forever unless the

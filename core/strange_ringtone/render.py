@@ -94,7 +94,12 @@ SUMMARY_RE = re.compile(
 
 # Every run starts like this: no stdin, no banner or progress lines, one
 # thread, and local files only, whatever the binary was built with.
-_COMMON = ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-protocol_whitelist", "file"]
+# -threads covers only the codecs; the filter graph otherwise starts a thread
+# per usable CPU, so -filter_threads holds it to one as well. A run then has
+# the same number of threads on any host, which the container's pids_limit
+# counts (compose.example.yaml).
+_COMMON = ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-filter_threads", "1",
+           "-protocol_whitelist", "file"]
 
 
 class RenderError(Exception):

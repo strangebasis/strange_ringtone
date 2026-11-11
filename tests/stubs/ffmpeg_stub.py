@@ -57,7 +57,8 @@ INPUT_LUFS = -23.0
 INPUT_PEAK = -20.0
 OUTPUT_MAGIC = b"STUB-IPOD\n"
 
-COMMON = ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-protocol_whitelist", "file"]
+COMMON = ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-filter_threads", "1",
+          "-protocol_whitelist", "file"]
 MEASURE_TAIL = ["-af", "ebur128=peak=true", "-f", "null", "-"]
 CHAIN_RE = re.compile(
     r"volume=(-?[0-9]+\.[0-9]{2})dB"
