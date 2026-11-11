@@ -311,6 +311,65 @@ class ContractExitTest(BudgetServerTestCase):
         self.assertEqual(exits(self.server), [exit_code()])
 
 
+class ContractLeftoverOutsideTest(BudgetServerTestCase):
+    """Under the contract: what the clean-up leaves outside the scratch directory counts as left behind too."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # What a test asks of the steps outside the scratch directory: the
+        # clean-up of the rest of /tmp leaves something, or the removal of
+        # the System V IPC objects fails. Both are faked: neither runs here.
+        self.outside_left = False
+        self.ipc_failed = False
+        self.ipc_calls = 0
+        faked_remove = runner_server.remove_leftovers
+
+        def remove(root: Path, keep: Path | None = None, **kwargs: Any) -> bool:
+            done = faked_remove(root, keep, **kwargs)
+            if not inside(root, self.scratch) and self.outside_left:
+                return False
+            return done
+
+        def remove_ipc(*args: Any, **kwargs: Any) -> None:
+            self.ipc_calls += 1
+            if self.ipc_failed:
+                raise OSError("no IPC object could be removed")
+
+        for name, value in (("remove_leftovers", remove), ("remove_ipc_objects", remove_ipc),
+                            ("may_remove_ipc_objects", lambda *args, **kwargs: True)):
+            patcher = mock.patch.object(runner_server, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.under_the_contract()
+
+    def test_a_clean_up_with_both_steps_clean_answers_and_the_runner_stays(self) -> None:
+        # Control: the two faked steps alone change nothing for a clean run.
+        response, job = self.post_mode("ok")
+        self.assertEqual(response.json()["status"], "done", response.body)
+        self.assertEqual(self.audio(job).status, 200)
+        self.assertEqual(exits(self.server), [])
+        self.assertTrue(self.wide, "the faked contract did not reach the clean-up of the rest of /tmp")
+        self.assertEqual(self.ipc_calls, 1)
+        self.assertEqual(self.other_lines(), [])
+
+    def test_a_leftover_outside_or_a_failed_ipc_removal_fails_the_job_and_stops_the_runner(self) -> None:
+        for flag in ("outside_left", "ipc_failed"):
+            with self.subTest(failure=flag):
+                self.log = LogCapture()
+                with contextlib.redirect_stderr(self.log):
+                    setattr(self, flag, True)
+                    # A run that succeeded, and a scratch directory left clean:
+                    # only the step outside it failed.
+                    response, job = self.post_mode("ok")
+                    setattr(self, flag, False)
+                    self.assertEqual(response.json(), FAILED)
+                    self.assertEqual(exits(self.server), [exit_code()])
+                    self.assertOneQuietLine(job)
+                    self.assertJsonError(self.audio(job), 404, "not_found")
+                    self.assertHealthy()
+                    self.server.exit_codes.clear()
+
+
 class OffContractTest(BudgetServerTestCase):
     """Anywhere else: the same failures fail the job, and the runner keeps serving."""
 
