@@ -491,6 +491,19 @@ test("fetchAudio refuses a Content-Length over the cap without reading the body"
   assert.equal(small.seen.bytes, 0, "the body was read");
 });
 
+test("a body refused by its Content-Length is cancelled, not left downloading", async (t) => {
+  // Refusing without reading would otherwise leave the response open, and the
+  // rest of the audio still coming in, after the page has given up on it.
+  for (const [length, options] of [[64 * MIB + 1, undefined], [CAP + 1, { maxBytes: CAP }]]) {
+    const body = countedBody(50 * CAP);
+    fakeFetch(t, () => audioResponse(body.stream, length));
+    await rejectsWith(fetchAudio(JOB, options), TOO_LARGE);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(body.seen.bytes, 0, "the body was read");
+    assert.ok(body.seen.cancelled, "the refused body was not cancelled");
+  }
+});
+
 test("a body that keeps coming is cut off past the cap, holding at most one chunk more", async (t) => {
   // No Content-Length, and one that understates the body: the count of the
   // bytes as they arrive is what holds.

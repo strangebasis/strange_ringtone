@@ -957,6 +957,14 @@ test("a fetch replaced while its audio downloads leaves the newer fetch alone", 
 
 const OVER_CAP = 64 * 1024 * 1024 + 1;
 
+test("the picker's hint gives both limits a picked file must meet", async () => {
+  const page = await loadApp({ maxClipSeconds: "15" });
+  const hint = page.el("file-status").textContent;
+  assert.match(hint, /\b10 minutes\b/);
+  assert.match(hint, /\b64 MB\b/);
+  assert.equal(page.el("file-status").classes.has("error"), false);
+});
+
 test("a picked file over 64 MB is refused with words for it, before any of it is read", async () => {
   const page = await loadApp({ maxClipSeconds: "15" });
   setDecoded([SONG]);
