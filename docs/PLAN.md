@@ -216,15 +216,47 @@ nothing is left behind on any path (section 10).
 
 ffmpeg runs two or three times per render, each time as a subprocess with an
 argument list (never a shell). Every run is wrapped in the util-linux `prlimit`
-binary (address space, CPU seconds, file size, open files), which execs into
-ffmpeg, so the PID is unchanged. `preexec_fn` is not used: the stdlib documents
-it as unsafe in a threaded process, and this server is threaded. The child
-starts in its own session (`start_new_session=True`), `communicate()` enforces
-`RENDER_TIMEOUT_SECONDS`, and on timeout the whole process group is killed with
-`os.killpg` and reaped. `subprocess.run(timeout=…)` alone would kill only the
-direct child. Each run uses `-nostdin -hide_banner -nostats -threads 1
--protocol_whitelist file -f wav -i <job>/in.wav`, and each render run adds `-y`,
-because the corrective render overwrites `out.m4a`.
+binary (address space 512 MiB, CPU seconds, file size 4 MiB, open files), which
+execs into ffmpeg, so the PID is unchanged. `preexec_fn` is not used: the
+stdlib documents it as unsafe in a threaded process, and this server is
+threaded. The file-size limit is twice the largest legitimate output (40 s at
+33 kB/s is 1.32 MB), rounded up, so one runaway output can't fill the tmpfs
+that every upload and result shares (many files can, section 8); the renderer
+also refuses and removes an output over it after each render run, so the limit
+holds where `prlimit` is not in force (Windows, for development). Only a
+regular file is an output: a link, a FIFO or anything else at `out.m4a` fails
+the render and is removed, and removing a link leaves its target alone. There
+is no process limit (`--nproc`):
+that is `RLIMIT_NPROC`, which the kernel counts per UID across the whole host,
+and every container of the compose example runs as UID 10001, so it would bound
+nothing for this container alone. What bounds ffmpeg's processes and threads is
+the container's `pids_limit` (5.7). The child starts in its own session
+(`start_new_session=True`). The renderer reads both of its pipes to the end at
+once, drops stdout and keeps only the last 16 KiB of stderr, where the
+`ebur128` summary stands, so a run that prints without end can't grow the
+server's memory. `RENDER_TIMEOUT_SECONDS` bounds that read, and on a timeout
+the whole process group is killed with `os.killpg` and reaped.
+`subprocess.run(timeout=…)` alone would kill only the direct child. A run that
+ends by itself has its group killed too, before its exit status, its summary or
+its output is used, so a child it left in the group dies with it. A child whose
+parent has exited belongs to the process orphans go to. Where that is the
+server (Linux, with the server as its container's PID 1, as in the compose
+example, or as a child subreaper), each killed child would stay a zombie of the
+server, holding a slot of `pids_limit` until the container restarts. So after
+every group kill, once the run's own process has been waited for, the renderer
+collects the dead members of that run's group (`waitid` on the group), never
+any other child: another render's ffmpeg keeps its exit status. It waits at
+most 1 s for them; elsewhere it leaves them to the process they went to. A
+member that isn't dead by then, and a child that left the group with `setsid()`
+or `setpgid()`, which the group kill doesn't reach, keep their slots until the
+container restarts: alive, or, where the server is the process orphans go to,
+as zombies it never collects (section 8). Each run uses `-nostdin
+-hide_banner -nostats -threads 1 -filter_threads 1 -protocol_whitelist file -f
+wav -i <job>/in.wav`, and each render run adds `-y`, because the corrective
+render overwrites `out.m4a`. `-threads 1` covers only the codecs; without
+`-filter_threads 1` the filter graph starts a thread per usable CPU, and a
+run's thread count, which `pids_limit` must cover, would follow the host. With
+both, a run has 6 threads whatever the number of CPUs.
 
 1. **Measure:** `-af ebur128=peak=true -f null -`. A strict regex reads the
    integrated loudness and true peak from the summary. If parsing fails, the
@@ -367,7 +399,7 @@ the user types becomes the filename. Decision 9 keeps it readable:
 | Image | `ghcr.io/<owner>/strange_ringtone:<semver>`, consumed by digest, linux/amd64 |
 | User | UID 10001, GID 10001 (fixed, non-root) |
 | Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
-| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`. No egress needed (internal network). In `compose.example.yaml` (from 6.1's PR A) that network is also isolated from the Docker host (`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`, both, so the host stays off it if IPv6 is ever turned on for it; they need Docker Engine 28.0 or newer, the release that added those modes), so the reverse proxy must be a container on it, not a process on the host, and the log rotates (json-file, `max-size: 10m`, `max-file: 3`). |
+| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`, the `sysctls` `kernel.shmmni: 0`, `kernel.msgmni: 0` and `kernel.sem: "0 0 0 0"` (`ipc: none` leaves System V shared memory, message queues and semaphores open to create in the container's own IPC namespace; with these, `shmget`, `msgget` and `semget` fail), `pids_limit: 80` and `mem_limit: 160m`. The image sets no process limit of its own (5.3), so `pids_limit` is the only bound on what ffmpeg starts: at least twice the worst case of 37 threads (the main thread, 16 request workers, the result sweeper, 6 per ffmpeg run for each of `RENDER_CONCURRENCY` renders, and 7 for the health check, which Docker starts through its runtime's init process inside the container's cgroup; 37 is also the highest count measured); each render added to `RENDER_CONCURRENCY` needs 12 more. `mem_limit` holds the tmpfs, whose pages count against it, plus twice the 47.6 MB measured with two renders at once and the health check running: 90.8 MiB, and 154.8 MiB with the example's 64 MiB tmpfs (`size=64m`). Raise it with the tmpfs: `MAX_CLIP_SECONDS=40` measured 48.2 MB, and with an 84 MiB tmpfs needs 175.9 MiB, so `176m` at the least. No egress needed (internal network). In `compose.example.yaml` (from 6.1's PR A) that network is also isolated from the Docker host (`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`, both, so the host stays off it if IPv6 is ever turned on for it; they need Docker Engine 28.0 or newer, the release that added those modes), so the reverse proxy must be a container on it, not a process on the host, and the log rotates (json-file, `max-size: 10m`, `max-file: 3`). |
 | Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `(MAX_RESULTS + RENDER_CONCURRENCY) × MAX_CLIP_SECONDS × 33 kB + RENDER_CONCURRENCY × MAX_BODY_BYTES`: a result is 256 kbit/s AAC, at most 33 kB per second of clip with the MP4 overhead, and each running render also holds its upload. That is 63 MB with the defaults (use 64 MB) and 84 MB with `MAX_CLIP_SECONDS=40`. |
 | Health | `GET /healthz` returns 200 with an empty body |
 
@@ -1359,24 +1391,71 @@ risks" list of the core's own, with its reason. The fetcher image's list is
 - **An exploited ffmpeg.** The WAV check (5.2) and the minimal build (5.3)
   keep small what a client's bytes reach: the WAV demuxer, the PCM decoder
   and encoder, the filters, the AAC encoder and the MP4 and null muxers
-  (`core/ffmpeg/components.txt`). A memory-safety bug there would run as
-  the server's own UID in the server's container, unlike yt-dlp, which has
-  a container to itself (6.1). It could read and replace every upload in
-  flight and every stored tone. What it started could outlive the render
-  and stay until the container restarts: the renderer kills ffmpeg's
-  process group only on a timeout or an error, not after a run that exits
-  by itself, and `setsid()` leaves the group in any case. Where the host's
-  `kernel.yama.ptrace_scope` is 0 it could write into the server, which is
-  dumpable, and serve what it likes from `'self'`, which the CSP allows.
-  `prlimit` bounds each ffmpeg process's address space, CPU time, file size
-  and open files, not the number of processes, and `compose.example.yaml`
-  gives the core service no `mem_limit` and no `pids_limit` (the fetcher
-  image's three containers have both). It has no route out: the `core`
+  (`core/ffmpeg/components.txt`). The build uses FFmpeg's hardened toolchain
+  (a PIE with full RELRO, a stack protector and fortified libc calls), which
+  makes a memory-safety bug there harder to turn into running code. What is
+  built around each run (5.3): `prlimit` bounds each ffmpeg process's address
+  space, CPU time, file size and open files; the renderer kills the run's
+  process group when each run ends, before anything of it is used, collects
+  the members that kill killed where they come to the server (its
+  container's PID 1 in the compose example), accepts only a regular file as
+  the output, and keeps only a bounded tail of the run's output. The server
+  makes itself non-dumpable at start-up on Linux, so a process of its UID can
+  neither attach to it, whatever the host's `kernel.yama.ptrace_scope` says,
+  nor read its `/proc/<pid>/environ`, maps, open files or memory. A download
+  opens the stored tone without following a link in its name and without
+  blocking, and serves it only if it is a regular file of at most the 4 MiB
+  an output may hold, reading at most one byte more to find out; anything
+  else answers as a missing result.
+  `compose.example.yaml` gives the core service a `pids_limit` and a
+  `mem_limit` and turns System V IPC off (5.7); the image sets no process
+  limit of its own, so a deployment that drops `pids_limit` has no bound on
+  how many processes ffmpeg starts. The core has no route out: the `core`
   network reaches the reverse proxy's container, on every port that listens
-  there, and nothing else. Not built: a group kill at the end of every
-  render, as the runner does it, the two caps and a process limit for
-  ffmpeg, a non-dumpable server as the runner is, and a UID or a container
-  of ffmpeg's own.
+  there, and nothing else. What remains: ffmpeg still runs as the server's
+  own UID in the server's container, unlike yt-dlp, which has a container to
+  itself (6.1). A bug exploited there could read and replace every upload in
+  flight and every stored tone, and where `kernel.yama.ptrace_scope` is 0
+  attach to another render's ffmpeg, which exec makes dumpable again. A
+  replaced tone is served if what the download opens is a regular file of at
+  most 4 MiB: any bytes, or a hard link to another upload or tone on the
+  tmpfs. Only the tone's own name is opened without following a link: a
+  result's directory replaced by a link is followed, and the file found
+  there must pass the same check. A result's directory replaced by a link,
+  or made one the server can't delete, is never swept: it keeps its place
+  under `MAX_RESULTS` until the container restarts, so enough of them make
+  every render answer 503. A process it starts that calls `setsid()` or
+  `setpgid()` leaves the group the renderer kills and stays until the
+  container restarts, inside the caps, and so does a member of the group
+  that isn't dead within the collection's 1 s; where the server is PID 1,
+  each stays as a zombie once it dies. The core runs renders side by side,
+  so it can't sweep its UID's processes as the fetcher's runner does. Such
+  processes can hold every free slot of `pids_limit`: Docker then can't
+  start the health check, which fails, and no ffmpeg can start, so every
+  render fails, while `GET /healthz` still answers 200. As the server's UID
+  it can also signal the server. As its container's PID 1, as in the compose
+  example, the server ends on SIGTERM and SIGINT, the only signals it
+  handles (the kernel drops every other one, SIGKILL and SIGSTOP included,
+  to a PID namespace's init that has no handler for it); the example's
+  restart policy starts it again, and a restart forgets every stored tone
+  and upload in flight (5.5). Under an init, most signals end the server,
+  and SIGSTOP, SIGTSTP, SIGTTIN and SIGTTOU freeze it while its container
+  keeps running. It can lower the server's resource limits with `prlimit`,
+  which needs no capability against a process of its own UID whatever the
+  dumpable flag says, and its scheduling priority and CPU affinity: a low
+  enough limit on open files, address space or processes stops the server
+  answering at all, a file-size limit of 0 fails every upload, and a small
+  CPU-time limit every render, until the container restarts. It can end the
+  server through `mem_limit`: where the container can't swap (a host without
+  swap, or `memswap_limit` equal to `mem_limit`), processes each smaller than
+  the server that together reach the limit make the OOM killer choose the
+  server; and empty files on the tmpfs, whose number `size=` doesn't bound
+  and each of which costs memory, do it whatever the swap. It can fill the
+  tmpfs with files outside its job directory, each within the file-size
+  limit, and every upload then fails until stored results expire and free
+  their space, or until a restart where none were stored, while the files
+  it wrote stay; a restart removes them, because the restarted container
+  gets a new tmpfs. Not built: a UID or a container of ffmpeg's own.
 
 ## 9. Supply chain, CI and releases
 

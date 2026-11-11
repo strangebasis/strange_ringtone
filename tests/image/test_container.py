@@ -66,7 +66,7 @@ class UserTest(unittest.TestCase):
         self.assertTrue(os.access(PRLIMIT, os.X_OK))
         proc = subprocess.run(
             [
-                PRLIMIT, "--as=536870912", "--cpu=20", "--fsize=67108864", "--nofile=64", "--",
+                PRLIMIT, "--as=536870912", "--cpu=20", "--fsize=4194304", "--nofile=64", "--",
                 "python", "-I", "-c",
                 "import resource as r; print(*(r.getrlimit(k) for k in "
                 "(r.RLIMIT_AS, r.RLIMIT_CPU, r.RLIMIT_FSIZE, r.RLIMIT_NOFILE)))",
@@ -79,7 +79,7 @@ class UserTest(unittest.TestCase):
         )
         self.assertEqual(
             proc.stdout.split(),
-            ["(536870912,", "536870912)", "(20,", "20)", "(67108864,", "67108864)", "(64,", "64)"],
+            ["(536870912,", "536870912)", "(20,", "20)", "(4194304,", "4194304)", "(64,", "64)"],
         )
 
 

@@ -15,7 +15,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import tracemalloc
 import unittest
 from pathlib import Path
 from typing import Any
@@ -113,15 +115,17 @@ class ArgumentsTest(unittest.TestCase):
     def test_measure_args(self) -> None:
         self.assertEqual(
             measure_args(Path("job") / "in.wav"),
-            ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-protocol_whitelist", "file",
-             "-f", "wav", "-i", str(Path("job") / "in.wav"), "-af", "ebur128=peak=true", "-f", "null", "-"],
+            ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-filter_threads", "1",
+             "-protocol_whitelist", "file", "-f", "wav", "-i", str(Path("job") / "in.wav"),
+             "-af", "ebur128=peak=true", "-f", "null", "-"],
         )
 
     def test_render_args(self) -> None:
         source, output = Path("job") / "in.wav", Path("job") / "out.m4a"
         self.assertEqual(
             render_args(source, output, params(), 9.0),
-            ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-protocol_whitelist", "file", "-y",
+            ["-nostdin", "-hide_banner", "-nostats", "-threads", "1", "-filter_threads", "1",
+             "-protocol_whitelist", "file", "-y",
              "-f", "wav", "-i", str(source), "-af", CHAIN, "-ar", "44100", "-map_metadata", "-1",
              "-fflags", "+bitexact", "-metadata", "title=My Tone", "-c:a", "aac", "-b:a", "256k",
              "-movflags", "+faststart", "-f", "ipod", str(output)],
@@ -173,8 +177,11 @@ class ArgumentsTest(unittest.TestCase):
     def test_every_run_is_local_files_only_without_stdin(self) -> None:
         for args in (measure_args(Path("in.wav")), render_args(Path("in.wav"), Path("out.m4a"), params(), 0.0)):
             with self.subTest(args=args[-1]):
-                self.assertEqual(args[:7], ["-nostdin", "-hide_banner", "-nostats", "-threads", "1",
-                                            "-protocol_whitelist", "file"])
+                # One thread for the codecs and one for the filter graph,
+                # which would otherwise start a thread per usable CPU: the
+                # core's pids_limit counts a fixed number of threads per run.
+                self.assertEqual(args[:9], ["-nostdin", "-hide_banner", "-nostats", "-threads", "1",
+                                            "-filter_threads", "1", "-protocol_whitelist", "file"])
                 # The demuxer is named, never guessed from the content.
                 self.assertEqual(args[args.index("-i") - 2: args.index("-i")], ["-f", "wav"])
         self.assertNotIn("-y", measure_args(Path("in.wav")))
@@ -192,9 +199,22 @@ class CommandTest(unittest.TestCase):
         renderer = Renderer((FFMPEG,), 20, prlimit=(PRLIMIT,))
         self.assertEqual(
             renderer.full_command(["-nostdin"]),
-            ["/usr/bin/prlimit", "--as=536870912", "--cpu=20", "--fsize=67108864", "--nofile=64", "--",
+            ["/usr/bin/prlimit", "--as=536870912", "--cpu=20", "--fsize=4194304", "--nofile=64", "--",
              "/usr/local/bin/ffmpeg", "-nostdin"],
         )
+
+    def test_the_file_size_limit_fits_the_largest_output_and_no_more(self) -> None:
+        # The largest legitimate output: MAX_CLIP_SECONDS at its ceiling of
+        # 40, at the contract's sizing of 33,000 bytes per second (the 256k
+        # bitrate plus the container). At least twice that, so a real render
+        # never hits it, and a few MiB at most, so one runaway output can't
+        # fill the tmpfs every result shares.
+        largest = 40 * 33_000
+        self.assertEqual(render.BITRATE, "256k")
+        self.assertGreaterEqual(Limits().file_size_bytes, 2 * largest)
+        self.assertLessEqual(Limits().file_size_bytes, 8 * 1024 * 1024)
+        # The renderer's own default is the same limit.
+        self.assertEqual(Renderer((FFMPEG,), 20).limits.file_size_bytes, Limits().file_size_bytes)
 
     def test_cpu_limit_follows_the_timeout_unless_given(self) -> None:
         self.assertIn("--cpu=7", Renderer((FFMPEG,), 7, prlimit=(PRLIMIT,)).full_command([]))
@@ -496,15 +516,17 @@ class SubprocessGuardsTest(StubTestCase):
                 self.assertEqual(command[0], program)
                 self.assertIn(FFMPEG, command)
 
-    def test_communicate_has_the_wall_clock_timeout(self) -> None:
-        timeouts: list[float | None] = []
-        real = subprocess.Popen.communicate
+    def test_the_wait_has_the_wall_clock_timeout(self) -> None:
+        # render._collect(proc, timeout) reads both pipes and waits for the
+        # run, in place of communicate(), which would keep all of both.
+        timeouts: list[float] = []
+        real = render._collect
 
-        def recording(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None) -> Any:
+        def recording(proc: subprocess.Popen[bytes], timeout: float) -> bytes:
             timeouts.append(timeout)
-            return real(proc, input, timeout)
+            return real(proc, timeout)
 
-        with mock.patch.object(subprocess.Popen, "communicate", recording):
+        with mock.patch.object(render, "_collect", recording):
             Renderer(STUB_COMMAND, 17).render(self.job, params(duration=1.0))
         self.assertEqual(timeouts, [17, 17])
 
@@ -560,14 +582,14 @@ class TimeoutTest(StubTestCase):
     def test_the_kill_is_followed_by_a_bounded_drain(self) -> None:
         # The killed run is read to EOF and reaped, with the drain's own bound.
         self.set_mode("hang")
-        timeouts: list[float | None] = []
-        real = self.popen.communicate
+        timeouts: list[float] = []
+        real = render._collect
 
-        def recording(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None) -> Any:
+        def recording(proc: subprocess.Popen[bytes], timeout: float) -> bytes:
             timeouts.append(timeout)
-            return real(proc, input, timeout)
+            return real(proc, timeout)
 
-        with mock.patch.object(self.popen, "communicate", recording):
+        with mock.patch.object(render, "_collect", recording):
             with self.assertRaises(RenderError):
                 Renderer(STUB_COMMAND, 1).render(self.job, params(duration=1.0))
         self.assertEqual(timeouts, [1, 0.5])
@@ -609,14 +631,14 @@ class TimeoutTest(StubTestCase):
                 self.procs.clear()
                 pid_file.unlink(missing_ok=True)
 
-                def interrupted(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None,
-                                error: type[BaseException] = error) -> Any:
+                def interrupted(proc: subprocess.Popen[bytes], timeout: float,
+                                error: type[BaseException] = error) -> bytes:
                     # Only once the grandchild exists, so there is a group to kill.
                     read_pid(pid_file)
                     raise error()
 
                 started = time.monotonic()
-                with mock.patch.object(self.popen, "communicate", interrupted):
+                with mock.patch.object(render, "_collect", interrupted):
                     with self.assertRaises(error):
                         Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
                 grandchild = read_pid(pid_file, timeout=0)
@@ -639,21 +661,21 @@ class TimeoutTest(StubTestCase):
         # Not only a RenderError: whatever escapes the encoder after it has
         # written out.m4a (an interrupt at shutdown, an OSError from a pipe)
         # leaves no half-written output behind for anything to serve.
-        real_communicate = self.popen.communicate
+        real_collect = render._collect
         written: list[bool] = []
         for error in (KeyboardInterrupt, OSError):
             with self.subTest(error=error.__name__):
                 self.procs.clear()
                 written.clear()
 
-                def interrupted(proc: subprocess.Popen[bytes], input: Any = None, timeout: float | None = None,
-                                error: type[BaseException] = error) -> Any:
+                def interrupted(proc: subprocess.Popen[bytes], timeout: float,
+                                error: type[BaseException] = error) -> bytes:
                     # The run completes and writes its output first.
-                    real_communicate(proc, input, timeout)
+                    real_collect(proc, timeout)
                     written.append((self.job / "out.m4a").is_file())
                     raise error()
 
-                with mock.patch.object(self.popen, "communicate", interrupted):
+                with mock.patch.object(render, "_collect", interrupted):
                     with self.assertRaises(error):
                         Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=False, duration=1.0))
                 self.assertEqual(written, [True], "the stub never wrote out.m4a")
@@ -684,6 +706,489 @@ class TimeoutTest(StubTestCase):
         self.assertEqual(killpg.call_args[0][1], signal.SIGKILL)
 
 
+class RunEndKillTest(StubTestCase):
+    """Every run's process group is killed exactly once, on every path, before anything of the run is used."""
+
+    def record(self) -> list[str]:
+        """The kills and the summary reads of every run, in order; the real ones still happen."""
+        events: list[str] = []
+        real_kill, real_parse = render._kill_group, render.parse_summary
+
+        def kill(proc: subprocess.Popen[bytes]) -> None:
+            events.append("kill")
+            real_kill(proc)
+
+        def parse(stderr: str) -> Any:
+            events.append("parse")
+            return real_parse(stderr)
+
+        for patcher in (mock.patch.object(render, "_kill_group", kill),
+                        mock.patch.object(render, "parse_summary", parse),
+                        mock.patch.object(render, "DRAIN_SECONDS", 0.5)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return events
+
+    def test_the_group_is_killed_before_the_summary_is_read(self) -> None:
+        # A run that exited by itself may have left a child that closed its
+        # pipes; nothing of the run is read while that child could still
+        # write to the job directory.
+        events = self.record()
+        Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+        self.assertEqual(self.kinds(), ["measure", "render"])
+        self.assertEqual(events, ["kill", "parse", "kill", "parse"])
+
+    def test_the_group_is_killed_once_on_every_path(self) -> None:
+        cases = (
+            # mode, timeout, normalize, runs, the error the render ends with
+            ("ok", 20, True, 2, None),
+            ("unparsable", 20, False, 1, "render_failed"),
+            ("fail", 20, False, 1, "render_failed"),
+            ("late_fail", 20, False, 1, "render_failed"),
+            ("hang", 1, False, 1, "render_timeout"),
+        )
+        events = self.record()
+        for mode, timeout, normalize, runs, code in cases:
+            with self.subTest(mode=mode):
+                events.clear()
+                self.set_mode(mode)
+                try:
+                    Renderer(STUB_COMMAND, timeout).render(self.job, params(normalize=normalize, duration=1.0))
+                except RenderError as error:
+                    self.assertEqual(error.code, code)
+                else:
+                    self.assertIsNone(code)
+                self.assertEqual(events.count("kill"), runs, events)
+                self.assertEqual(events[0], "kill", events)
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "process groups are POSIX")
+    def test_a_child_left_behind_by_a_successful_run_is_killed(self) -> None:
+        # The stub leaves a sleeping child in its group after each pass, with
+        # its streams on the null device, so the pipes reach EOF at once.
+        self.set_mode("survivor")
+        result = Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+        # Acceptance: the render itself is a normal success.
+        self.assertEqual(result.measured_lufs, -14.0)
+        self.assertTrue(result.output.read_bytes().startswith(STUB_MAGIC))
+        pid_file = self.job / "survivors.pid"
+        self.assertTrue(pid_file.is_file(), "the stub never started its survivors")
+        survivors = [int(line) for line in pid_file.read_text(encoding="ascii").split()]
+        for pid in survivors:
+            self.addCleanup(kill_quietly, pid)
+        self.assertEqual(len(survivors), 2)
+        deadline = time.monotonic() + 2
+        while any(alive(pid) for pid in survivors) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual([pid for pid in survivors if alive(pid)], [], "a child of a successful run outlived it")
+
+
+class GroupCollectionTest(StubTestCase):
+    """After each group kill the dead members of that run's own group are collected, and no other process."""
+
+    def record(self) -> list[tuple[str, int | None]]:
+        """Each kill and each collection, with the leader's exit status at that moment; the real ones still run."""
+        events: list[tuple[str, int | None]] = []
+        real_kill, real_collect = render._kill_group, render._collect_group
+
+        def kill(proc: subprocess.Popen[bytes]) -> None:
+            events.append(("kill", proc.returncode))
+            real_kill(proc)
+
+        def collect(proc: subprocess.Popen[bytes]) -> None:
+            events.append(("collect", proc.returncode))
+            real_collect(proc)
+
+        for patcher in (mock.patch.object(render, "_kill_group", kill),
+                        mock.patch.object(render, "_collect_group", collect),
+                        mock.patch.object(render, "DRAIN_SECONDS", 0.5)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return events
+
+    def assertCollectedAfterEachKill(self, events: list[tuple[str, int | None]], runs: int) -> None:
+        self.assertEqual([name for name, _code in events], ["kill", "collect"] * runs, events)
+        for name, code in events:
+            if name == "collect":
+                # Popen has the leader's status already, so no collection can
+                # take it from Popen.
+                self.assertIsNotNone(code, "a group was collected before its leader was waited for")
+
+    def test_every_kill_is_followed_by_a_collection_once_the_leader_is_waited_for(self) -> None:
+        cases = (
+            # mode, timeout, normalize, runs, the error the render ends with
+            ("ok", 20, True, 2, None),
+            ("unparsable", 20, False, 1, "render_failed"),
+            ("fail", 20, False, 1, "render_failed"),
+            ("late_fail", 20, False, 1, "render_failed"),
+            ("hang", 1, False, 1, "render_timeout"),
+        )
+        events = self.record()
+        for mode, timeout, normalize, runs, code in cases:
+            with self.subTest(mode=mode):
+                events.clear()
+                self.set_mode(mode)
+                try:
+                    Renderer(STUB_COMMAND, timeout).render(self.job, params(normalize=normalize, duration=1.0))
+                except RenderError as error:
+                    self.assertEqual(error.code, code)
+                else:
+                    self.assertIsNone(code)
+                self.assertCollectedAfterEachKill(events, runs)
+
+    def test_an_interrupted_run_is_collected_too(self) -> None:
+        events = self.record()
+
+        def interrupted(proc: subprocess.Popen[bytes], timeout: float) -> bytes:
+            raise KeyboardInterrupt()
+
+        self.set_mode("hang")
+        with mock.patch.object(render, "_collect", interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=False, duration=1.0))
+        self.assertCollectedAfterEachKill(events, 1)
+
+    def test_nothing_is_collected_where_orphans_go_elsewhere(self) -> None:
+        # Not PID 1, no child subreaper, or not Linux: what a run leaves
+        # behind is another process's to collect, and the renderer doesn't
+        # even ask.
+        self.set_mode("survivor")
+        with mock.patch.object(render, "_orphans_come_here", return_value=False), \
+                mock.patch.object(render.os, "waitid", side_effect=AssertionError("waitid called"), create=True):
+            Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+        pid_file = self.job / "survivors.pid"
+        if pid_file.is_file():
+            for line in pid_file.read_text(encoding="ascii").split():
+                self.addCleanup(kill_quietly, int(line))
+
+    def test_where_orphans_come_to(self) -> None:
+        probe = render._orphans_come_here.__wrapped__
+        with mock.patch.object(render.sys, "platform", "win32"):
+            self.assertFalse(probe())
+        with mock.patch.object(render.sys, "platform", "linux"):
+            # PID 1 of its namespace (the compose example's server) inherits
+            # every orphan, and nothing else needs asking.
+            with mock.patch.object(render.os, "getpid", return_value=1), \
+                    mock.patch.object(render, "_is_child_subreaper", side_effect=AssertionError("asked")):
+                self.assertTrue(probe())
+            for subreaper in (False, True):
+                with self.subTest(subreaper=subreaper), \
+                        mock.patch.object(render.os, "getpid", return_value=4321), \
+                        mock.patch.object(render, "_is_child_subreaper", return_value=subreaper):
+                    self.assertEqual(probe(), subreaper)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "a child subreaper is Linux's")
+    def test_the_killed_members_are_collected_where_orphans_come_to_the_server(self) -> None:
+        # In the compose example the server is its container's PID 1, so what
+        # a run leaves behind becomes the server's child once the run's
+        # leader exits. Killed, such a child stays a zombie, holding a slot of
+        # pids_limit, until its parent collects it. A child subreaper inherits
+        # orphans the same way, so the render runs in one, which then reports
+        # whatever child the render left it.
+        for mode, timeout, outcome in (("survivor", 20, "ok"), ("grandchild", 1, "render_timeout")):
+            with self.subTest(mode=mode):
+                self.set_mode(mode)
+                for name in ("survivors.pid", "grandchild.pid", "out.m4a"):
+                    (self.job / name).unlink(missing_ok=True)
+                result = subprocess.run(
+                    [sys.executable, "-I", "-c", SUBREAPER_HELPER, str(helpers.CORE), str(self.job),
+                     json.dumps(STUB_COMMAND), str(timeout)],
+                    capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["outcome"], outcome)
+                self.assertTrue(report["started"], "the stub left no child behind")
+                self.assertEqual(report["left"], [], "the render left the server a child it never collected")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "waitid on a process group, as Linux has it")
+    def test_a_render_running_alongside_keeps_its_exit_status(self) -> None:
+        # The core runs renders side by side. Another render's ffmpeg that
+        # has exited and not yet been waited for is a child of the server
+        # too. A collection that took any child could take it, and that
+        # render would then read the status as 0, which is what Popen
+        # answers for a child already gone: a failed run would pass.
+        other = self.temp / "other"
+        other.mkdir()
+        valid_wav(other / "in.wav", 1.0)
+        exited, finished = threading.Event(), threading.Event()
+        outcome: list[str] = []
+        real_collect = render._collect
+
+        def collect(proc: subprocess.Popen[bytes], timeout: float) -> bytes:
+            if threading.current_thread() is alongside and not exited.is_set():
+                # Wait until the run has exited, without collecting it, and
+                # hold it there while the other render runs and collects.
+                os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+                exited.set()
+                finished.wait(60)
+            return real_collect(proc, timeout)
+
+        def render_alongside() -> None:
+            try:
+                Renderer(STUB_COMMAND, 20).render(other, params(normalize=False, duration=1.0))
+            except RenderError as error:
+                outcome.append(error.code)
+            else:
+                outcome.append("ok")
+
+        alongside = threading.Thread(target=render_alongside)
+        # Its run writes a summary and an output, then exits 1: only the
+        # exit status says it failed.
+        self.set_mode("late_fail")
+        with mock.patch.object(render, "_collect", collect), \
+                mock.patch.object(render, "_orphans_come_here", return_value=True):
+            alongside.start()
+            try:
+                self.assertTrue(exited.wait(30), "the render alongside never ran")
+                self.set_mode("survivor")
+                Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+            finally:
+                finished.set()
+                alongside.join(60)
+        pid_file = self.job / "survivors.pid"
+        if pid_file.is_file():
+            for line in pid_file.read_text(encoding="ascii").split():
+                self.addCleanup(kill_quietly, int(line))
+        self.assertEqual(outcome, ["render_failed"], "the render alongside lost its exit status")
+
+    def test_a_member_that_stays_alive_does_not_hold_the_request(self) -> None:
+        # A member the group kill hasn't ended yet is never reported by
+        # waitid, which answers None for as long as it lives. The collection
+        # gives up after COLLECT_SECONDS, so such a member can't hang the
+        # request whose run left it.
+        class StillWaiting(Exception):
+            pass
+
+        proc = mock.Mock(spec=subprocess.Popen, pid=4321, returncode=0)
+        # Windows has none of these; their Linux values stand in there.
+        p_pgid = getattr(os, "P_PGID", 2)
+        asked: set[tuple[int, int]] = set()
+        started = time.monotonic()
+
+        def waitid(idtype: int, ident: int, options: int) -> None:
+            asked.add((idtype, ident))
+            if time.monotonic() - started > render.COLLECT_SECONDS + 5:
+                # Ends a collection that has no bound, so the test fails
+                # instead of hanging.
+                raise StillWaiting()
+            return None
+
+        with mock.patch.object(render, "_orphans_come_here", return_value=True), \
+                mock.patch.object(render.os, "waitid", waitid, create=True), \
+                mock.patch.object(render.os, "P_PGID", p_pgid, create=True), \
+                mock.patch.object(render.os, "WEXITED", getattr(os, "WEXITED", 4), create=True), \
+                mock.patch.object(render.os, "WNOHANG", getattr(os, "WNOHANG", 1), create=True):
+            try:
+                render._collect_group(proc)
+            except StillWaiting:
+                self.fail("the collection kept waiting for a live member past its bound")
+        self.assertLess(time.monotonic() - started, render.COLLECT_SECONDS + 0.5)
+        # Only the run's own group was asked about.
+        self.assertEqual(asked, {(p_pgid, 4321)})
+
+    def test_dead_members_without_end_do_not_hold_the_request(self) -> None:
+        # The bound holds while members are being collected, too. A group
+        # that keeps handing over dead members (a process outside it that
+        # keeps putting short-lived ones into it) must not keep the request
+        # past COLLECT_SECONDS either.
+        class StillCollecting(Exception):
+            pass
+
+        proc = mock.Mock(spec=subprocess.Popen, pid=4321, returncode=0)
+        collected = 0
+        started = time.monotonic()
+
+        def waitid(idtype: int, ident: int, options: int) -> object:
+            nonlocal collected
+            if time.monotonic() - started > render.COLLECT_SECONDS + 5:
+                # Ends a collection that has no bound, so the test fails
+                # instead of hanging.
+                raise StillCollecting()
+            collected += 1
+            return object()
+
+        with mock.patch.object(render, "_orphans_come_here", return_value=True), \
+                mock.patch.object(render.os, "waitid", waitid, create=True), \
+                mock.patch.object(render.os, "P_PGID", getattr(os, "P_PGID", 2), create=True), \
+                mock.patch.object(render.os, "WEXITED", getattr(os, "WEXITED", 4), create=True), \
+                mock.patch.object(render.os, "WNOHANG", getattr(os, "WNOHANG", 1), create=True):
+            try:
+                render._collect_group(proc)
+            except StillCollecting:
+                self.fail("the collection kept collecting dead members past its bound")
+        self.assertLess(time.monotonic() - started, render.COLLECT_SECONDS + 0.5)
+        self.assertGreater(collected, 0)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "waitid on a process group, as Linux has it")
+    def test_a_leader_not_yet_waited_for_keeps_its_exit_status(self) -> None:
+        # The leader is a member of its own group. Called before Popen has
+        # waited for it, a collection of the group could take the leader's
+        # status, and Popen would then answer 0 for a child already gone:
+        # a failed run would pass. So the collection leaves such a group alone.
+        proc = subprocess.Popen([sys.executable, "-I", "-c", "raise SystemExit(3)"], start_new_session=True)
+        self.addCleanup(proc.wait, 10)
+        # Exited, and not waited for.
+        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+        self.assertIsNone(proc.returncode)
+        with mock.patch.object(render, "_orphans_come_here", return_value=True):
+            render._collect_group(proc)
+        self.assertEqual(proc.wait(timeout=10), 3)
+
+
+# Runs one render as a child subreaper (prctl PR_SET_CHILD_SUBREAPER, 36), then
+# reports any child it still has: a zombie the render didn't collect, or a
+# process it didn't kill. Arguments: core/, the job directory, the command as
+# JSON, the timeout in seconds.
+SUBREAPER_HELPER = """
+import ctypes, json, os, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from strange_ringtone.render import Renderer, RenderError, RenderParams
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0:
+    raise SystemExit("prctl(PR_SET_CHILD_SUBREAPER) failed")
+job = Path(sys.argv[2])
+params = RenderParams(fade_in=0.0, fade_out=0.0, normalize=True, target_lufs=-14.0, title="t", duration=1.0)
+try:
+    Renderer(tuple(json.loads(sys.argv[3])), int(sys.argv[4])).render(job, params)
+    outcome = "ok"
+except RenderError as error:
+    outcome = error.code
+started = (job / "survivors.pid").exists() or (job / "grandchild.pid").exists()
+left = []
+deadline = time.monotonic() + 5
+while True:
+    try:
+        found = os.waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        break
+    if found is not None:
+        left.append("zombie")
+        break
+    if time.monotonic() >= deadline:
+        left.append("alive")
+        break
+    time.sleep(0.05)
+print(json.dumps({"outcome": outcome, "started": started, "left": left}))
+"""
+
+
+class OutputKindTest(StubTestCase):
+    """Only a regular file is a result: anything else in its place is refused and removed, a link's target untouched."""
+
+    def render_with(self, make_output: str) -> RenderError:
+        # A run that ends like a good one, summary and all, but leaves
+        # something of its own choosing at the output's path.
+        script = f"import os, sys; out = sys.argv[-1]; {make_output}; sys.stderr.write({REAL_SUMMARY!r})"
+        renderer = Renderer((sys.executable, "-I", "-c", script), 20)
+        with self.assertRaises(RenderError) as raised:
+            renderer.render(self.job, params(normalize=False, duration=1.0))
+        return raised.exception
+
+    def test_a_link_as_the_output_is_refused(self) -> None:
+        # The job directory is writable by the UID ffmpeg runs as. A link
+        # there that the store kept would be opened by the server on
+        # download: its own /proc/self/maps, say, which no other process of
+        # its UID may read. The target here is a small regular file, so only
+        # the kind of the output itself can refuse it.
+        target = self.temp / "elsewhere.txt"
+        target.write_bytes(b"not the run's output\n")
+        probe = self.temp / "probe-link"
+        try:
+            os.symlink(target, probe)
+        except (OSError, NotImplementedError):
+            self.skipTest("this account can't create symlinks")
+        probe.unlink()
+        error = self.render_with(f"os.symlink({str(target)!r}, out)")
+        self.assertEqual(error.code, "render_failed")
+        self.assertEqual(self.job_names(), ["in.wav"])
+        self.assertEqual(target.read_bytes(), b"not the run's output\n")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs are POSIX")
+    def test_a_fifo_as_the_output_is_refused(self) -> None:
+        error = self.render_with("os.mkfifo(out)")
+        self.assertEqual(error.code, "render_failed")
+        self.assertEqual(self.job_names(), ["in.wav"])
+
+
+class OutputSizeTest(StubTestCase):
+    """An output over the file-size limit is refused and removed, also where prlimit is not in force."""
+
+    def test_an_output_over_the_limit_is_refused_and_removed(self) -> None:
+        # No prlimit here, as on Windows: only the renderer's own check after
+        # the run stands between an oversized file and the results store.
+        first = Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=False, duration=1.0))
+        size = first.output.stat().st_size
+        first.output.unlink()
+        self.assertLess(size, Limits().file_size_bytes)
+        # Exactly at the limit is what RLIMIT_FSIZE itself allows.
+        exact = Renderer(STUB_COMMAND, 20, limits=Limits(cpu_seconds=20, file_size_bytes=size))
+        self.assertEqual(exact.render(self.job, params(normalize=False, duration=1.0)).output.stat().st_size, size)
+        (self.job / "out.m4a").unlink()
+        small = Renderer(STUB_COMMAND, 20, limits=Limits(cpu_seconds=20, file_size_bytes=size - 1))
+        for normalize in (False, True):
+            with self.subTest(normalize=normalize):
+                with self.assertRaises(RenderError) as raised:
+                    small.render(self.job, params(normalize=normalize, duration=1.0))
+                self.assertEqual(raised.exception.code, "render_failed")
+                self.assertEqual(self.job_names(), ["in.wav"])
+
+
+class OutputBoundTest(StubTestCase):
+    """stdout is read and dropped and only a bounded tail of stderr is kept, so a flood can't fill memory."""
+
+    # The bound's own range: the ebur128 summary (some 600 bytes) and the
+    # lines after it fit many times over, and a megabyte is far more than a
+    # 40 s pass prints.
+    LEAST, MOST = 4 * 1024, 1024 * 1024
+
+    def test_the_bound_is_a_named_constant(self) -> None:
+        bound = getattr(render, "STDERR_TAIL_BYTES", None)
+        self.assertIsInstance(bound, int, "render.STDERR_TAIL_BYTES, the bytes of stderr kept, is missing")
+        assert isinstance(bound, int)
+        self.assertGreaterEqual(bound, self.LEAST)
+        self.assertLessEqual(bound, self.MOST)
+
+    def test_a_flood_is_read_to_its_end_but_only_the_tail_is_kept(self) -> None:
+        # The stub writes 24 MiB to each pipe in turns, then the summary. The
+        # render succeeds only if both pipes are read at once, and the summary
+        # is found in what was kept.
+        self.set_mode("flood")
+        kept: list[int] = []
+        real_parse = render.parse_summary
+
+        def recording(stderr: str) -> Any:
+            kept.append(len(stderr))
+            return real_parse(stderr)
+
+        with mock.patch.object(render, "parse_summary", recording):
+            result = Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+        self.assertEqual(self.kinds(), ["measure", "render"])
+        self.assertEqual(result.measured_lufs, -14.0)
+        self.assertEqual(len(kept), 2)
+        for length in kept:
+            self.assertLessEqual(length, self.MOST, f"kept {length} characters of stderr")
+        bound = getattr(render, "STDERR_TAIL_BYTES", None)
+        self.assertIsNotNone(bound, "render.STDERR_TAIL_BYTES is missing")
+        for length in kept:
+            self.assertLessEqual(length, bound)
+
+    def test_memory_stays_bounded_while_a_flood_is_read(self) -> None:
+        # Measured, not inferred from the code: whatever reads the pipes, the
+        # Python memory the render allocates stays far under one stream's
+        # flood.
+        if tracemalloc.is_tracing():
+            self.skipTest("tracemalloc is already in use")
+        self.set_mode("flood")
+        tracemalloc.start()
+        try:
+            Renderer(STUB_COMMAND, 20).render(self.job, params(normalize=False, duration=1.0))
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 8 * 1024 * 1024, f"the render held {peak} bytes while reading the flood")
+
+
 @unittest.skipUnless(sys.platform.startswith("linux") and os.path.exists(PRLIMIT), "util-linux prlimit")
 class PrlimitTest(StubTestCase):
     def test_the_run_has_the_limits(self) -> None:
@@ -693,9 +1198,51 @@ class PrlimitTest(StubTestCase):
             self.assertEqual(run["limits"], {
                 "RLIMIT_AS": 512 * 1024 * 1024,
                 "RLIMIT_CPU": 20,
-                "RLIMIT_FSIZE": 64 * 1024 * 1024,
+                "RLIMIT_FSIZE": 4 * 1024 * 1024,
                 "RLIMIT_NOFILE": 64,
             })
+
+
+class CollectedRunTest(StubTestCase):
+    """A run that ended by itself is reaped and leaves no pipe open, so a busy server doesn't leak descriptors."""
+
+    def test_every_run_is_reaped_with_its_pipes_closed(self) -> None:
+        procs: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def recording(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+            proc = real_popen(*args, **kwargs)
+            procs.append(proc)
+            return proc
+
+        for mode in ("ok", "flood"):
+            with self.subTest(mode=mode):
+                procs.clear()
+                self.set_mode(mode)
+                with mock.patch.object(render.subprocess, "Popen", recording):
+                    Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+                self.assertEqual(len(procs), 2)
+                for proc in procs:
+                    self.assertEqual(proc.returncode, 0)
+                    assert proc.stdout is not None and proc.stderr is not None
+                    self.assertTrue(proc.stdout.closed, "stdout left open")
+                    self.assertTrue(proc.stderr.closed, "stderr left open")
+
+    def test_only_the_end_of_stderr_is_kept(self) -> None:
+        # The tail, not the head: what precedes the bound is dropped, and the
+        # last byte the run wrote is the last byte kept.
+        script = (
+            "import sys; err = sys.stderr.buffer; "
+            "err.write(b'a' * 100000); err.write(b'b' * 1000); err.write(b'END'); err.flush()"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-c", script],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        kept = render._collect(proc, 20)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(len(kept), render.STDERR_TAIL_BYTES)
+        self.assertTrue(kept.endswith(b"b" * 1000 + b"END"))
 
 
 if __name__ == "__main__":

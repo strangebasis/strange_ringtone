@@ -146,6 +146,17 @@ class BuildConfigurationTest(unittest.TestCase):
                 self.assertIn(flag, flags)
         self.assertFalse([flag for flag in flags if flag.startswith("--enable-") and "gpl" in flag])
 
+    def test_configure_line_asks_for_the_hardened_toolchain(self) -> None:
+        # ffmpeg parses bytes a client sent: PIE, full RELRO, a stack
+        # protector and fortified calls make a memory-safety bug there harder
+        # to exploit. tests/image/test_ffmpeg_hardening.py checks the linked
+        # binary itself; this pins the request in the committed line and in
+        # what the binary reports it was configured with.
+        self.assertIn("--toolchain=hardened", committed_flags())
+        text = listing("-buildconf")
+        reported = [line.strip() for line in text.partition("configuration:")[2].splitlines()]
+        self.assertIn("--toolchain=hardened", reported)
+
     def test_every_enabled_component_is_in_the_allowlist(self) -> None:
         allowed = allowlist()
         for flag in committed_flags():

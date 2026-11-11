@@ -27,6 +27,15 @@
 --disable-x86asm
 --enable-static
 --disable-shared
+# This binary parses bytes a client sent, so a memory-safety bug in it is the
+# core's likeliest way in. FFmpeg's hardened toolchain builds a position-
+# independent executable (-fPIE -pie) with full RELRO (-z relro -z now), a
+# stack protector in every function (-fstack-protector-all), fortified libc
+# calls (-D_FORTIFY_SOURCE=2) and no optimisation that assumes signed
+# overflow can't happen (-fno-strict-overflow). These make such a bug harder
+# to turn into running code. tests/image/test_ffmpeg_hardening.py checks the
+# linked binary.
+--toolchain=hardened
 # Input: the PCM WAV the browser made, checked by content before ffmpeg runs.
 --enable-demuxer=wav
 --enable-decoder=pcm_s16le
