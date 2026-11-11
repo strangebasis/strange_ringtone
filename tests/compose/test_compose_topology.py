@@ -106,23 +106,33 @@ JOB_THREADS = 2
 CLIENT_THREADS = 1
 RUNNER_THREADS = 1
 YTDLP_RUN_THREADS = 1 + 1 + 2 + 63
-# The core's worst case, besides its main thread, the health check's process
-# and its request workers (RingtoneServer.MAX_WORKERS): the result sweeper,
-# and for each of RENDER_CONCURRENCY renders one ffmpeg run (prlimit execs
-# into ffmpeg, so a run is one process). ffmpeg 8's command line runs a
+# The core's worst case, besides its request workers
+# (RingtoneServer.MAX_WORKERS): its main thread, the health check, the result
+# sweeper, and for each of RENDER_CONCURRENCY renders one ffmpeg run (prlimit
+# execs into ffmpeg, so a run is one process). ffmpeg 8's command line runs a
 # thread each for itself, its demuxer, decoder, filter graph, encoder and
 # muxer: 6, measured in the image during a real render
 # (tests/image/test_core_threads.py checks it). That holds only because the
 # filter graph is held to one thread; without that it starts a pool of one
-# thread per usable CPU.
+# thread per usable CPU. Docker starts the health check, as it starts every
+# docker exec, through its runtime's init process (runc:[2:INIT]), which runs
+# inside the container's cgroup before it execs the command. Measured in the
+# image under the compose example's flags, with the health check run back to
+# back during two renders and 16 busy workers: that process had 6 threads,
+# at times 7, and the cgroup's pids.peak was 36 or 37 over sixteen runs. So
+# the core counts the health check as 7, not as one process.
+CORE_MAIN_THREADS = 1
+CORE_HEALTH_CHECK_THREADS = 7
 CORE_SWEEPER_THREADS = 1
 FFMPEG_RUN_THREADS = 6
 # The core's memory with two renders of a 30 s clip (the default
-# MAX_CLIP_SECONDS) running at once, measured in the image under the
-# contract flags: the cgroup's memory.current less its shmem (the tmpfs) and
-# less the measuring process's own anonymous memory peaked at 41.3 MB, here
-# rounded up to 42 MiB. The tmpfs pages count against the same cgroup.
-CORE_MEASURED_PEAK_BYTES = 42 * 1024 * 1024
+# MAX_CLIP_SECONDS) running at once and the health check run back to back
+# inside the container, measured in the image under the compose example's
+# flags from a client outside the container's cgroup: the cgroup's
+# memory.current less its shmem (the tmpfs) peaked at 47.6 MB (47,620,096
+# bytes) over eight runs, here rounded up to 47.7 MB. The tmpfs pages count
+# against the same cgroup.
+CORE_MEASURED_PEAK_BYTES = 47_700_000
 # Docker's size suffixes are binary: 64m is 64 MiB.
 _SIZE_UNITS = {"": 1, "b": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
 # ICMP redirects (compose.example.yaml). With forwarding off the kernel takes a
@@ -211,7 +221,8 @@ def _core_worst_case_threads() -> int:
     from strange_ringtone.server import RingtoneServer
 
     concurrency = Settings.from_env({"PUBLIC_ORIGIN": ORIGIN}).render_concurrency
-    return SERVICE_FIXED_THREADS + RingtoneServer.MAX_WORKERS + CORE_SWEEPER_THREADS + concurrency * FFMPEG_RUN_THREADS
+    return (CORE_MAIN_THREADS + CORE_HEALTH_CHECK_THREADS + RingtoneServer.MAX_WORKERS + CORE_SWEEPER_THREADS
+            + concurrency * FFMPEG_RUN_THREADS)
 
 
 def _size_bytes(value: object) -> int:
