@@ -1225,19 +1225,24 @@ class RunnerServer(http.server.ThreadingHTTPServer):
         # a test can make the budget small.
         deadline = time.monotonic() + CLEANUP_BUDGET_SECONDS
         clean = _remove_leftovers_quietly(scratch, keep, deadline)
+        # Whether everything outside the scratch directory went: a second
+        # pass below looks at the scratch directory only, so this is kept
+        # apart and still counts after it.
+        outside = True
         if self._clean_all_of_tmp:
             # The rest of the container's own tmpfs, only under the contract
             # (may_clean_all_of_tmp): anything of the run's outside the
             # scratch directory, which stays whole. Before the scratch
             # directory is made again, so a tmpfs the run filled has room.
-            clean = _remove_leftovers_quietly(scratch.parent, scratch, deadline) and clean
+            outside = _remove_leftovers_quietly(scratch.parent, scratch, deadline)
         if self._remove_ipc_objects:
             # What the run left that is no file: its System V IPC objects,
             # which would keep their memory charged to this container.
             try:
                 remove_ipc_objects(deadline=deadline)
             except Exception:
-                clean = False
+                outside = False
+        clean = clean and outside
         try:
             restore_scratch(scratch)
             usable = True
@@ -1246,11 +1251,11 @@ class RunnerServer(http.server.ThreadingHTTPServer):
         if usable and not clean:
             # A scratch directory the run moved aside or replaced was not
             # there to be emptied, and has just been made again; whatever
-            # else the first pass could not remove is tried once more, and
-            # results/, which that pass removes when no result is held, is
-            # made again after it. Whatever is still left now counts as left
-            # behind.
-            clean = _remove_leftovers_quietly(scratch, keep, deadline)
+            # else the first pass could not remove in it is tried once more,
+            # and results/, which that pass removes when no result is held,
+            # is made again after it. Whatever is still left now, in it or
+            # outside it, counts as left behind.
+            clean = _remove_leftovers_quietly(scratch, keep, deadline) and outside
             try:
                 restore_scratch(scratch)
             except Exception:
