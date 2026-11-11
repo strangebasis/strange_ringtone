@@ -12,7 +12,11 @@ As its container's PID 1, it also turns on the sweep that kills and reaps
 whatever a yt-dlp run leaves behind (strange_ringtone_runner.ytdlp). Where
 the sweep can't run (started under an init, say) it refuses to start (exit
 4) unless FETCH_ALLOW_NO_SWEEP=true, and with that override it says on
-stderr that it serves without the sweep.
+stderr that it serves without the sweep. Once serving as PID 1, the runner
+exits with code 5 (strange_ringtone_runner.server.EXIT_CLEAN_UP_FAILED)
+when the clean-up after a run overran its budget, left something behind or
+could not make the scratch directory usable again, so that the restart
+policy starts a clean container.
 
 A mirror of strange_ringtone_fetch.__main__, line for line, under the
 runner's name, plus the non-dumpable step and the sweep decision: the

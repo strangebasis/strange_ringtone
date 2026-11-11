@@ -65,6 +65,18 @@ COLLECT_DEADLINE_SECONDS = 60.0
 SWEEP_INTERVAL_SECONDS = 5.0
 CHUNK_BYTES = 65536
 RESULTS_DIR = "results"
+# How long the whole clean-up after a run may take: the scratch directory,
+# the rest of /tmp, the System V IPC objects and the restore of the scratch
+# directory share it. The fetcher's client waits FETCH_TIMEOUT_SECONDS and
+# POST_GRACE_SECONDS for the answer (strange_ringtone_fetch.runner_client),
+# which leaves this after the drain and the two reaps, with a margin.
+CLEANUP_BUDGET_SECONDS = 3.0
+# The runner's exit code when, under the container's contract, the clean-up
+# after a run overran its budget, left something behind or could not make
+# the scratch directory usable again. Distinct from the entry's 1 to 4, so
+# an operator can tell them apart; the restart policy then starts a clean
+# container.
+EXIT_CLEAN_UP_FAILED = 5
 NO_STORE = "no-store"
 _LOG_PATH_MAX = 200
 _LOG_METHOD_MAX = 16
@@ -366,7 +378,7 @@ def _remove(tree: _DescriptorTree, handle: Any, name: str, entry: os.stat_result
     return False
 
 
-def remove_leftovers(root: Path, keep: Path | None = None) -> bool:
+def remove_leftovers(root: Path, keep: Path | None = None, deadline: float | None = None) -> bool:
     """Remove everything inside root but keep and the directories on the way to it; whether nothing else is left.
 
     root itself stays. keep is kept whole as a plain directory, or kept as a
@@ -382,7 +394,8 @@ def remove_leftovers(root: Path, keep: Path | None = None) -> bool:
     limit stops it on a deep tree, and each listing reads a directory
     whole, however many entries it has. What depth still costs is time and
     a little memory
-    for each level it is down.
+    for each level it is down. Once time.monotonic() reaches deadline, if
+    one is given, it stops where it is: False, with the rest left in place.
     """
     try:
         info = os.lstat(root)
@@ -418,6 +431,10 @@ def remove_leftovers(root: Path, keep: Path | None = None) -> bool:
         _make_usable(tree, handle, opened)
         stack = [_Frame(_identity(info), "", path_to_keep, remove=False)]
         while stack:
+            if deadline is not None and time.monotonic() >= deadline:
+                # Out of time: a tree a run made to outlast the clean-up
+                # must not hold the answer past the fetcher's deadline.
+                return False
             frame = stack[-1]
             if not frame.pending:
                 try:
@@ -493,6 +510,15 @@ def remove_leftovers(root: Path, keep: Path | None = None) -> bool:
     finally:
         tree.close(handle)
     return clean
+
+
+def _remove_leftovers_quietly(root: Path, keep: Path | None, deadline: float) -> bool:
+    # remove_leftovers for the clean-up after a run: anything it raises means
+    # that something may be left.
+    try:
+        return remove_leftovers(root, keep=keep, deadline=deadline)
+    except Exception:
+        return False
 
 
 def restore_scratch(directory: Path) -> None:
@@ -588,7 +614,7 @@ def _ipc_ids(listing: Path) -> list[int]:
     return [int(fields[1]) for fields in (line.split() for line in lines) if len(fields) > 1 and fields[1].isdigit()]
 
 
-def remove_ipc_objects(listing: Path = SYSV_IPC) -> None:
+def remove_ipc_objects(listing: Path = SYSV_IPC, deadline: float | None = None) -> None:
     """Remove every System V shared memory segment, message queue and semaphore set this user may remove.
 
     A run has the runner's UID and can leave such objects: neither a file
@@ -596,14 +622,25 @@ def remove_ipc_objects(listing: Path = SYSV_IPC) -> None:
     the container's memory limit until it is removed, enough to make every
     later run fail for want of memory. Only under the container's contract
     (may_remove_ipc_objects). The kernel refuses another user's object,
-    which stays; one already gone is no error.
+    which stays; one already gone is no error. Once time.monotonic()
+    reaches deadline, if one is given, the rest stays.
     """
     libc = ctypes.CDLL(None, use_errno=True)
+
+    def in_time() -> bool:
+        return deadline is None or time.monotonic() < deadline
+
     for ident in _ipc_ids(listing / "shm"):
+        if not in_time():
+            return
         libc.shmctl(ident, _IPC_RMID, None)
     for ident in _ipc_ids(listing / "msg"):
+        if not in_time():
+            return
         libc.msgctl(ident, _IPC_RMID, None)
     for ident in _ipc_ids(listing / "sem"):
+        if not in_time():
+            return
         # The second argument, a semaphore's number, means nothing to IPC_RMID.
         libc.semctl(ident, 0, _IPC_RMID)
 
@@ -1021,6 +1058,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload = server._run(video_id, job)
             self.send_json(200, payload)
         finally:
+            if server.exit_after_answer:
+                # The clean-up failed under the container's contract: after
+                # the answer, or after failing to write it, and with the lock
+                # still held, so no other job starts in what the run left.
+                # The process ends here, and the closed connection is what
+                # the fetcher's client waits for.
+                server.exit_for_restart(EXIT_CLEAN_UP_FAILED)
             # After the answer is written, so no other run can start before
             # this one's files are settled; before the connection is closed,
             # and the fetcher's client waits for that close before its GET for
@@ -1089,6 +1133,9 @@ class RunnerServer(http.server.ThreadingHTTPServer):
         self._clean_all_of_tmp = may_clean_all_of_tmp(settings.scratch_dir, sweep_strays)
         # And whether it may empty the IPC namespace, under the same contract.
         self._remove_ipc_objects = may_remove_ipc_objects(settings.scratch_dir, sweep_strays)
+        # Set by a run whose clean-up failed under the contract: the runner
+        # exits once that run's answer is written (Handler._run_job).
+        self.exit_after_answer = False
         # Held by a run or a stream: the one-job-at-a-time rule (R1, R3).
         self.busy = threading.Lock()
         self._workers = threading.BoundedSemaphore(self.MAX_WORKERS)
@@ -1116,9 +1163,12 @@ class RunnerServer(http.server.ThreadingHTTPServer):
 
         Only the job's own result, when the run produced one, is still in
         the scratch directory once this returns, as far as the clean-up
-        could remove the rest.
+        could remove the rest within its budget; when it could not, the
+        payload is failed, and under the container's contract
+        exit_after_answer is set.
         """
         results = self.results
+        self.exit_after_answer = False
         # Before yt-dlp writes anything: no uncollected result exists while a
         # download arrives, so the tmpfs holds one audio file at most (R3).
         results.discard_all()
@@ -1150,55 +1200,79 @@ class RunnerServer(http.server.ThreadingHTTPServer):
             usable = self._clean_up(held)
         if not usable:
             # Fail closed: a result is only ever served from a scratch
-            # directory that is the runner's again.
+            # directory that is the runner's again, and that nothing of the
+            # run is left in.
             results.discard_all()
             return {"status": "failed", "error": "failed"}
         return payload
 
     def _clean_up(self, job: str | None) -> bool:
-        """Remove everything a run left; whether the scratch directory is usable and holds job's result, if any.
+        """Remove everything a run left, within the budget; whether all of it went and job's result is in place.
 
         A run has the runner's UID and could write anywhere in its /tmp: a
         file where results/ should be, a directory it took the permissions
         off, a full tmpfs. All of it in the scratch directory goes, except
         the result the runner holds for this job, and under the container's
         contract the rest of /tmp and the run's System V IPC objects too, so
-        no later job fails because of it.
+        no later job fails because of it. All of it within
+        CLEANUP_BUDGET_SECONDS. A clean-up that overran, left something or
+        could not make the scratch directory usable again writes one line
+        to stderr, and under the contract sets exit_after_answer.
         """
         scratch = self.settings.scratch_dir
         keep = scratch / RESULTS_DIR / f"{job}.m4a" if job is not None else None
-        try:
-            remove_leftovers(scratch, keep=keep)
-        except Exception:
-            # What is left is retried after the next run; whether the
-            # directory is usable is decided below.
-            pass
+        # One deadline for every step below, read from the module now, so
+        # a test can make the budget small.
+        deadline = time.monotonic() + CLEANUP_BUDGET_SECONDS
+        clean = _remove_leftovers_quietly(scratch, keep, deadline)
         if self._clean_all_of_tmp:
             # The rest of the container's own tmpfs, only under the contract
             # (may_clean_all_of_tmp): anything of the run's outside the
             # scratch directory, which stays whole. Before the scratch
             # directory is made again, so a tmpfs the run filled has room.
-            try:
-                remove_leftovers(scratch.parent, keep=scratch)
-            except Exception:
-                pass
+            clean = _remove_leftovers_quietly(scratch.parent, scratch, deadline) and clean
         if self._remove_ipc_objects:
             # What the run left that is no file: its System V IPC objects,
             # which would keep their memory charged to this container.
             try:
-                remove_ipc_objects()
+                remove_ipc_objects(deadline=deadline)
             except Exception:
-                pass
+                clean = False
         try:
             restore_scratch(scratch)
             usable = True
         except Exception:
             usable = False
-        if not usable:
-            # One line, with no token, ID or title in it. The runner keeps
-            # serving and /healthz stays as it is; docs/PLAN.md 6.1 says what
-            # that leaves.
-            sys.stderr.write("after a run the scratch directory could not be made usable again: the job failed\n")
+        if usable and not clean:
+            # A scratch directory the run moved aside or replaced was not
+            # there to be emptied, and has just been made again; whatever
+            # else the first pass could not remove is tried once more, and
+            # results/, which that pass removes when no result is held, is
+            # made again after it. Whatever is still left now counts as left
+            # behind.
+            clean = _remove_leftovers_quietly(scratch, keep, deadline)
+            try:
+                restore_scratch(scratch)
+            except Exception:
+                usable = False
+        in_time = time.monotonic() < deadline
+        if not (usable and clean and in_time):
+            # One line, with no token, ID or title in it; /healthz stays as
+            # it is. Under the container's contract the runner then exits
+            # (exit_after_answer), so that the restart policy starts a clean
+            # container; anywhere else it keeps serving, and docs/PLAN.md,
+            # section 6.1, says what that leaves.
+            if not usable:
+                reason = "the scratch directory could not be made usable again"
+            elif not in_time:
+                reason = f"the clean-up took longer than its {CLEANUP_BUDGET_SECONDS:g} s"
+            else:
+                reason = "the clean-up could not remove everything the run left"
+            restart = ""
+            if self._clean_all_of_tmp:
+                self.exit_after_answer = True
+                restart = f", and the runner exits ({EXIT_CLEAN_UP_FAILED}) to be restarted clean"
+            sys.stderr.write(f"after a run {reason}: the job failed{restart}\n")
             return False
         if keep is not None:
             # A run that put a link in place of the scratch directory or of
@@ -1210,6 +1284,21 @@ class RunnerServer(http.server.ThreadingHTTPServer):
             except OSError:
                 return False
         return True
+
+    def exit_for_restart(self, code: int) -> None:
+        """End this process at once with code, stderr flushed first; never returns.
+
+        For a runner whose clean-up failed under the container's contract:
+        as PID 1 its exit ends the container, and the restart policy starts
+        a new one with an empty /tmp. os._exit, not SystemExit: it is called
+        on a request's thread, where SystemExit would end only that thread,
+        and nothing that a clean shutdown would wait for may delay it.
+        """
+        try:
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+        os._exit(code)
 
     def _sweep_forever(self, interval: float) -> None:
         while not self._sweeper_stop.wait(interval):
