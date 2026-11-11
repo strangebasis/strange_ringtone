@@ -19,6 +19,7 @@ the real kill(-1) does.
 from __future__ import annotations
 
 import contextlib
+import errno
 import inspect
 import os
 import shutil
@@ -422,7 +423,18 @@ class RemoveLeftoversTest(TempTestCase):
         for name in ("d", "deep-directory"):
             with self.subTest(name=name):
                 self.addCleanup(remove_chain, self.root, name)
-                make_chain(self.root, name, depth)
+                try:
+                    make_chain(self.root, name, depth)
+                except OSError as error:
+                    if name == "d" or error.errno != errno.ENAMETOOLONG:
+                        raise
+                    # A security module that checks whole paths refuses to
+                    # make one past its own limit, whatever it is made
+                    # relative to: AppArmor does, under Docker's default
+                    # profile, with ENAMETOOLONG. No run can build such a
+                    # tree there either. A run outside such a container
+                    # still builds this one and removes it.
+                    self.skipTest("this host refuses to make a path this long (ENAMETOOLONG)")
                 self.assertIs(self.remove(), True)
                 self.assertEqual(os.listdir(self.root), [])
 
