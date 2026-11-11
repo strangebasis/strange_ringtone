@@ -106,6 +106,40 @@ JOB_THREADS = 2
 CLIENT_THREADS = 1
 RUNNER_THREADS = 1
 YTDLP_RUN_THREADS = 1 + 1 + 2 + 63
+# The core's worst case, besides its request workers
+# (RingtoneServer.MAX_WORKERS): its main thread, the health check, the result
+# sweeper, and for each of RENDER_CONCURRENCY renders one ffmpeg run (prlimit
+# execs into ffmpeg, so a run is one process). ffmpeg 8's command line runs a
+# thread each for itself, its demuxer, decoder, filter graph, encoder and
+# muxer: 6, measured in the image during a real render
+# (tests/image/test_core_threads.py checks it). That holds only because the
+# filter graph is held to one thread; without that it starts a pool of one
+# thread per usable CPU. Docker starts the health check, as it starts every
+# docker exec, through its runtime's init process (runc:[2:INIT]), which runs
+# inside the container's cgroup before it execs the command. Measured in the
+# image under the compose example's flags, with the health check run back to
+# back during two renders and 16 busy workers: that process had 6 threads,
+# at times 7, and the cgroup's pids.peak was 36 or 37 over sixteen runs. So
+# the core counts the health check as 7, not as one process.
+CORE_MAIN_THREADS = 1
+CORE_HEALTH_CHECK_THREADS = 7
+CORE_SWEEPER_THREADS = 1
+FFMPEG_RUN_THREADS = 6
+# The core's memory with two renders of a 30 s clip (the default
+# MAX_CLIP_SECONDS) running at once and the health check run back to back
+# inside the container, measured in the image under the compose example's
+# flags from a client outside the container's cgroup: the cgroup's
+# memory.current less its shmem (the tmpfs) peaked at 47.6 MB (47,620,096
+# bytes) over eight runs, here rounded up to 47.7 MB. The tmpfs pages count
+# against the same cgroup.
+CORE_MEASURED_PEAK_BYTES = 47_700_000
+# System V IPC off in the core's container: `ipc: none` gives it a private
+# IPC namespace but leaves System V shared memory, message queues and
+# semaphores open to create there. With these three at zero, shmget, msgget
+# and semget fail.
+CORE_SYSV_IPC_SYSCTLS = {"kernel.shmmni": "0", "kernel.msgmni": "0", "kernel.sem": "0 0 0 0"}
+# Docker's size suffixes are binary: 64m is 64 MiB.
+_SIZE_UNITS = {"": 1, "b": 1, "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}
 # ICMP redirects (compose.example.yaml). With forwarding off the kernel takes a
 # redirect when `all` or the receiving interface says 1, and turning forwarding
 # off sets `all` to 1, so the fetcher-image services set all, default and lo
@@ -179,6 +213,33 @@ def _worst_case_threads() -> dict[str, int]:
         "fetcher": SERVICE_FIXED_THREADS + FetchServer.MAX_WORKERS + JOB_THREADS + CLIENT_THREADS,
         "fetcher-runner": SERVICE_FIXED_THREADS + RunnerServer.MAX_WORKERS + RUNNER_THREADS + YTDLP_RUN_THREADS,
     }
+
+
+def _core_worst_case_threads() -> int:
+    """The core's worst-case thread count, from the code's own caps and its default RENDER_CONCURRENCY.
+
+    Imported, not copied, so raising MAX_WORKERS or the default concurrency
+    without raising the example's pids_limit fails LayoutTest.
+    """
+    import helpers  # noqa: F401  (puts core/ and fetcher/ on sys.path)
+    from strange_ringtone.config import Settings
+    from strange_ringtone.server import RingtoneServer
+
+    concurrency = Settings.from_env({"PUBLIC_ORIGIN": ORIGIN}).render_concurrency
+    return (CORE_MAIN_THREADS + CORE_HEALTH_CHECK_THREADS + RingtoneServer.MAX_WORKERS + CORE_SWEEPER_THREADS
+            + concurrency * FFMPEG_RUN_THREADS)
+
+
+def _size_bytes(value: object) -> int:
+    """A compose size (an int of bytes, or a string such as 268435456 or 64m) in bytes."""
+    if isinstance(value, bool):
+        raise ValueError(f"not a size: {value!r}")
+    if isinstance(value, int):
+        return value
+    match = re.fullmatch(r"(\d+)([bkmg]?)", str(value).strip().lower())
+    if match is None:
+        raise ValueError(f"not a size: {value!r}")
+    return int(match[1]) * _SIZE_UNITS[match[2]]
 
 # The flags the contract runs a container with (README, Deployment contract),
 # for the containers the tests start outside compose.
@@ -1234,6 +1295,60 @@ class LayoutTest(unittest.TestCase):
                     f"{name}: pids_limit {limit} is under twice its worst case of {worst} threads; "
                     f"raise it with the cap, and the sizing in compose.example.yaml's comment and the README",
                 )
+
+    def test_core_hardening_and_caps(self) -> None:
+        """The core's container contract (section 5.7 of docs/PLAN.md), and caps on its processes and memory."""
+        core = self._service("core")
+        self.assertEqual(core.get("user"), UID_GID)
+        self.assertIs(core.get("read_only"), True)
+        self.assertEqual(core.get("cap_drop"), ["ALL"])
+        self.assertIn("no-new-privileges:true", core.get("security_opt") or [])
+        self.assertEqual(core.get("ipc"), "none")
+        # ffmpeg runs as the server's UID in this container, and the image
+        # sets no process limit of its own (RLIMIT_NPROC counts per UID across
+        # the host): the cgroup's caps are what bound an exploited run.
+        limit = core.get("pids_limit")
+        self.assertIsInstance(limit, int, "the core sets no pids_limit")
+        self.assertNotIsInstance(limit, bool)
+        self.assertGreater(limit, 0, "0 and -1 mean no limit to Docker")
+        self.assertIn("mem_limit", core, "the core sets no mem_limit")
+
+    def test_the_core_caps_processes_at_twice_its_worst_case(self) -> None:
+        """A cgroup pids_limit of at least twice the core's worst case from its own caps (docs/PLAN.md 6.1's rule)."""
+        worst = _core_worst_case_threads()
+        limit = self._service("core").get("pids_limit")
+        self.assertIsInstance(limit, int, "the core sets no pids_limit")
+        self.assertNotIsInstance(limit, bool)
+        self.assertGreaterEqual(
+            limit, 2 * worst,
+            f"core: pids_limit {limit} is under twice its worst case of {worst} threads; raise it with "
+            f"MAX_WORKERS or RENDER_CONCURRENCY, and the sizing in compose.example.yaml's comment",
+        )
+
+    def test_the_core_memory_limit_holds_its_tmpfs_and_twice_its_measured_peak(self) -> None:
+        """mem_limit covers the core's /tmp, whose pages count against it, plus twice the measured peak."""
+        core = self._service("core")
+        self.assertIn("mem_limit", core, "the core sets no mem_limit")
+        limit = _size_bytes(core["mem_limit"])
+        tmpfs = core.get("tmpfs") or []
+        self.assertEqual(len(tmpfs), 1, tmpfs)
+        sizes = [option for option in tmpfs[0].split(":", 1)[1].split(",") if option.startswith("size=")]
+        self.assertEqual(len(sizes), 1, tmpfs)
+        tmpfs_bytes = _size_bytes(sizes[0].removeprefix("size="))
+        self.assertGreaterEqual(
+            limit, tmpfs_bytes + 2 * CORE_MEASURED_PEAK_BYTES,
+            f"core: mem_limit {limit} is under its tmpfs ({tmpfs_bytes}) plus twice the measured peak "
+            f"({CORE_MEASURED_PEAK_BYTES}): a full /tmp and two renders would meet the OOM killer",
+        )
+
+    def test_the_core_turns_system_v_ipc_off(self) -> None:
+        """The core's sysctls leave System V IPC no object to create, which `ipc: none` alone does not."""
+        sysctls = self._service("core").get("sysctls") or {}
+        self.assertIsInstance(sysctls, dict, sysctls)
+        for key, value in CORE_SYSV_IPC_SYSCTLS.items():
+            with self.subTest(sysctl=key):
+                self.assertIn(key, sysctls, f"core: no {key} in {sysctls!r}")
+                self.assertEqual(str(sysctls[key]), value, f"core: {key} in {sysctls!r}")
 
     def test_the_fetcher_image_services_refuse_icmp_redirects(self) -> None:
         """T2 (static): accept_redirects 0 for all, default and lo, and on the interface of every network attachment."""

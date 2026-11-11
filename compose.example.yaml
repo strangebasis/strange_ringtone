@@ -98,12 +98,52 @@ services:
     ipc: none
     ulimits:
       msgqueue: 0
+    # `ipc: none` still lets any process here create System V shared memory,
+    # message queues and semaphores in the container's own IPC namespace:
+    # state outside /tmp that an exploited ffmpeg could keep between runs.
+    # The server uses none of them. With these at zero, shmget, msgget and
+    # semget fail. They apply to the container's IPC namespace only and
+    # need no capability.
+    sysctls:
+      kernel.shmmni: 0
+      kernel.msgmni: 0
+      kernel.sem: "0 0 0 0"
     tmpfs:
       # The only writable path: uploads and results, gone on restart. noexec
       # and nosuid keep anything written there from running. The size follows
       # the contract's formula (docs/PLAN.md 5.7): 64 MB fits the default
       # settings; MAX_CLIP_SECONDS=40 needs 84 MB.
       - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    # ffmpeg runs as the server's UID in this container, so this cgroup limit
+    # is what bounds the memory of the server, of every ffmpeg run and of
+    # anything an exploited run starts, the tmpfs pages above included.
+    # Measured in the image under these flags, from a client outside the
+    # container's cgroup: with two renders of a 30 s clip at once (the
+    # default MAX_CLIP_SECONDS and RENDER_CONCURRENCY) and the health check
+    # running in the container, the cgroup's memory.current less its tmpfs
+    # pages peaked at 47.6 MB over eight runs. Twice that (90.8 MiB) plus
+    # the 64m tmpfs is 154.8 MiB, under 160m. Raise it with the tmpfs: with
+    # MAX_CLIP_SECONDS=40 the same measurement peaked at 48.2 MB, and twice
+    # that plus the 84m tmpfs is 175.9 MiB, so 176m at the least. Measure
+    # again before raising RENDER_CONCURRENCY or MAX_WORKERS.
+    mem_limit: 160m
+    # The cgroup's cap on processes and threads. The image sets no process
+    # limit of its own: prlimit's --nproc would be RLIMIT_NPROC, which the
+    # kernel counts per UID across every container that runs as 10001, so
+    # this is the only bound on what ffmpeg starts. The worst case: the main
+    # thread, 16 request workers (RingtoneServer.MAX_WORKERS), the result
+    # sweeper, one ffmpeg run for each of RENDER_CONCURRENCY renders
+    # (default 2; prlimit execs into ffmpeg), and the health check. A run has
+    # 6 threads, as measured, because the renderer holds the filter graph to
+    # one: its main thread, demuxer, decoder, filter graph, encoder and
+    # muxer. Docker starts the health check, like any docker exec, through
+    # its runtime's init process, which runs in this cgroup with 6 threads,
+    # at times 7, before it becomes the check's one process. So
+    # 1 + 16 + 1 + 2 x 6 + 7 = 37, which is also the highest pids.peak
+    # measured, and 80 is more than twice that. RENDER_CONCURRENCY has no
+    # upper bound in the settings: each render added adds 6 to the worst
+    # case, and this must stay at least twice it.
+    pids_limit: 80
     networks:
       - core
     # json-file with rotation: Docker keeps every line forever unless the

@@ -184,8 +184,25 @@ server, and the fetch counts against the rate limit like any other.
   replace other users' uploads and finished tones, and stay until the
   container restarts. It has no route out: in `compose.example.yaml`'s
   layout the `core` network reaches nothing but the reverse proxy. The
-  example gives the core no memory or process cap yet (docs/PLAN.md,
-  section 8).
+  example caps the container's memory and processes (`mem_limit` and
+  `pids_limit`). The image sets no process limit of its own, so a
+  deployment that drops `pids_limit` leaves ffmpeg no bound on its
+  processes. The renderer kills each run's process group when the run
+  ends, and the server, as its container's PID 1, collects what that
+  kill killed, but a process that left the group (`setsid()` or
+  `setpgid()`) holds a slot of `pids_limit` until the container
+  restarts. A replaced tone is served only if it is a regular file within
+  an output's size limit. Inside the container ffmpeg can still stop the
+  server serving, or stop its renders, until a restart: by ending it
+  with SIGTERM or SIGINT, by cutting its resource limits, by driving the
+  container into `mem_limit`, by holding every free slot of
+  `pids_limit`, or by keeping its results from being swept. By filling
+  the tmpfs it makes every upload fail until stored results expire and
+  free their space, or until a restart where none were stored, while the
+  files it wrote stay; a restart removes them, because the restarted
+  container gets a new tmpfs. A server that ends is started again by the
+  example's restart policy, and a restart forgets every stored tone
+  (docs/PLAN.md, sections 5.3 and 8).
 - *yt-dlp, yt-dlp-ejs or Deno*, through a bad release or a crafted video:
   it runs in the runner's container, which is given no secret and nothing
   of `.env` but three limits. Its only way out is the forwarder: YouTube's
