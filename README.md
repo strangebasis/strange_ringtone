@@ -186,7 +186,19 @@ server, and the fetch counts against the rate limit like any other.
   example caps the container's memory and processes (`mem_limit` and
   `pids_limit`). The image sets no process limit of its own, so a
   deployment that drops `pids_limit` leaves ffmpeg no bound on its
-  processes (docs/PLAN.md, section 8).
+  processes. The renderer kills each run's process group when the run
+  ends, and the server, as its container's PID 1, collects what that
+  kill killed, but a process that left the group (`setsid()` or
+  `setpgid()`) holds a slot of `pids_limit` until the container
+  restarts. A replaced tone is served only if it is a regular file within
+  an output's size limit. Inside the container ffmpeg can still stop the
+  server serving, or stop its renders, until a restart: by ending it
+  with SIGTERM or SIGINT, by cutting its resource limits, by driving the
+  container into `mem_limit`, by holding every free slot of
+  `pids_limit`, by filling the tmpfs, or by keeping its results from
+  being swept. A server that ends is started again by the example's
+  restart policy, and a restart forgets every stored tone (docs/PLAN.md,
+  sections 5.3 and 8).
 - *yt-dlp, yt-dlp-ejs or Deno*, through a bad release or a crafted video:
   it runs in the runner's container, which is given no secret and nothing
   of `.env` but three limits. Its only way out is the forwarder: YouTube's
