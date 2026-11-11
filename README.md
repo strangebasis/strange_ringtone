@@ -10,9 +10,9 @@ iOS 26's **Share → Use as Ringtone**. No GarageBand, no computer and no cable.
 ## How it works
 
 1. Open the app in Safari on an iPhone running iOS 26 or later and pick an
-   audio file (up to 10 minutes). The phone decodes it; nothing is uploaded
-   yet. Where the server runs the optional fetcher, you can paste or share a
-   YouTube link instead ([below](#from-a-youtube-link)).
+   audio file (up to 10 minutes and 64 MB). The phone decodes it; nothing is
+   uploaded yet. Where the server runs the optional fetcher, you can paste or
+   share a YouTube link instead ([below](#from-a-youtube-link)).
 2. The app pre-selects the loudest stretch, up to `MAX_CLIP_SECONDS` (30 s by
    default), and moves its start to a quiet moment. Drag the handles or nudge
    them by 0.1 s or 1 s. **Play selection** loops it the way a ringtone
@@ -47,7 +47,8 @@ the link.
   the YouTube address itself.
 - Videos can be up to 10 minutes long (`FETCH_MAX_SECONDS`, which must not be
   set above the page's 10-minute decode limit). A longer video is refused with
-  a message saying so.
+  a message saying so. The page also refuses audio over 64 MB before decoding
+  it, whatever the fetcher's `FETCH_MAX_BYTES` allows.
 - The page asks for the job's status every 2 seconds, then downloads the
   audio once (the fetcher deletes it as it sends it) and decodes it on the
   phone like a picked file. From there it is the same trimmer, with the name
@@ -517,7 +518,7 @@ sets it there. Each command reads only the rows that name it.
 | `PUBLIC_ORIGIN` | *(required)* | Fetcher. The same value as the core's. Every `POST` must carry exactly one `Origin` equal to it. |
 | `TRUSTED_PROXIES` | empty | Fetcher. As for the core: CIDRs whose `X-Forwarded-For` is honoured for the per-client rate limit. `compose.example.yaml` sets it to empty on the fetcher service, which wins over `.env`, so the value in `.env` is the core's alone and the fetcher trusts no proxy. If you override that, never list a range that covers `jobs`, where the runner's requests come from: Docker may give `fetcher` and `jobs` other subnets when it recreates them (see Networks). |
 | `FETCH_MAX_SECONDS` | 600 | Runner. Longest video, 1 to 600. Must not exceed the page's 10-minute decode limit, or a video is downloaded only for the phone to refuse it. |
-| `FETCH_MAX_BYTES` | 41943040 (40 MiB) | Both. Largest audio download, 1 MiB to 512 MiB: the fetcher caps what it accepts from the runner, the runner caps what yt-dlp downloads; size each `/tmp` from it. |
+| `FETCH_MAX_BYTES` | 41943040 (40 MiB) | Both. Largest audio download, 1 MiB to 512 MiB: the fetcher caps what it accepts from the runner, the runner caps what yt-dlp downloads; size each `/tmp` from it. The page refuses audio over 64 MiB before decoding it, whatever this allows, so a value above 64 MiB fetches audio the page then refuses. |
 | `FETCH_TIMEOUT_SECONDS` | 120 | Both. The runner's wall clock per yt-dlp run, 1 to 600; the fetcher waits that long plus 15 s for the runner's answer, so set it once, in the shared `.env`. |
 | `RATE_LIMIT_FETCHES_PER_MINUTE` | 5 | Fetcher. Per client IP, counted on accepted jobs. With the example's empty `TRUSTED_PROXIES` on the fetcher, a client behind the reverse proxy counts as the proxy's address, so every client shares this limit. |
 | `FETCH_RESULT_TTL_SECONDS` | 600 | Fetcher. How long a finished result waits to be collected |

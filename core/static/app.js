@@ -3,7 +3,7 @@
 // escaped data-* attributes, because the CSP allows no inline script, and
 // every dynamic text goes through textContent, so a file name, a video title
 // or a server message can never become markup.
-import { decodeFile, MAX_INPUT_SECONDS } from "./audio/decode.js";
+import { decodeFile, MAX_INPUT_BYTES, MAX_INPUT_SECONDS } from "./audio/decode.js";
 import { gainForTarget, integratedLufs } from "./audio/loudness.js";
 import { displayName, renderQuery, toneNameHeader } from "./audio/request.js";
 import { suggestionRule, suggestSelection } from "./audio/suggest.js";
@@ -520,8 +520,8 @@ function resetForNewFile() {
 }
 
 function fileHint() {
-  return "Any audio file up to " + Math.round(MAX_INPUT_SECONDS / 60)
-    + " minutes long. It is decoded on this device; only the selection is sent.";
+  return "Any audio file up to " + Math.round(MAX_INPUT_SECONDS / 60) + " minutes long and "
+    + MAX_INPUT_BYTES / (1024 * 1024) + " MB. It is decoded on this device; only the selection is sent.";
 }
 
 // What placed the selection (docs/PLAN.md 7.2), in the status line's words.

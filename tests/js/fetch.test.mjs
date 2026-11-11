@@ -7,6 +7,9 @@ import {
   FETCH_ERROR_CODES, FetchError, LINK_HOSTS, MAX_POLLS, POLL_INTERVAL_MS, VIDEO_ID_RE, fetchAudio, fetchErrorMessage,
   fetchJob, parseTimestamp, parseYouTubeLink, pollJob,
 } from "../../core/static/fetch.js";
+// The page's byte cap, through the namespace so this file still loads where
+// decode.js lacks the export.
+import * as decodeModule from "../../core/static/audio/decode.js";
 
 const ID = "dQw4w9WgXcQ";
 const JOB = "0123456789abcdef0123456789abcdef";
@@ -406,4 +409,231 @@ test("every error code has its own words", () => {
   for (const code of ["http_5023", "http_abc", "<b>", null, undefined, 42, "toString", "__proto__"]) {
     assert.equal(fetchErrorMessage(code), generic, String(code));
   }
+});
+
+// --- the size cap on fetched audio ----------------------------------------------
+
+// The fetched audio goes to the same decoder as a picked file, so it gets the
+// same cap, checked before the bytes pile up rather than after. The tests pass
+// a small cap instead of allocating 64 MiB.
+const MIB = 1024 * 1024;
+const TOO_LARGE = "audio_too_large";
+const CAP = 10_000;
+const CHUNK = 1000;
+// The tests' own arrays, whatever a test puts in place of the global to count
+// what fetch.js allocates.
+const Bytes = Uint8Array;
+
+// A body handed out one CHUNK per read and never ahead of the reader
+// (highWaterMark 0), so `seen.bytes` is exactly what fetchAudio was given.
+// It ends after `total` bytes; a cap that does not work then shows as a
+// fetch that succeeds rather than one that never ends.
+function countedBody(total) {
+  const seen = { bytes: 0, cancelled: false };
+  const stream = new ReadableStream({
+    pull(controller) {
+      const size = Math.min(CHUNK, total - seen.bytes);
+      if (size <= 0) {
+        controller.close();
+        return;
+      }
+      seen.bytes += size;
+      controller.enqueue(new Bytes(size).fill(7));
+    },
+    cancel() {
+      seen.cancelled = true;
+    },
+  }, { highWaterMark: 0 });
+  return { stream, seen };
+}
+
+function audioResponse(stream, length = null) {
+  const headers = { "Content-Type": "audio/mp4" };
+  if (length !== null) headers["Content-Length"] = String(length);
+  return new Response(stream, { headers });
+}
+
+// A response as a browser without a readable body stream gives it: no `body`
+// to read from, only arrayBuffer().
+function bufferedResponse(size, { length = null, body = null } = {}) {
+  const seen = { reads: 0 };
+  const headers = new Headers({ "Content-Type": "audio/mp4" });
+  if (length !== null) headers.set("Content-Length", String(length));
+  const response = {
+    ok: true,
+    status: 200,
+    headers,
+    body,
+    arrayBuffer: async () => {
+      seen.reads += 1;
+      return new Uint8Array(size).fill(7).buffer;
+    },
+  };
+  return { response, seen };
+}
+
+test("fetched audio is capped at the page's 64 MiB, with words of its own", () => {
+  assert.equal(decodeModule.MAX_INPUT_BYTES, 64 * MIB, "decode.js exports MAX_INPUT_BYTES, 64 MiB");
+  assert.ok(FETCH_ERROR_CODES.includes(TOO_LARGE), "fetch.js has a message for " + TOO_LARGE);
+  assert.notEqual(fetchErrorMessage(TOO_LARGE), fetchErrorMessage("zz_unknown"));
+  assert.match(fetchErrorMessage(TOO_LARGE), /64 MB/);
+  assert.equal(new FetchError(TOO_LARGE).message, fetchErrorMessage(TOO_LARGE));
+});
+
+test("fetchAudio refuses a Content-Length over the cap without reading the body", async (t) => {
+  // The default cap is the page's own.
+  const big = countedBody(50 * CAP);
+  const calls = fakeFetch(t, () => audioResponse(big.stream, 64 * MIB + 1));
+  await rejectsWith(fetchAudio(JOB), TOO_LARGE);
+  assert.equal(big.seen.bytes, 0, "the body was read");
+  assert.equal(calls.length, 1, "nothing is retried");
+
+  const small = countedBody(50 * CAP);
+  fakeFetch(t, () => audioResponse(small.stream, CAP + 1));
+  await rejectsWith(fetchAudio(JOB, { maxBytes: CAP }), TOO_LARGE);
+  assert.equal(small.seen.bytes, 0, "the body was read");
+});
+
+test("a body refused by its Content-Length is cancelled, not left downloading", async (t) => {
+  // Refusing without reading would otherwise leave the response open, and the
+  // rest of the audio still coming in, after the page has given up on it.
+  for (const [length, options] of [[64 * MIB + 1, undefined], [CAP + 1, { maxBytes: CAP }]]) {
+    const body = countedBody(50 * CAP);
+    fakeFetch(t, () => audioResponse(body.stream, length));
+    await rejectsWith(fetchAudio(JOB, options), TOO_LARGE);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(body.seen.bytes, 0, "the body was read");
+    assert.ok(body.seen.cancelled, "the refused body was not cancelled");
+  }
+});
+
+test("a body that keeps coming is cut off past the cap, holding at most one chunk more", async (t) => {
+  // No Content-Length, and one that understates the body: the count of the
+  // bytes as they arrive is what holds.
+  for (const length of [null, 5, CAP]) {
+    const body = countedBody(50 * CAP);
+    fakeFetch(t, () => audioResponse(body.stream, length));
+    await rejectsWith(fetchAudio(JOB, { maxBytes: CAP }), TOO_LARGE);
+    assert.ok(body.seen.bytes > CAP, `refused at ${body.seen.bytes} bytes, before passing the cap`);
+    assert.ok(body.seen.bytes <= CAP + CHUNK, `read ${body.seen.bytes} bytes of a ${CAP}-byte cap`);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(body.seen.cancelled, "the rest of the body was not cancelled");
+  }
+});
+
+test("a body of exactly the cap is returned whole, and one byte more is refused", async (t) => {
+  for (const length of [null, CAP]) {
+    const exact = countedBody(CAP);
+    fakeFetch(t, () => audioResponse(exact.stream, length));
+    const bytes = await fetchAudio(JOB, { maxBytes: CAP });
+    assert.ok(bytes instanceof Uint8Array);
+    assert.equal(bytes.length, CAP);
+    assert.ok(bytes.every((byte) => byte === 7));
+  }
+  const over = countedBody(CAP + 1);
+  fakeFetch(t, () => audioResponse(over.stream));
+  await rejectsWith(fetchAudio(JOB, { maxBytes: CAP }), TOO_LARGE);
+});
+
+test("without a readable body stream the size is checked before the bytes are used", async (t) => {
+  for (const body of [null, undefined]) {
+    const exact = bufferedResponse(CAP, { body });
+    fakeFetch(t, () => exact.response);
+    const bytes = await fetchAudio(JOB, { maxBytes: CAP });
+    assert.equal(bytes.length, CAP, String(body));
+
+    const over = bufferedResponse(CAP + 1, { body });
+    fakeFetch(t, () => over.response);
+    await rejectsWith(fetchAudio(JOB, { maxBytes: CAP }), TOO_LARGE);
+
+    // The header still refuses before anything is read.
+    const declared = bufferedResponse(CAP + 1, { body, length: CAP + 1 });
+    fakeFetch(t, () => declared.response);
+    await rejectsWith(fetchAudio(JOB, { maxBytes: CAP }), TOO_LARGE);
+    assert.equal(declared.seen.reads, 0, "arrayBuffer was called");
+  }
+  // A body that breaks off is still a network error there.
+  const broken = bufferedResponse(CAP);
+  broken.response.arrayBuffer = () => Promise.reject(new TypeError("reset"));
+  fakeFetch(t, () => broken.response);
+  await rejectsWith(fetchAudio(JOB, { maxBytes: CAP }), "network");
+});
+
+// Every new buffer fetch.js asks for while a test runs, in bytes. A view on a
+// buffer that exists holds nothing more, so it is not counted.
+function countAllocations(t) {
+  const counted = { bytes: 0 };
+  globalThis.Uint8Array = class extends Bytes {
+    constructor(...args) {
+      super(...args);
+      if (typeof args[0] === "number") counted.bytes += args[0];
+    }
+  };
+  t.after(() => {
+    globalThis.Uint8Array = Bytes;
+  });
+  return counted;
+}
+
+// A body whose producer overwrites each piece once the next is asked for, as
+// one that reuses its buffers would. Only a reader that has copied a piece
+// by then still has its bytes: one that keeps the pieces to join them at the
+// end finds them overwritten.
+function recycledBody(total) {
+  let sent = 0;
+  let last = null;
+  return new ReadableStream({
+    pull(controller) {
+      if (last !== null) last.fill(9);
+      const size = Math.min(CHUNK, total - sent);
+      if (size <= 0) {
+        controller.close();
+        return;
+      }
+      sent += size;
+      last = new Bytes(size).fill(7);
+      controller.enqueue(last);
+    },
+  }, { highWaterMark: 0 });
+}
+
+test("a fetched audio is gathered in one buffer, never held twice", async (t) => {
+  // Keeping the pieces of a body until its end and then copying them into a
+  // buffer of their sum holds the audio twice for a moment: 128 MiB for a
+  // download at the cap. The body goes into one buffer as it arrives, as long
+  // as its Content-Length says, or as long as the cap where that header is
+  // missing or no plain number.
+  const allocated = countAllocations(t);
+  for (const [size, length, buffer] of [
+    [CAP - 500, CAP - 500, CAP - 500],
+    [CAP, CAP, CAP],
+    [3 * CHUNK + 1, null, CAP],
+    [3 * CHUNK + 1, "soon", CAP],
+    [0, 0, 0],
+  ]) {
+    fakeFetch(t, () => audioResponse(recycledBody(size), length));
+    allocated.bytes = 0;
+    const bytes = await fetchAudio(JOB, { maxBytes: CAP });
+    assert.equal(bytes.length, size, `Content-Length ${length}`);
+    assert.ok(bytes.every((byte) => byte === 7), `Content-Length ${length}: a piece was kept, not copied, until the end`);
+    assert.equal(allocated.bytes, buffer, `Content-Length ${length}: bytes allocated for a body of ${size}`);
+  }
+});
+
+test("a body longer than its Content-Length is returned whole, inside the cap", async (t) => {
+  // A header that understates the body, as after a proxy changed it on the
+  // way: the bytes so far move to a buffer of the cap's size, once.
+  const allocated = countAllocations(t);
+  const body = countedBody(5 * CHUNK);
+  fakeFetch(t, () => audioResponse(body.stream, 2 * CHUNK));
+  const bytes = await fetchAudio(JOB, { maxBytes: CAP });
+  assert.equal(bytes.length, 5 * CHUNK);
+  assert.ok(bytes.every((byte) => byte === 7));
+  assert.equal(allocated.bytes, 2 * CHUNK + CAP);
+  // A body shorter than its header says is what arrived, and no more.
+  const short = countedBody(2 * CHUNK);
+  fakeFetch(t, () => audioResponse(short.stream, 5 * CHUNK));
+  const fewer = await fetchAudio(JOB, { maxBytes: CAP });
+  assert.equal(fewer.length, 2 * CHUNK);
+  assert.ok(fewer.every((byte) => byte === 7));
 });

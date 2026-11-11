@@ -133,6 +133,17 @@ The browser is the only bridge. Audio from the fetcher reaches the core only as
 WAV that the browser made, so the core's input surface is the same with or
 without the fetcher.
 
+The browser checks a picked file and fetched audio alike twice: once before
+decoding and once after. Before decoding, `decode.js` refuses input over
+64 MiB (`MAX_INPUT_BYTES`) without reading any of it, and `fetch.js` refuses
+a fetched audio over the same cap: by its `Content-Length` before reading the
+body, and, where the browser offers the body as a stream, by counting it as
+it arrives and stopping at most one chunk past the cap. Where it does not,
+`fetch.js` reads the body whole and checks its size before anything uses
+the bytes. That cap holds whatever `FETCH_MAX_BYTES` allows. After decoding,
+`decode.js` refuses input over 10 minutes (`MAX_INPUT_SECONDS`), which only
+the decoded duration shows.
+
 Inside the fetcher, yt-dlp moves to a container of its own whose only way out
 is the image's forwarder (section 6.1, milestone 5's follow-up).
 
@@ -1078,7 +1089,14 @@ as the operator's own risk. The
 runner still opens every result `O_NOFOLLOW` and `O_NONBLOCK` and holds and
 serves only a regular file within `FETCH_MAX_BYTES`. The isolated gateway mode also means the
 host has no route to the internal networks, so the reverse proxy must be a
-container on them.
+container on them. Fetched audio goes to the phone's own audio decoder,
+which reads it by content; neither the fetcher nor the page checks its
+bytes as audio first (a check on the first bytes would not make a malicious
+file safer), so a decoder exploit is the browser's boundary, as it is for a
+picked file. The page refuses audio over 64 MiB before decoding it
+(section 4); within that, a file at a very low bitrate can still decode to
+hours and end the phone's tab, which costs the user the tab and leaks
+nothing.
 
 **Checks and their tests.** Every check gets its failing test before its code
 (section 12), and the verification panel removes each check and expects a

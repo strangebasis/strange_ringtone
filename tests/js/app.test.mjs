@@ -952,3 +952,56 @@ test("a fetch replaced while its audio downloads leaves the newer fetch alone", 
   ], "no poll after the pick");
   assert.equal(page.el("name").value, "My Song");
 });
+
+// --- the byte cap -------------------------------------------------------------------
+
+const OVER_CAP = 64 * 1024 * 1024 + 1;
+
+test("the picker's hint gives both limits a picked file must meet", async () => {
+  const page = await loadApp({ maxClipSeconds: "15" });
+  const hint = page.el("file-status").textContent;
+  assert.match(hint, /\b10 minutes\b/);
+  assert.match(hint, /\b64 MB\b/);
+  assert.equal(page.el("file-status").classes.has("error"), false);
+});
+
+test("a picked file over 64 MB is refused with words for it, before any of it is read", async () => {
+  const page = await loadApp({ maxClipSeconds: "15" });
+  setDecoded([SONG]);
+  let reads = 0;
+  const input = page.el("file");
+  input.files = [{
+    name: "Huge.wav",
+    size: OVER_CAP,
+    arrayBuffer: () => {
+      reads += 1;
+      return Promise.resolve(new ArrayBuffer(8));
+    },
+  }];
+  await Promise.all(input.dispatch("change"));
+  await settle();
+  assert.equal(reads, 0, "the oversized file was read");
+  assert.deepEqual(page.decodedInputs(), []);
+  assert.equal(page.el("editor").hidden, true);
+  assert.ok(page.el("file-status").classes.has("error"));
+  assert.match(page.el("file-status").textContent, /64 MB/);
+  // A file within the cap still opens.
+  await pickFile(page, "My Song.mp3", [SONG]);
+  assert.equal(page.el("editor").hidden, false);
+});
+
+test("fetched audio over 64 MB is refused with its own words and never decoded", async () => {
+  setDecoded([LOUD_AT_30]);
+  const huge = new Response(new Uint8Array(AUDIO_BYTES),
+    { headers: { "Content-Type": "audio/mp4", "Content-Length": String(OVER_CAP) } });
+  const page = await loadApp({
+    maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ firstAudio: Promise.resolve(huge) }),
+  });
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.el("yt-status").classes.has("error") || !page.el("editor").hidden, "the fetch's outcome");
+  assert.deepEqual(page.decodedInputs(), [], "the oversized audio was decoded");
+  assert.equal(page.el("editor").hidden, true);
+  assert.equal(page.el("yt-status").textContent, fetchErrorMessage("audio_too_large"));
+  assert.notEqual(page.el("yt-status").textContent, fetchErrorMessage("zz_unknown"));
+});
