@@ -605,13 +605,35 @@ SYSV_IPC = Path("/proc/sysvipc")
 _IPC_RMID = 0
 
 
-def _ipc_ids(listing: Path) -> list[int]:
-    """The objects a /proc/sysvipc listing names: the second column of every line after the first."""
+def _ipc_rows(listing: Path) -> list[tuple[int, set[int]]]:
+    """The objects a /proc/sysvipc listing names: each one's ID, and the UIDs of its owner and its creator.
+
+    The ID is the second column of every line after the first; the first
+    line names the columns, `uid` and `cuid` among them. Those two users
+    are the ones the kernel lets remove the object.
+    """
     try:
-        lines = listing.read_text(encoding="ascii", errors="replace").splitlines()[1:]
+        lines = listing.read_text(encoding="ascii", errors="replace").splitlines()
     except OSError:
         return []
-    return [int(fields[1]) for fields in (line.split() for line in lines) if len(fields) > 1 and fields[1].isdigit()]
+    if not lines:
+        return []
+    columns = lines[0].split()
+    rows: list[tuple[int, set[int]]] = []
+    for fields in (line.split() for line in lines[1:]):
+        if len(fields) < 2 or not fields[1].isdigit():
+            continue
+        users = {
+            int(fields[at]) for at, column in enumerate(columns)
+            if column in ("uid", "cuid") and at < len(fields) and fields[at].isdigit()
+        }
+        rows.append((int(fields[1]), users))
+    return rows
+
+
+def _ipc_ids(listing: Path) -> list[int]:
+    """The IDs of the objects a /proc/sysvipc listing names."""
+    return [ident for ident, _users in _ipc_rows(listing)]
 
 
 def remove_ipc_objects(listing: Path = SYSV_IPC, deadline: float | None = None) -> None:
@@ -624,25 +646,41 @@ def remove_ipc_objects(listing: Path = SYSV_IPC, deadline: float | None = None) 
     (may_remove_ipc_objects). The kernel refuses another user's object,
     which stays; one already gone is no error. Once time.monotonic()
     reaches deadline, if one is given, the rest stays.
+
+    Raises RuntimeError when an object this user owns or created is still
+    listed afterwards. The listing decides, not what each call answered:
+    IPC_RMID answers -1 without raising anything here, for an object that
+    is already gone as for one the kernel would not remove.
     """
     libc = ctypes.CDLL(None, use_errno=True)
 
     def in_time() -> bool:
         return deadline is None or time.monotonic() < deadline
 
-    for ident in _ipc_ids(listing / "shm"):
-        if not in_time():
-            return
-        libc.shmctl(ident, _IPC_RMID, None)
-    for ident in _ipc_ids(listing / "msg"):
-        if not in_time():
-            return
-        libc.msgctl(ident, _IPC_RMID, None)
-    for ident in _ipc_ids(listing / "sem"):
-        if not in_time():
-            return
-        # The second argument, a semaphore's number, means nothing to IPC_RMID.
-        libc.semctl(ident, 0, _IPC_RMID)
+    def remove_all() -> None:
+        for ident in _ipc_ids(listing / "shm"):
+            if not in_time():
+                return
+            libc.shmctl(ident, _IPC_RMID, None)
+        for ident in _ipc_ids(listing / "msg"):
+            if not in_time():
+                return
+            libc.msgctl(ident, _IPC_RMID, None)
+        for ident in _ipc_ids(listing / "sem"):
+            if not in_time():
+                return
+            # The second argument, a semaphore's number, means nothing to IPC_RMID.
+            libc.semctl(ident, 0, _IPC_RMID)
+
+    remove_all()
+    geteuid = getattr(os, "geteuid", None)
+    me = geteuid() if geteuid is not None else None
+    for kind in ("shm", "msg", "sem"):
+        for _ident, users in _ipc_rows(listing / kind):
+            # Counted as this user's, too, where the listing or the platform
+            # can't say whose it is: left unremoved, it would keep its memory.
+            if me is None or not users or me in users:
+                raise RuntimeError(f"a System V IPC object of this user is left in {kind}")
 
 
 def _unlink(path: Path) -> None:

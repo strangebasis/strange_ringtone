@@ -60,10 +60,18 @@ LISTINGS = {
 
 
 class FakeLibc:
-    """The three calls remove_ipc_objects makes, recorded, each answering success."""
+    """The three calls remove_ipc_objects makes, recorded, answering as libc does: 0, or -1 and nothing raised.
 
-    def __init__(self) -> None:
+    With a listing directory, a call that answers 0 takes its object out of
+    that listing, as the kernel does; `gone` names objects that vanish
+    although the call answers -1 (removed by someone else in between).
+    """
+
+    def __init__(self, listing: Path | None = None, answer: int = 0, gone: tuple[int, ...] = ()) -> None:
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.listing = listing
+        self.answer = answer
+        self.gone = gone
 
     def __getattr__(self, name: str) -> Any:
         if name not in ("shmctl", "msgctl", "semctl"):
@@ -71,9 +79,18 @@ class FakeLibc:
 
         def call(*args: Any) -> int:
             self.calls.append((name, args))
-            return 0
+            if self.listing is not None and (self.answer == 0 or args[0] in self.gone):
+                self._unlist(name[:3], args[0])
+            return self.answer
 
         return call
+
+    def _unlist(self, kind: str, ident: int) -> None:
+        assert self.listing is not None
+        path = self.listing / kind
+        lines = path.read_text(encoding="ascii").splitlines()
+        kept = [lines[0]] + [line for line in lines[1:] if int(line.split()[1]) != ident]
+        path.write_text("\n".join(kept) + "\n", encoding="ascii")
 
 
 class IpcDecisionTest(unittest.TestCase):
@@ -109,16 +126,25 @@ class RemoveIpcObjectsTest(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.listing = Path(temp.name)
 
-    def remove(self) -> list[tuple[str, tuple[Any, ...]]]:
+    # The UID of the objects in LISTINGS.
+    OWNER = 10001
+
+    def remove(
+        self, answer: int = 0, gone: tuple[int, ...] = (), euid: int = OWNER
+    ) -> list[tuple[str, tuple[Any, ...]]]:
         remove_ipc_objects = seam(runner_server, "remove_ipc_objects")
-        libc = FakeLibc()
-        with mock.patch.object(runner_server.ctypes, "CDLL", lambda *args, **kwargs: libc):
+        libc = FakeLibc(self.listing, answer, gone)
+        with mock.patch.object(runner_server.ctypes, "CDLL", lambda *args, **kwargs: libc), \
+                mock.patch.object(runner_server.os, "geteuid", lambda: euid, create=True):
             remove_ipc_objects(self.listing)
         return libc.calls
 
-    def test_every_listed_object_is_removed(self) -> None:
+    def write_listings(self) -> None:
         for kind, lines in LISTINGS.items():
             (self.listing / kind).write_text("\n".join(lines) + "\n", encoding="ascii")
+
+    def test_every_listed_object_is_removed(self) -> None:
+        self.write_listings()
         # IPC_RMID is 0: shmctl and msgctl take no buffer for it, and semctl
         # takes a semaphore number it ignores.
         self.assertEqual(self.remove(), [
@@ -127,6 +153,48 @@ class RemoveIpcObjectsTest(unittest.TestCase):
             ("msgctl", (7, 0, None)),
             ("semctl", (2, 0, 0)),
         ])
+
+    def test_an_object_of_this_user_that_is_still_listed_fails_the_removal(self) -> None:
+        # libc answers -1 and raises nothing when the kernel refuses a
+        # removal. An object of the runner's own that is still listed keeps
+        # its memory charged to the container, so the removal must say so:
+        # the clean-up then counts as failed, and under the contract the
+        # runner restarts.
+        self.write_listings()
+        with self.assertRaises(RuntimeError):
+            self.remove(answer=-1)
+        # One kind left is enough, whichever it is.
+        for kind in KINDS:
+            with self.subTest(kind=kind):
+                for other, lines in LISTINGS.items():
+                    rows = lines if other == kind else lines[:1]
+                    (self.listing / other).write_text("\n".join(rows) + "\n", encoding="ascii")
+                with self.assertRaises(RuntimeError):
+                    self.remove(answer=-1)
+
+    def test_an_object_already_gone_is_no_failure(self) -> None:
+        # -1 is also the answer for an object that went away between the
+        # listing and the call. What decides is the listing afterwards.
+        self.write_listings()
+        self.remove(answer=-1, gone=(3, 32771, 7, 2))
+
+    def test_another_users_object_may_stay(self) -> None:
+        # The kernel refuses the runner an object that another user owns
+        # and created; that one stays, and it is no failure of the clean-up.
+        self.write_listings()
+        calls = self.remove(answer=-1, euid=4242)
+        self.assertEqual(len(calls), 4)
+
+    def test_an_object_whose_owner_the_listing_does_not_name_counts_as_this_users(self) -> None:
+        # A listing without the uid and cuid columns can't show whose an
+        # object is: fail closed.
+        for kind, lines in LISTINGS.items():
+            columns = lines[0].split()
+            keep = [at for at, column in enumerate(columns) if column not in ("uid", "cuid")]
+            rows = [" ".join(line.split()[at] for at in keep) for line in lines]
+            (self.listing / kind).write_text("\n".join(rows) + "\n", encoding="ascii")
+        with self.assertRaises(RuntimeError):
+            self.remove(answer=-1)
 
     def test_a_listing_with_no_objects_or_none_at_all_removes_nothing(self) -> None:
         for kind, lines in LISTINGS.items():

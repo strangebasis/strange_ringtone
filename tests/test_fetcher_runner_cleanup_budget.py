@@ -156,11 +156,18 @@ class DeadlineTest(TempTestCase):
         temp.mkdir()
         for kind, lines in LISTINGS.items():
             (temp / kind).write_text("\n".join(lines) + "\n", encoding="ascii")
+        # The objects in LISTINGS belong to UID 10001; a removal that the
+        # deadline cut short leaves them listed, and says so.
         for deadline, expected in ((time.monotonic() - 1, 0), (time.monotonic() + 60, 4)):
             with self.subTest(past=expected == 0):
-                libc = FakeLibc()
-                with mock.patch.object(runner_server.ctypes, "CDLL", return_value=libc):
-                    remove_ipc_objects(temp, deadline=deadline)
+                libc = FakeLibc(temp)
+                with mock.patch.object(runner_server.ctypes, "CDLL", return_value=libc), \
+                        mock.patch.object(runner_server.os, "geteuid", lambda: 10001, create=True):
+                    if expected == 0:
+                        with self.assertRaises(RuntimeError):
+                            remove_ipc_objects(temp, deadline=deadline)
+                    else:
+                        remove_ipc_objects(temp, deadline=deadline)
                 self.assertEqual(len(libc.calls), expected, libc.calls)
 
 
