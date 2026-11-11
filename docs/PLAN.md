@@ -1243,8 +1243,9 @@ going off-site.
   (5.2). What bounds such uploads is the number of render slots and the
   60 s deadline, and two a minute keep both default slots busy. A request
   head has no deadline of its own, only the 30 s timeout of each read, so
-  one that never ends holds one of the 16 workers. Both are the proxy's to stop, by reading each request completely
-  before it passes it on (README, Security model).
+  one that never ends holds one of the 16 workers. Both are the proxy's to
+  stop, by reading each request completely before it passes it on (README,
+  Security model).
 - **Egress (fetcher):** the fetcher image's own forwarder is the only way
   out: one CONNECT allowlist to YouTube's hosts on port 443, within budgets.
   yt-dlp runs in a container that shares no network with the reverse proxy

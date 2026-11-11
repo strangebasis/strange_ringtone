@@ -519,8 +519,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _render(self) -> None:
         settings = self.server.settings
         headers = self.headers
-        # docs/PLAN.md 5.2, in order. Each step raises GuardError and nothing
-        # after it runs; no body byte is read until all of them pass.
+        # The checks of section 5.2 of docs/PLAN.md, in order. Steps 1 to 4
+        # raise GuardError and nothing after them runs; no body byte is read
+        # until all of them pass. Steps 5 to 7, inside the slot, return their
+        # refusal instead, so it can be sent after the job directory is gone
+        # and the slot is free.
         require_origin(headers.get_all("Origin") or [], settings.public_origin)
         require_content_type(headers.get_all("Content-Type") or [], WAV_TYPE)
         length = body_length(
@@ -528,13 +531,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             headers.get_all("Transfer-Encoding") or [],
             settings.max_body_bytes,
         )
-        # The query and the name are checked before the rate limit and the
-        # slot, so a refused request never uses up the client's budget.
+        # Step 4 starts here. The query and the name are checked before the
+        # rate limit and the slot, so a refused request never uses up the
+        # client's budget.
         self.render_request = parse_render_request(self.path, headers, settings)
         client = client_address(
             self.client_address[0], headers.get_all("X-Forwarded-For") or [], settings.trusted_proxies
         )
-        # Step 4: both limits must have room. A client over its limit gets 429
+        # Then the rate limit must have room, the results store must not be
+        # full, and the gate must give a slot. A client over its limit gets 429
         # whether or not the gate is full, before it uploads anything. The
         # render is counted only later, once its upload has arrived and passed
         # validation (see _admit): a 503 busy or a refused upload ran no
