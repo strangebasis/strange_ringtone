@@ -54,9 +54,10 @@ def make_not_dumpable() -> None:
 
     ffmpeg parses bytes a client sent, and runs as the server's own UID in
     the server's container. Where the host's kernel.yama.ptrace_scope is 0
-    (the kernel's default), a same-UID process may ptrace a dumpable one, and
-    Docker's default seccomp and AppArmor profiles allow it, so an exploited
-    ffmpeg could attach to the server and plant code in it. Whatever
+    (some distributions' default, and how a kernel without Yama behaves), a
+    same-UID process may ptrace a dumpable one, and Docker's default seccomp
+    and AppArmor profiles allow it, so an exploited ffmpeg could attach to
+    the server and plant code in it. Whatever
     ptrace_scope says, it could read a dumpable process's /proc/<pid>/environ
     and maps. A non-dumpable target needs CAP_SYS_PTRACE for all of that, and
     the container has no capability. The flag is per process and execve
@@ -98,8 +99,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"strange_ringtone: configuration error: {error}", file=sys.stderr)
         return 2
     # Before the server starts a thread or ffmpeg runs: from here on no
-    # process of the server's UID can ptrace the server or read its /proc
-    # entries. Fail closed: a server that can't do it doesn't serve.
+    # process of the server's UID can ptrace the server or read its
+    # environment, memory map, open files or memory under /proc (its status
+    # and command line stay readable). Fail closed: a server that can't do
+    # it doesn't serve.
     try:
         make_not_dumpable()
     except OSError as error:

@@ -401,10 +401,10 @@ class Renderer:
         # it only after the PID space wrapped in between. The two paths
         # above that raise have killed the group already, so every run's
         # group is killed exactly once, and each kill is followed by the
-        # collection of what it killed. A child that called setsid() has
-        # left the group and is not reached; the core runs renders side by
-        # side, so it can't sweep its UID's processes as the fetcher's
-        # runner does.
+        # collection of what it killed. A child that called setsid() or
+        # setpgid() has left the group and is not reached; the core runs
+        # renders side by side, so it can't sweep its UID's processes as
+        # the fetcher's runner does.
         _kill_group(proc)
         _collect_group(proc)
         if proc.returncode != 0:
