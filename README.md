@@ -195,10 +195,12 @@ server, and the fetch counts against the rate limit like any other.
   server serving, or stop its renders, until a restart: by ending it
   with SIGTERM or SIGINT, by cutting its resource limits, by driving the
   container into `mem_limit`, by holding every free slot of
-  `pids_limit`, by filling the tmpfs, or by keeping its results from
-  being swept. A server that ends is started again by the example's
-  restart policy, and a restart forgets every stored tone (docs/PLAN.md,
-  sections 5.3 and 8).
+  `pids_limit`, or by keeping its results from being swept. By filling
+  the tmpfs it makes every upload fail until stored results expire and
+  free their space, while the files it wrote stay; a restart removes
+  them, because the restarted container gets a new tmpfs. A server that
+  ends is started again by the example's restart policy, and a restart
+  forgets every stored tone (docs/PLAN.md, sections 5.3 and 8).
 - *yt-dlp, yt-dlp-ejs or Deno*, through a bad release or a crafted video:
   it runs in the runner's container, which is given no secret and nothing
   of `.env` but three limits. Its only way out is the forwarder: YouTube's

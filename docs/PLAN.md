@@ -1345,9 +1345,10 @@ risks" list of the core's own, with its reason. The fetcher image's list is
   server; and empty files on the tmpfs, whose number `size=` doesn't bound
   and each of which costs memory, do it whatever the swap. It can fill the
   tmpfs with files outside its job directory, each within the file-size
-  limit, and every upload then fails until the container restarts, because
-  the server clears its scratch directory only at start. Not built: a UID or
-  a container of ffmpeg's own.
+  limit, and every upload then fails until stored results expire and free
+  their space, while the files it wrote stay; a restart removes them,
+  because the restarted container gets a new tmpfs. Not built: a UID or a
+  container of ffmpeg's own.
 
 ## 9. Supply chain, CI and releases
 
