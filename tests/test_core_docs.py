@@ -180,6 +180,15 @@ class PlanTest(unittest.TestCase):
         self.assertIn("setsid()", bullet)
         self.assertIn("setpgid()", bullet)
         self.assertIn("Not built: a UID or a container of ffmpeg's own", bullet)
+        # The figures it states are the code's: the most an output may hold,
+        # which is all a replaced tone can be, and the collection's bound.
+        size = Limits().file_size_bytes
+        self.assertEqual(size % MIB, 0, "the docs state the file-size limit in MiB")
+        mib = rf"(?<![0-9.]){size // MIB} MiB\b"
+        self.assertRegex(bullet, rf"at most the {mib} an output may hold")
+        self.assertRegex(bullet, rf"most {mib}: any bytes")
+        self.assertEqual(set(re.findall(r"([0-9.]+) MiB", bullet)), {str(size // MIB)})
+        self.assertRegex(bullet, rf"within the collection's {COLLECT_SECONDS:g} s\b")
         # Accepting a risk is the owner's decision, not the docs'.
         self.assertNotRegex(bullet, r"(?i)\baccepted\b")
 
