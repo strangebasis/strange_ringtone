@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
-from strange_ringtone.config import Settings
+from strange_ringtone.config import DEFAULT_VERSION, Settings
 from strange_ringtone.http_guard import (
     ConcurrencyGate,
     GuardError,
@@ -42,7 +42,7 @@ from strange_ringtone.names import content_disposition, parse_tone_name
 from strange_ringtone.render import FFMPEG, Renderer, RenderError, RenderParams, default_prlimit
 from strange_ringtone.results import ResultStore, StoreFull
 from strange_ringtone.static import ALLOWED, StaticFiles
-from strange_ringtone.wav import WavError, inspect_wav
+from strange_ringtone.wav import WavError, WavInfo, inspect_wav
 
 SERVER_NAME = "strange_ringtone"
 RENDER_PATH = "/api/render"
@@ -87,6 +87,9 @@ CHUNK_BYTES = 65536
 # the largest body (MAX_CLIP_SECONDS 40, about 7.7 MB) at roughly 1 Mbit/s.
 BODY_DEADLINE_SECONDS = 60
 IMMUTABLE = "public, max-age=31536000, immutable"
+# Stored, but asked for again on every use. No validator is sent, so asking
+# again downloads the file again.
+NO_CACHE = "no-cache"
 NO_STORE = "no-store"
 # Caps what one log line can carry from a client-chosen path.
 _LOG_PATH_MAX = 200
@@ -162,24 +165,16 @@ def parse_render_request(path: str, headers: Message, settings: Settings) -> Ren
 
 
 def render_and_store(job_dir: Path, handler: Handler) -> None:
-    """The render hook: validate in.wav, render it, keep the result, answer JSON.
+    """The render hook: render in.wav, keep the result, answer JSON.
 
-    Runs inside the render slot with job_dir/in.wav complete. The handler
-    deletes job_dir before it sends the answer, so out.m4a is moved into the
-    results store before this returns.
+    Runs inside the render slot, after the handler has validated
+    job_dir/in.wav (its shape is handler.wav_info) and counted the render
+    against its client. The handler deletes job_dir before it sends the
+    answer, so out.m4a is moved into the results store before this returns.
     """
     server = handler.server
     request = handler.render_request
-    try:
-        info = inspect_wav(job_dir / "in.wav", server.settings.max_clip_seconds)
-    except WavError as error:
-        # These two carry a detail, which GuardError can't, so they are
-        # answered here. The detail is one of the fixed codes in wav.py.
-        if error.code == "too_long":
-            handler.send_json(413, {"error": "too_large", "detail": "too_long"})
-        else:
-            handler.send_json(400, {"error": "bad_wav", "detail": error.code})
-        return
+    info = handler.wav_info
     params = RenderParams(
         fade_in=request.fade_in,
         fade_out=request.fade_out,
@@ -266,6 +261,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     server: RingtoneServer
     # Set by _render once the query and the name have passed, for the hook.
     render_request: RenderRequest
+    # Set by _render once the upload has passed validation, for the hook.
+    wav_info: WavInfo
 
     # One request per connection, always closed afterwards: no keep-alive state
     # to reason about, and no worker parked on an idle socket. It also means
@@ -469,8 +466,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if asset is not None:
             body, content_type = asset
             # Safe to cache forever: a release changes VERSION, and with it
-            # every asset URL.
-            self.send_body(200, body, content_type, IMMUTABLE)
+            # every asset URL. The default version names no release, so a
+            # rebuild serves new files under the same URLs, and a browser or
+            # proxy that kept them for a year would run old code.
+            cache_control = NO_CACHE if self.server.settings.version == DEFAULT_VERSION else IMMUTABLE
+            self.send_body(200, body, content_type, cache_control)
             return
         match = RESULT_PATH_RE.fullmatch(path) if path is not None else None
         if match is not None:
@@ -515,8 +515,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _render(self) -> None:
         settings = self.server.settings
         headers = self.headers
-        # docs/PLAN.md 5.2, in order. Each step raises GuardError and nothing
-        # after it runs; no body byte is read until all of them pass.
+        # The checks of section 5.2 of docs/PLAN.md, in order. Steps 1 to 4
+        # raise GuardError and nothing after them runs; no body byte is read
+        # until all of them pass. Steps 5 to 7, inside the slot, return their
+        # refusal instead, so it can be sent after the job directory is gone
+        # and the slot is free.
         require_origin(headers.get_all("Origin") or [], settings.public_origin)
         require_content_type(headers.get_all("Content-Type") or [], WAV_TYPE)
         length = body_length(
@@ -524,16 +527,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             headers.get_all("Transfer-Encoding") or [],
             settings.max_body_bytes,
         )
-        # The query and the name are checked before the rate limit and the
-        # slot, so a refused request never uses up the client's budget.
+        # Step 4 starts here. The query and the name are checked before the
+        # rate limit and the slot, so a refused request never uses up the
+        # client's budget.
         self.render_request = parse_render_request(self.path, headers, settings)
         client = client_address(
             self.client_address[0], headers.get_all("X-Forwarded-For") or [], settings.trusted_proxies
         )
-        # Step 4: both limits must have room. A client over its limit gets 429
-        # whether or not the gate is full, but a render is counted only once
-        # the gate admits it: a 503 busy ran no render, so a client retrying
-        # after its Retry-After must not burn its budget on refusals.
+        # Then the rate limit must have room, the results store must not be
+        # full, and the gate must give a slot. A client over its limit gets 429
+        # whether or not the gate is full, before it uploads anything. The
+        # render is counted only later, once its upload has arrived and passed
+        # validation (see _admit): a 503 busy or a refused upload ran no
+        # render, and behind a proxy every client may share one key, so
+        # refusals must not burn anyone's budget.
         allowed, retry_after = self.server.limiter.has_room(client)
         if not allowed:
             raise GuardError(429, "rate_limited", retry_after=retry_after)
@@ -543,11 +550,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.server.results.is_full():
             raise GuardError(503, "results_full", retry_after=RESULTS_FULL_RETRY_SECONDS)
         with self.server.gate.slot():
-            # Counted here, atomically: a parallel request from the same client
-            # may have taken the last hit since has_room answered.
-            allowed, retry_after = self.server.limiter.allow(client)
-            if not allowed:
-                raise GuardError(429, "rate_limited", retry_after=retry_after)
             # A fresh directory per job, with names the server picked: nothing a
             # client sends ever becomes part of a path.
             try:
@@ -560,7 +562,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise GuardError(500, "internal_error") from None
             answer = b""
             try:
+                # Steps 5 to 7: receive the body, validate it, count the
+                # render. The hook runs only when all three pass, so no hook,
+                # the real one or a test's, ever sees an upload the validator
+                # refused, and none has to remember to count.
                 failure = self._receive_body(job_dir / "in.wav", length)
+                if failure is None:
+                    failure = self._admit(job_dir / "in.wav", client)
                 if failure is None:
                     answer = self._run_hook(job_dir)
             finally:
@@ -570,12 +578,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # answer must not find its own render still holding the slot.
         if failure is not None:
             try:
-                self.send_json_error(failure.status, failure.code)
+                self._send_refusal(failure)
             except OSError:
                 # The client is gone; there is nobody to tell.
                 pass
             return
         self.wfile.write(answer)
+
+    def _admit(self, upload: Path, client: str) -> GuardError | WavError | None:
+        """Validate the upload, then count the render; the refusal if either says no.
+
+        Validation comes first, so an upload that is refused costs its sender
+        nothing. The count goes through allow(), under the limiter's lock: a
+        parallel request of the same client may have taken the last hit since
+        has_room answered.
+        """
+        try:
+            self.wav_info = inspect_wav(upload, self.server.settings.max_clip_seconds)
+        except WavError as error:
+            return error
+        except OSError:
+            # The upload can't be read back (the scratch directory went away,
+            # say): a clean 500, as for a failed write.
+            return GuardError(500, "internal_error")
+        allowed, retry_after = self.server.limiter.allow(client)
+        if not allowed:
+            return GuardError(429, "rate_limited", retry_after=retry_after)
+        return None
+
+    def _send_refusal(self, failure: GuardError | WavError) -> None:
+        if isinstance(failure, WavError):
+            # These two carry a detail, which GuardError can't. The detail is
+            # one of the fixed codes in wav.py.
+            if failure.code == "too_long":
+                self.send_json(413, {"error": "too_large", "detail": "too_long"})
+            else:
+                self.send_json(400, {"error": "bad_wav", "detail": failure.code})
+            return
+        self.send_json_error(failure.status, failure.code, failure.retry_after)
 
     def _run_hook(self, job_dir: Path) -> bytes:
         """Run the render hook with its response held in memory, and return that response.
