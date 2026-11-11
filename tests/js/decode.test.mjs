@@ -4,6 +4,12 @@ import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 
 import { MAX_INPUT_SECONDS, MIN_INPUT_SECONDS, decodeFile } from "../../core/static/audio/decode.js";
+// The byte cap through the namespace: a named import of a missing export would
+// stop this whole file from loading instead of failing the tests that need it.
+import * as decodeModule from "../../core/static/audio/decode.js";
+
+const MAX_INPUT_BYTES = decodeModule.MAX_INPUT_BYTES;
+const MIB = 1024 * 1024;
 
 function fakeBuffer(channels, length, sampleRate) {
   const data = Array.from({ length: channels }, (_, c) => new Float32Array(length).fill(c + 1));
@@ -41,7 +47,21 @@ class FakeOffline {
   }
 }
 
-const file = { arrayBuffer: async () => new ArrayBuffer(8) };
+// A Blob always has a size; decodeFile looks at it before reading anything.
+const file = { size: 8, arrayBuffer: async () => new ArrayBuffer(8) };
+
+// A file of the given size that records every read of its bytes.
+function sizedFile(size) {
+  const reads = [];
+  return {
+    size,
+    reads,
+    arrayBuffer: async () => {
+      reads.push(size);
+      return new ArrayBuffer(8);
+    },
+  };
+}
 
 function install(buffer) {
   decoded = buffer;
@@ -115,4 +135,46 @@ test("an undecodable file and a missing Web Audio give plain messages", async ()
   await assert.rejects(decodeFile(file), /could not be read as audio/);
   delete globalThis.OfflineAudioContext;
   await assert.rejects(decodeFile(file), /cannot decode audio/);
+});
+
+test("the byte cap is 64 MiB", () => {
+  assert.equal(MAX_INPUT_BYTES, 64 * MIB, "decode.js exports MAX_INPUT_BYTES, 64 MiB");
+});
+
+test("a file one byte over the byte cap is refused before any of it is read", async () => {
+  install(fakeBuffer(2, 44100 * 3, 44100));
+  const big = sizedFile(64 * MIB + 1);
+  await assert.rejects(decodeFile(big), (error) => {
+    // app.js shows the words of a plain Error only.
+    assert.equal(error.constructor, Error);
+    assert.match(error.message, /64 MB/);
+    // What to do about it: trim it, or save it smaller, then pick it again.
+    assert.match(error.message, /trim/i);
+    assert.match(error.message, /MP3/);
+    assert.match(error.message, /M4A/);
+    return true;
+  });
+  assert.deepEqual(big.reads, [], "the oversized file was read");
+  assert.deepEqual(contexts, [], "a decoder was made for the oversized file");
+});
+
+test("a file exactly at the byte cap goes on to the decoder", async () => {
+  assert.equal(MAX_INPUT_BYTES, 64 * MIB, "decode.js exports MAX_INPUT_BYTES, 64 MiB");
+  install(fakeBuffer(2, 44100 * 3, 44100));
+  const atCap = sizedFile(MAX_INPUT_BYTES);
+  const result = await decodeFile(atCap);
+  assert.equal(result.length, 44100 * 3);
+  assert.deepEqual(atCap.reads, [MAX_INPUT_BYTES]);
+  assert.equal(contexts.length, 1);
+});
+
+test("a file whose size is not a number is refused unread", async () => {
+  // The comparison fails closed: something that is not a Blob does not slip
+  // past the cap by having no size.
+  for (const size of [undefined, Number.NaN]) {
+    install(fakeBuffer(2, 44100 * 3, 44100));
+    const odd = sizedFile(size);
+    await assert.rejects(decodeFile(odd), Error, String(size));
+    assert.deepEqual(odd.reads, [], String(size));
+  }
 });

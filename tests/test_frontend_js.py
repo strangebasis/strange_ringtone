@@ -260,5 +260,72 @@ class FetchMessagesCoverFetcherCodesTest(unittest.TestCase):
                 self.assertNotIn("(HTTP ", message)
 
 
+
+class PageByteCapDocumentedTest(unittest.TestCase):
+    """The docs state the page's byte cap wherever they state the limits it sits beside.
+
+    The page refuses a picked or fetched file over MAX_INPUT_BYTES before it
+    decodes it, whatever FETCH_MAX_BYTES allows, so the docs that size a fetch
+    or state the decode limit must say so too.
+    """
+
+    CAP_MIB = 64
+    FIGURE = re.compile(rf"\b{CAP_MIB} Mi?B\b")
+
+    @staticmethod
+    def read(*parts: str) -> str:
+        return ROOT.joinpath(*parts).read_text(encoding="utf-8")
+
+    @staticmethod
+    def between(text: str, start: str, end: str) -> str:
+        """The text from the line that starts with `start` up to the next line that starts with `end`."""
+        match = re.search(rf"^{re.escape(start)}.*?(?=^{re.escape(end)})", text, re.S | re.M)
+        if match is None:
+            raise AssertionError(f"no block from {start!r} to {end!r}")
+        return match.group(0)
+
+    @unittest.skipIf(NODE is None, NO_NODE)
+    def test_decode_js_cap_is_the_documented_figure(self) -> None:
+        script = (
+            "import { pathToFileURL } from 'node:url';"
+            "const decode = await import(pathToFileURL(process.argv[1]).href);"
+            "process.stdout.write(JSON.stringify(decode.MAX_INPUT_BYTES ?? null));"
+        )
+        proc = run_node(["--input-type=module", "-e", script, str(AUDIO / "decode.js")], timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), self.CAP_MIB * 1024 * 1024, "decode.js exports MAX_INPUT_BYTES")
+
+    def test_readme_fetch_max_bytes_row_names_the_page_cap(self) -> None:
+        rows = [line for line in self.read("README.md").splitlines() if line.startswith("| `FETCH_MAX_BYTES` |")]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertRegex(rows[0], self.FIGURE)
+
+    def test_env_example_fetch_max_bytes_comment_names_the_page_cap(self) -> None:
+        lines = self.read(".env.example").splitlines()
+        at = next(i for i, line in enumerate(lines) if line.startswith("# FETCH_MAX_BYTES="))
+        start = at
+        while start > 0 and lines[start - 1].startswith("#"):
+            start -= 1
+        self.assertRegex("\n".join(lines[start:at]), self.FIGURE)
+
+    def test_readme_states_the_size_beside_the_ten_minute_limits(self) -> None:
+        readme = self.read("README.md")
+        with self.subTest(where="a picked file, How it works"):
+            self.assertRegex(self.between(readme, "## How it works", "#"), self.FIGURE)
+        with self.subTest(where="a fetched video"):
+            self.assertRegex(self.between(readme, "- Videos can be up to 10 minutes long", "- "), self.FIGURE)
+
+    def test_plan_states_the_cap_where_the_browser_decodes(self) -> None:
+        plan = self.read("docs", "PLAN.md")
+        sections = self.between(plan, "## 4.", "## 5.") + self.between(plan, "## 7.", "## 8.")
+        self.assertRegex(sections, self.FIGURE)
+
+    def test_plan_fetcher_accepted_risks_name_the_decoder_and_the_cap(self) -> None:
+        fetcher = self.between(self.read("docs", "PLAN.md"), "## 6.", "## 7.")
+        risks = self.between(fetcher, "**Accepted risks.**", "**")
+        self.assertIn("decoder", risks)
+        self.assertRegex(risks, self.FIGURE)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,10 +4,25 @@
 
 /**
  * The longest input accepted, in seconds. A 10-minute stereo clip at 44.1 kHz
- * is already about 210 MB of Float32 plus the decoder's own copy; an hour-long
- * file would crash a Safari tab instead of showing a message.
+ * is already about 210 MB of Float32 plus the decoder's own copy, and the
+ * editor works on all of it. The duration is known only once the file is
+ * decoded, so this check runs after the decode; MAX_INPUT_BYTES is what runs
+ * before it. A small file at a very low bitrate can still decode to more than
+ * a tab can hold, and then the tab ends before this check is reached.
  */
 export const MAX_INPUT_SECONDS = 600;
+
+/**
+ * The largest input accepted, in bytes, checked before any of the file is read
+ * or decoded, for a picked file and fetched audio alike. 64 MiB holds 10
+ * minutes of lossy compressed audio at any usual bitrate (an MP3 at 320 kbit/s
+ * is about 24 MB, YouTube's AAC about 10 MB). Lossless audio may not fit:
+ * CD-quality WAV passes it after about six minutes, and FLAC or Apple
+ * Lossless (which also comes as .m4a) often before ten, which is why the
+ * refusal suggests MP3 or AAC. It bounds what is read into memory, not what
+ * decoding makes of it.
+ */
+export const MAX_INPUT_BYTES = 64 * 1024 * 1024;
 
 /**
  * The shortest input accepted, in seconds: the server refuses a selection
@@ -34,6 +49,13 @@ export async function decodeFile(file, sampleRate = 44100) {
   const Offline = globalThis.OfflineAudioContext;
   if (typeof Offline !== "function") {
     throw new Error("This browser cannot decode audio. Try a recent Safari, Chrome or Firefox.");
+  }
+  // Before a byte is read: decoding a file of hundreds of megabytes can end a
+  // phone's tab before the duration check below ever runs. Written so that a
+  // size that is missing or not a number is refused too.
+  if (!(file.size <= MAX_INPUT_BYTES)) {
+    throw new Error(`This file is larger than ${MAX_INPUT_BYTES / (1024 * 1024)} MB. Trim it first, or save it `
+      + "in a smaller format such as MP3 or AAC (M4A), then pick it again.");
   }
   const bytes = await file.arrayBuffer();
   let decoded;
