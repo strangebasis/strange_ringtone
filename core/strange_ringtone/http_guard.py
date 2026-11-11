@@ -205,7 +205,8 @@ class RateLimiter:
         """What allow() would answer now, without counting the call.
 
         Lets the server refuse an over-limit client with 429 before it asks the
-        concurrency gate, yet count a render only once the gate has admitted it.
+        concurrency gate or reads the upload, yet count a render only once its
+        upload has passed validation.
         """
         return self._check(key, record=False)
 
