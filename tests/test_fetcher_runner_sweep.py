@@ -688,16 +688,16 @@ class RealSweepTest(unittest.TestCase):
         download = self.leftover_runner(sweep=False).fetch(VIDEO_ID, self.job())
         self.assertTrue(download.audio.is_file())
         time.sleep(0.5)
-        # The hopper takes a new PID every 10 ms: one listing of /proc can
-        # name its old PID, a zombie by the time it is read, and not yet
-        # its new one. So it is looked for a few times before the stub's
-        # leftovers count as too few.
-        for _ in range(20):
+        # others() lists /proc and then reads each entry, and the hopper moves
+        # to a new PID every 10 ms. A look that it hops during finds its old
+        # PID a zombie and never saw its new one, so it counts one live
+        # process too few. Looked at again, for a moment, until both show.
+        deadline = time.monotonic() + 5
+        while True:
             left = self.others()
             live = [row for row in left if row[1] != "Z"]
-            if len(live) >= 2:
+            if len(live) >= 2 or time.monotonic() >= deadline:
                 break
-            time.sleep(0.02)
         zombies = [row for row in left if row[1] == "Z"]
         self.assertGreaterEqual(len(live), 2, f"the stub left too little to prove anything: {left}")
         self.assertGreaterEqual(len(zombies), 1, f"no zombie for PID 1 to reap: {left}")
