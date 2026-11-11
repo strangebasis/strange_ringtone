@@ -17,6 +17,10 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 DEFAULT_SOURCE_URL = "https://github.com/strangebasisdevs/strange_ringtone"
+# The version outside a release. Spelled once: the server sends the static
+# files of this version with no-cache instead of a year's caching, and a
+# second spelling that drifted would bring the year back.
+DEFAULT_VERSION = "dev"
 
 # ASCII digits only. str.isdigit() and int() also accept other scripts' digits,
 # signs, underscores and surrounding whitespace, none of which an operator means.
@@ -75,7 +79,7 @@ class Settings:
     max_results: int = 50
     fetch_enabled: bool = False
     source_url: str = DEFAULT_SOURCE_URL
-    version: str = "dev"
+    version: str = DEFAULT_VERSION
     scratch_dir: Path = field(default_factory=_default_scratch_dir)
 
     @property
@@ -249,7 +253,7 @@ def _parse_source_url(value: str | None) -> str:
 
 def _parse_version(value: str | None) -> str:
     if value is None:
-        return "dev"
+        return DEFAULT_VERSION
     if not _VERSION_RE.fullmatch(value):
         raise ConfigError(
             "VERSION must be 1 to 64 characters of letters, digits, '.', '_' or '-', starting with a letter or digit"
