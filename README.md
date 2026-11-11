@@ -578,8 +578,9 @@ above); `compose.example.yaml` shows them in place.
   sets 64 for the fetcher, at least twice its worst case of 21: the main
   thread, 16 request workers, the job worker and the sweeper, the health
   check, and the runner client's deadline timer. It sets 160 for the runner,
-  at least twice its worst case of 74: the main thread, 4 request workers,
-  the result sweeper, the health check, and one yt-dlp run of up to 67
+  at least twice its worst case of 75: the main thread, 4 request workers,
+  the result sweeper, the thread that reads a run's stderr, the health
+  check, and one yt-dlp run of up to 67
   threads with Deno, sized for a host that reports 64 CPUs; nothing of an
   earlier run adds to that, because the runner kills and reaps whatever a
   run leaves (see Runs with). It sets 320 for

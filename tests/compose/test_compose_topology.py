@@ -97,6 +97,8 @@ IP_FORWARD = "net.ipv4.ip_forward"
 # process (Docker runs one at a time). The fetcher also: the job worker and
 # the sweeper (Jobs.start), and the runner client's deadline timer for the
 # one exchange the job worker has open. The runner also: its result sweeper,
+# the thread that reads a run's stderr while the run goes on (both counted
+# from the code in tests/test_fetcher_runner_threads.py),
 # and one yt-dlp run, measured offline in the image under the contract
 # flags: yt-dlp's Python 1 thread, Deno's main thread, 2 tokio threads and
 # V8's workers, at most 4 there (one per usable CPU up to 4), counted as 63
@@ -104,7 +106,7 @@ IP_FORWARD = "net.ipv4.ip_forward"
 SERVICE_FIXED_THREADS = 1 + 1
 JOB_THREADS = 2
 CLIENT_THREADS = 1
-RUNNER_THREADS = 1
+RUNNER_THREADS = 1 + 1
 YTDLP_RUN_THREADS = 1 + 1 + 2 + 63
 # ICMP redirects (compose.example.yaml). With forwarding off the kernel takes a
 # redirect when `all` or the receiving interface says 1, and turning forwarding

@@ -706,8 +706,9 @@ source of abuse.
   yt-dlp runs it, starts its main thread, 2 tokio threads and one V8 worker
   per usable CPU up to 4 (7 threads with 4 CPUs or more, measured offline in
   the image), and yt-dlp's Python 1 thread. The runner's `pids_limit: 160`
-  is at least twice its worst case of 74: the main thread, 4 request workers
-  (`RunnerServer.MAX_WORKERS`), the result sweeper, the health check, and
+  is at least twice its worst case of 75: the main thread, 4 request workers
+  (`RunnerServer.MAX_WORKERS`), the result sweeper, the thread that reads a
+  run's stderr while the run goes on, the health check, and
   one yt-dlp run counted as 67 (V8's workers as 63, for a host that reports
   64 CPUs, in case the cap of 4 doesn't hold there). The fetcher, which
   runs no yt-dlp, has `pids_limit: 64`, at least twice its worst case of

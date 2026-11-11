@@ -327,10 +327,11 @@ services:
     # that runs as 10001, so it bounds nothing per container; this does, and
     # a thread that can't start fails its request closed. The worst case: the
     # main thread, 4 request workers (RunnerServer.MAX_WORKERS), the result
-    # sweeper, the health check, and one yt-dlp run (one job at a time),
+    # sweeper, the thread that reads a run's stderr, the health check, and one
+    # yt-dlp run (one job at a time),
     # which is yt-dlp's Python (1 thread) and Deno (its main thread, 2 tokio
     # threads and V8's workers: 4 at most as measured, counted here as 63 for
-    # a host that reports 64 CPUs), so 1 + 4 + 1 + 1 + 67 = 74. 160 is more
+    # a host that reports 64 CPUs), so 1 + 4 + 1 + 1 + 1 + 67 = 75. 160 is more
     # than twice that. Nothing of a run is left over to add to it: the runner
     # kills each run's process group when the run ends, and, as this
     # container's PID 1, sweeps before and after every run: kill(-1) ends
