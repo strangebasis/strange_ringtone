@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 
 import helpers
-from strange_ringtone.render import STDERR_TAIL_BYTES, Limits, measure_args
+from strange_ringtone.render import COLLECT_SECONDS, STDERR_TAIL_BYTES, Limits, measure_args
 
 README = helpers.ROOT / "README.md"
 PLAN = helpers.ROOT / "docs" / "PLAN.md"
@@ -126,6 +126,16 @@ class PlanTest(unittest.TestCase):
         self.assertIn("RLIMIT_NPROC", section)
         self.assertIn("`pids_limit`", section)
 
+    def test_the_render_pipeline_says_what_the_group_kill_leaves(self) -> None:
+        section = _flat(_section(self.plan, "5.3 "))
+        # The collection after each group kill, bounded as render.py bounds it.
+        self.assertRegex(section, rf"at most {COLLECT_SECONDS:g} s\b")
+        # Both ways out of the group are named, and no sentence says that a
+        # child a run left behind can't outlive it.
+        self.assertIn("setsid()", section)
+        self.assertIn("setpgid()", section)
+        self.assertNotIn("doesn't outlive it (unless", section)
+
     def test_the_contract_draft_names_the_core_caps(self) -> None:
         section = _section(self.plan, "5.7 ")
         rows = [line for line in section.splitlines() if line.startswith("| Runs with |")]
@@ -168,6 +178,7 @@ class PlanTest(unittest.TestCase):
                 self.assertNotIn(stale, bullet)
         # What remains, and what is still not built.
         self.assertIn("setsid()", bullet)
+        self.assertIn("setpgid()", bullet)
         self.assertIn("Not built: a UID or a container of ffmpeg's own", bullet)
         # Accepting a risk is the owner's decision, not the docs'.
         self.assertNotRegex(bullet, r"(?i)\baccepted\b")
