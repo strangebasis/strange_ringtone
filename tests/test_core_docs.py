@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 
 import helpers
-from strange_ringtone.render import Limits, measure_args
+from strange_ringtone.render import STDERR_TAIL_BYTES, Limits, measure_args
 
 README = helpers.ROOT / "README.md"
 PLAN = helpers.ROOT / "docs" / "PLAN.md"
@@ -115,10 +115,13 @@ class PlanTest(unittest.TestCase):
         section = _flat(_section(self.plan, "5.3 "))
         size = Limits().file_size_bytes
         self.assertEqual(size % MIB, 0, "the docs state the file-size limit in MiB")
-        self.assertIn(f"{size // MIB} MiB", section)
+        # Not preceded by a digit: "64 MiB" contains "4 MiB".
+        self.assertRegex(section, rf"(?<![0-9.]){size // MIB} MiB\b")
         # The renderer reads the pipes itself and keeps a bounded tail;
         # communicate() keeps everything, and the core no longer uses it.
         self.assertNotIn("communicate()", section)
+        self.assertEqual(STDERR_TAIL_BYTES % 1024, 0, "the docs state the kept tail of stderr in KiB")
+        self.assertRegex(section, rf"(?<![0-9.]){STDERR_TAIL_BYTES // 1024} KiB\b")
         # No process limit in prlimit, and why: the cgroup's cap does it.
         self.assertIn("RLIMIT_NPROC", section)
         self.assertIn("`pids_limit`", section)
