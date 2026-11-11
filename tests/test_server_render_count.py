@@ -321,3 +321,25 @@ class RefusedBeforeTheSlotTest(RenderCountTestCase):
         self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(self.hits(), 1)
         self.assertNoJobLeft()
+
+
+class UnreadableUploadTest(RenderCountTestCase):
+    def test_an_upload_that_cannot_be_read_back_is_a_clean_500(self) -> None:
+        # The upload arrived whole, but reading it back for validation fails
+        # (the scratch directory went away, say). The answer is the JSON 500
+        # of a failed write, not a dropped connection or a logged traceback,
+        # and an upload that was never validated costs nothing and never
+        # reaches the hook.
+        hook = base.RenderHook()
+        self.start(render_hook=hook, clock=self.clock, rate_limit_renders_per_minute=1)
+        unreadable = OSError(2, "No such file or directory")
+        with mock.patch.object(server_module, "inspect_wav", side_effect=unreadable):
+            self.assertJsonError(self.send_whole(self.valid_body()), 500, "internal_error")
+        self.assertEqual(hook.calls, [], "the hook was given an upload that was never validated")
+        self.assertEqual(self.hits(), 0, "an upload that was never validated was counted")
+        self.wait_for_log("POST /api/render 500")
+        self.assertNotIn("error while handling a request", self.log.getvalue())
+        self.assertScratchEmpty()
+        # The client's one render is still there.
+        self.assertEqual(self.post_valid().status, 200)
+        self.assertEqual(len(hook.calls), 1)
