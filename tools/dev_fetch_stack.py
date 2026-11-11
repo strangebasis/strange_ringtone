@@ -163,9 +163,10 @@ class Proxy(socketserver.ThreadingTCPServer):
 def dev_version() -> str:
     """A VERSION for this start of the stack, so the browser never runs stale code.
 
-    The core serves /static/<version>/ as immutable, which is right for a
-    release (a release changes the version, and with it every asset path) but
-    would make a browser keep the modules of an earlier start of this stack
+    The core serves /static/<version>/ as immutable under every version but
+    its default, "dev". That is right for a release (a release changes the
+    version, and with it every asset path), but a version kept across starts
+    of this stack would make a browser keep the modules of an earlier start
     across code changes. A new segment for every start sidesteps that cache.
     """
     # The clock alone can repeat within a tick (Windows), hence the random part.

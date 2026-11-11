@@ -143,7 +143,7 @@ is the image's forwarder (section 6.1, milestone 5's follow-up).
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/` | App page. Static HTML, config in escaped `data-*` attributes, no inline script. |
-| GET | `/static/<version>/…` | JS, CSS and icons from an in-memory allowlist. The version segment is the image's `VERSION` build argument (`dev` outside a release), so `immutable` caching is safe: a release changes the URLs. |
+| GET | `/static/<version>/…` | JS, CSS and icons from an in-memory allowlist. The version segment is the image's `VERSION` build argument (`dev` outside a release). Under a release version the files are sent `immutable` for a year, which is safe because a release changes the URLs. Under `dev` they are sent `no-cache`: a rebuild serves new files under the same URLs, so a browser or proxy must ask again on every use, and with no validator sent that means downloading them again. |
 | GET | `/healthz` | `200`, empty body |
 | POST | `/api/render` | Body: `audio/wav`. Query: `fade_in`, `fade_out`, `normalize`, `target_lufs`. The name goes in the `X-Tone-Name` header. Returns JSON `{result_id, duration, measured_lufs, applied_gain_db}`. |
 | GET | `/api/result/<id>.m4a` and `.m4r` | The rendered tone (attachment). `<id>` is 128 random bits and expires after `RESULT_TTL_SECONDS`. |
@@ -175,18 +175,31 @@ result URLs directly.
    and the length is at most `MAX_BODY_BYTES`. That limit is derived from
    `MAX_CLIP_SECONDS × 48000 × 2 ch × 2 B` plus 4 KiB, which is about 5.8 MB at
    30 s.
-4. The per-client rate limit and the render concurrency limit have room.
+4. The render options in the query and the `X-Tone-Name` header are valid.
+   Then the per-client rate limit has room (checked, not yet counted), the
+   results store is not full, and the render concurrency limit gives the
+   request a slot. A client over its limit gets 429 here, before it uploads
+   anything.
 5. The body streams into a fresh per-job directory under the scratch path, with
-   a server-generated name.
+   a server-generated name, and must arrive whole within 60 s.
 6. Stdlib `wave` parses it, and a strict RIFF walk rejects duplicate `fmt `/`data`
    chunks or a declared size that disagrees with the file. Allowed: PCM s16le, 1
    or 2 channels, 44.1 or 48 kHz, duration from 0.5 s to exactly
    `MAX_CLIP_SECONDS`. The frame count may not exceed seconds × rate, with no
    tolerance, because iOS accepted 30.000 s and refused 30.5 s.
-7. Only then does ffmpeg run, still with explicit `-f wav`.
+7. The render is counted against the client's rate limit, in one locked step
+   that checks and counts. If parallel requests from the same client took the
+   last hits since step 4, the answer is 429 with `Retry-After` and nothing
+   renders.
+8. Only then does ffmpeg run, still with explicit `-f wav`.
 
-The job directory is deleted in a `finally`. Tests prove that nothing is left
-behind on any path (section 10).
+A request refused at any step up to 6 costs its client no render. One that
+passes step 7 has used one, whatever the render then answers. The server, not
+the render hook, does steps 5 to 7, and calls the hook only after all of them
+pass, so a hook can neither see an upload the validator refused nor skip the
+count. The job directory is deleted in a `finally`, and every refusal from
+step 5 on is sent only after that and after the slot is free. Tests prove that
+nothing is left behind on any path (section 10).
 
 ### 5.3 Render pipeline (sketch; exact flags are checked against the pinned build)
 
@@ -1225,11 +1238,14 @@ going off-site.
   caps. Body reads have socket timeouts, and a whole body must arrive within
   60 s of taking a render slot (408 otherwise), so one trickled upload can't
   hold a slot for longer than that. A client that sends one after another
-  can: each costs it one hit of the rate limit, and two a minute keep both
-  default slots busy. A request head has no deadline of its own, only the
-  30 s timeout of each read, so one that never ends holds one of the 16
-  workers. Both are the proxy's to stop, by reading each request completely
-  before it passes it on (README, Security model).
+  can, and the rate limit does not slow it down: an upload that never
+  arrives whole, or that the WAV check refuses, costs its sender no hit
+  (5.2). What bounds such uploads is the number of render slots and the
+  60 s deadline, and two a minute keep both default slots busy. A request
+  head has no deadline of its own, only the 30 s timeout of each read, so
+  one that never ends holds one of the 16 workers. Both are the proxy's to
+  stop, by reading each request completely before it passes it on (README,
+  Security model).
 - **Egress (fetcher):** the fetcher image's own forwarder is the only way
   out: one CONNECT allowlist to YouTube's hosts on port 443, within budgets.
   yt-dlp runs in a container that shares no network with the reverse proxy
@@ -1242,13 +1258,15 @@ risks" list of the core's own, with its reason. The fetcher image's list is
 
 - **One client can lock the others out.** The render slots and the results
   store are one pool for every user, and behind a proxy with
-  `TRUSTED_PROXIES` empty so is the rate limit. A render is counted when it
-  takes its slot, so one that is then refused for its body still counts.
-  Nothing is evicted early (5.5), and the defaults let one address render
-  100 tones in the 10 minutes a tone lives, against a `MAX_RESULTS` of 50:
-  one address can fill the store and keep it full. Not built: counting a
-  render only once its WAV has passed, and a cap on the results one address
-  holds.
+  `TRUSTED_PROXIES` empty so is the rate limit. A render is counted only
+  once its WAV has passed the check, just before ffmpeg runs (5.2), so an
+  upload that is refused for its body costs nobody a render. It still holds
+  a render slot while it arrives, for up to 60 s: what bounds such uploads
+  is the number of slots and that deadline, and stopping a flood of them is
+  the reverse proxy's job. Nothing is evicted early (5.5), and the defaults
+  let one address render 100 tones in the 10 minutes a tone lives, against
+  a `MAX_RESULTS` of 50: one address can fill the store and keep it full.
+  Not built: a cap on the results one address holds.
 - **An exploited ffmpeg.** The WAV check (5.2) and the minimal build (5.3)
   keep small what a client's bytes reach: the WAV demuxer, the PCM decoder
   and encoder, the filters, the AAC encoder and the MP4 and null muxers
