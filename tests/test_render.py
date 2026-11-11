@@ -868,5 +868,47 @@ class PrlimitTest(StubTestCase):
             })
 
 
+class CollectedRunTest(StubTestCase):
+    """A run that ended by itself is reaped and leaves no pipe open, so a busy server doesn't leak descriptors."""
+
+    def test_every_run_is_reaped_with_its_pipes_closed(self) -> None:
+        procs: list[subprocess.Popen[bytes]] = []
+        real_popen = subprocess.Popen
+
+        def recording(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:
+            proc = real_popen(*args, **kwargs)
+            procs.append(proc)
+            return proc
+
+        for mode in ("ok", "flood"):
+            with self.subTest(mode=mode):
+                procs.clear()
+                self.set_mode(mode)
+                with mock.patch.object(render.subprocess, "Popen", recording):
+                    Renderer(STUB_COMMAND, 20).render(self.job, params(duration=1.0))
+                self.assertEqual(len(procs), 2)
+                for proc in procs:
+                    self.assertEqual(proc.returncode, 0)
+                    assert proc.stdout is not None and proc.stderr is not None
+                    self.assertTrue(proc.stdout.closed, "stdout left open")
+                    self.assertTrue(proc.stderr.closed, "stderr left open")
+
+    def test_only_the_end_of_stderr_is_kept(self) -> None:
+        # The tail, not the head: what precedes the bound is dropped, and the
+        # last byte the run wrote is the last byte kept.
+        script = (
+            "import sys; err = sys.stderr.buffer; "
+            "err.write(b'a' * 100000); err.write(b'b' * 1000); err.write(b'END'); err.flush()"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-c", script],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        kept = render._collect(proc, 20)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(len(kept), render.STDERR_TAIL_BYTES)
+        self.assertTrue(kept.endswith(b"b" * 1000 + b"END"))
+
+
 if __name__ == "__main__":
     unittest.main()
