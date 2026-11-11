@@ -71,8 +71,9 @@ def make_not_dumpable() -> None:
     """On Linux, mark this process non-dumpable (prctl PR_SET_DUMPABLE 0), or raise OSError; elsewhere, nothing.
 
     yt-dlp runs as the runner's own UID in the runner's container and is not
-    its ancestor. Where the host's kernel.yama.ptrace_scope is 0 (the
-    kernel's default), a same-UID process may ptrace a dumpable one, and
+    its ancestor. Where the host's kernel.yama.ptrace_scope is 0 (some
+    distributions' default, and how a kernel without Yama behaves), a
+    same-UID process may ptrace a dumpable one, and
     Docker's default seccomp and AppArmor profiles allow it, so a malicious
     yt-dlp could attach to the runner and plant code in it that kill(-1)
     never reaches (it spares the caller): the reach between jobs that the

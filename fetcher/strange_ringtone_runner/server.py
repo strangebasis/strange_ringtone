@@ -377,8 +377,12 @@ def remove_leftovers(root: Path, keep: Path | None = None) -> bool:
     unwritable gets the owner's permissions back, never through a link and
     never on root's parent, which lies outside. Nothing but a directory is
     ever opened, so a FIFO can't block it; another filesystem mounted
-    inside is never entered; it works iteratively, so neither a deep tree
-    nor a large directory defeats it.
+    inside is never entered; it works iteratively, relative to one open
+    directory at a time, so neither recursion, PATH_MAX nor the open-file
+    limit stops it on a deep tree, and each listing reads a directory
+    whole, however many entries it has. What depth still costs is time and
+    a little memory
+    for each level it is down.
     """
     try:
         info = os.lstat(root)
@@ -1108,10 +1112,11 @@ class RunnerServer(http.server.ThreadingHTTPServer):
             raise
 
     def _run(self, video_id: str, job: str) -> dict[str, Any]:
-        """One run under the caller's hold of busy: the answer's payload. Nothing the run left survives it.
+        """One run under the caller's hold of busy: the answer's payload, given after the clean-up (_clean_up).
 
         Only the job's own result, when the run produced one, is still in
-        the scratch directory once this returns.
+        the scratch directory once this returns, as far as the clean-up
+        could remove the rest.
         """
         results = self.results
         # Before yt-dlp writes anything: no uncollected result exists while a
