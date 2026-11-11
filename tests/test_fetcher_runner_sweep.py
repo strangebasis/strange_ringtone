@@ -688,8 +688,16 @@ class RealSweepTest(unittest.TestCase):
         download = self.leftover_runner(sweep=False).fetch(VIDEO_ID, self.job())
         self.assertTrue(download.audio.is_file())
         time.sleep(0.5)
-        left = self.others()
-        live = [row for row in left if row[1] != "Z"]
+        # The hopper takes a new PID every 10 ms: one listing of /proc can
+        # name its old PID, a zombie by the time it is read, and not yet
+        # its new one. So it is looked for a few times before the stub's
+        # leftovers count as too few.
+        for _ in range(20):
+            left = self.others()
+            live = [row for row in left if row[1] != "Z"]
+            if len(live) >= 2:
+                break
+            time.sleep(0.02)
         zombies = [row for row in left if row[1] == "Z"]
         self.assertGreaterEqual(len(live), 2, f"the stub left too little to prove anything: {left}")
         self.assertGreaterEqual(len(zombies), 1, f"no zombie for PID 1 to reap: {left}")
