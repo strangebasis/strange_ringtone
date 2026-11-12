@@ -325,7 +325,14 @@ class TemplateTest(unittest.TestCase):
         page = _Page()
         page.feed(self.text)
         by_id = {dict(attrs).get("id"): (tag, dict(attrs)) for tag, attrs in page.elements}
-        self.assertEqual(by_id["file"], ("input", {"type": "file", "id": "file", "accept": "audio/*"}))
+        # "audio/*" alone leaves an iPhone unable to pick an audio file: Safari
+        # on iOS reads it as movie types (WebKit bug 242110), so the Files
+        # picker greys audio out and offers videos. A type named by its
+        # extension is allowed there, so the field names the audio types too.
+        # "audio/*" stays for the other browsers. This only filters the
+        # picker: the page decodes by content, whatever the name.
+        self.assertEqual(by_id["file"], ("input", {
+            "type": "file", "id": "file", "accept": "audio/*,.m4a,.mp3,.wav,.aac,.aif,.aiff,.caf,.flac,.m4r"}))
         self.assertEqual(by_id["waveform"][0], "canvas")
         for slider, value in (("fade-in", "0.2"), ("fade-out", "1.5")):
             self.assertEqual(by_id[slider][1]["min"], "0")
