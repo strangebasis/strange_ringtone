@@ -1331,6 +1331,15 @@ time before any rule reads it. A start that the link or the user named is
 where the selection begins (rule 1, counted from the window's beginning); a
 default start leaves the selection to rules 2 and 3.
 
+The page is never told `FETCH_MAX_SECONDS`: what is long is the server's to
+say. So its texts name ten minutes only as the most the server fetches, and
+its privacy hint and Help say that the start time is sent "for a video
+longer than the server fetches whole", not for one over ten minutes: with a
+lower setting a shorter video's start time leaves the phone too. For the
+same reason the default start is that of the best ten minutes whatever the
+setting, which is a fair start for a shorter window and not always its
+best.
+
 The field belongs to the link it was filled for. When the same video comes
 again under a link whose timestamp was added, changed or taken away (pasted,
 or shared with `#yt=`) and nobody has typed in the field, the page fills it
@@ -1480,6 +1489,7 @@ yt-dlp's info JSON and the media server's bytes:
 | W14 | The same video under a link with another timestamp is never fetched from the old start in the new link's name, also when the link changes while a look-up is on its way; a typed start stays; another part replaces the one on its way; a tap for the part on its way opens no second job and says what named its start; asking again stops a part on its way or being decoded | JS |
 | W15 | Every check of the window program, of the runner's and the client's handling of a window and of the page's flow, its search for the default start included, was removed or weakened once (mutation run, 2026-11-12) and a test failed each time | unit, JS |
 | W16 | The search for a long video's default start scores at most four whole seconds a heatmap point, whatever length the fetcher reports, finds what a walk over every second finds, and never gives a start later than 99:59:59 | JS |
+| W17 | No text of the page names ten minutes as the length from which the start time is sent: the server's limit decides, and the page is not told it | unit |
 
 ## 7. Web app
 

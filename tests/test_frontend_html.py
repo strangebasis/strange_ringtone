@@ -413,9 +413,20 @@ class TemplateTest(unittest.TestCase):
             "If you hear nothing, turn off Silent mode.",
             "paste a video link under <strong>From YouTube</strong>",
             "<strong>Make Ringtone</strong> Shortcut",
-            "Only the video's ID reaches the server, and for a video over 10 minutes the start time you choose.",
+            "Only the video's ID reaches the server and, for a video longer than the server fetches whole"
+            " (10 minutes at most), the start time you choose.",
         ):
             self.assertIn(phrase, text)
+
+    def test_no_text_says_the_start_time_is_sent_only_for_videos_over_ten_minutes(self) -> None:
+        # The server decides what is long: FETCH_MAX_SECONDS, which a
+        # deployment may set anywhere from 1 s to 600 s, and which this page
+        # is never told. With 300, a seven-minute video's start time leaves
+        # the phone too, so naming 10 minutes as the threshold would
+        # understate what is sent. Ten minutes is only ever the most.
+        text = re.sub(r"\s+", " ", self.text)
+        self.assertNotRegex(text, r"(?i)\b(?:over|longer than|more than|above) (?:10|ten) minutes")
+        self.assertEqual(text.count("for a video longer than the server fetches whole"), 2)
 
     def test_youtube_hint_states_no_size_as_the_servers(self) -> None:
         # The server fetches up to FETCH_MAX_BYTES, which a deployment sets
@@ -426,9 +437,10 @@ class TemplateTest(unittest.TestCase):
         section = text[text.index('id="youtube"'):text.index('id="pick"')]
         self.assertIn("The server fetches up to 10 minutes of audio from YouTube.", section)
         # What leaves the phone, said where the link is pasted (docs/PLAN.md
-        # 6.2): the ID, and for a long video one more thing.
-        self.assertIn("Only the video's ID is sent, and for a video over 10 minutes the start time you choose.",
-                      section)
+        # 6.2): the ID, and for a long video one more thing. Long is what the
+        # server says it is, not a number this page could name.
+        self.assertIn("Only the video's ID is sent and, for a video longer than the server fetches whole,"
+                      " the start time you choose.", section)
         self.assertNotRegex(section, r"\b\d+(?:\.\d+)? ?(?:[KMG]i?B|bytes?)\b")
 
 
