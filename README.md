@@ -542,8 +542,12 @@ and including the attestations, under the version `rehearsal`, with no tag
 and no release touched. The scan pulls the images without logging in, so
 both packages must be public; the first push may create them private
 (docs/PLAN.md 9.3). A release whose run fails is finished by re-running its
-failed jobs, not all of them. release-please's two labels, `autorelease:
-pending` and `autorelease: tagged`, must exist in the repository: the
+failed jobs, not all of them. The exception is a scan that finds something:
+that release gets no images, and the fix ships as the next patch release.
+Before it can, swap the label on the stopped release's pull request by hand,
+from `autorelease: pending` to `autorelease: tagged`: the job that swaps it
+never ran, and release-please opens no new release pull request while the
+old one is pending. Both labels must exist in the repository, because the
 workflows' tokens may add a label to a pull request but not create one.
 
 ## Deployment contract

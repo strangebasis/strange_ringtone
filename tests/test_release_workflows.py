@@ -591,6 +591,17 @@ class PublishTest(unittest.TestCase):
         self.assertIn('gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls"', script)
         self.assertEqual(script.count("--method "), 2)
 
+    def test_the_docs_say_how_to_go_on_after_a_scan_stopped_a_release(self) -> None:
+        # relabel runs only after tag, so a release the scan stopped keeps its
+        # pending label, and release-please then opens no PR for the fix. The
+        # way out is a manual swap, which the release steps must name.
+        self.assertIn("tag", _needs(self.jobs["relabel"]))
+        swap = "from `autorelease: pending` to `autorelease: tagged`"
+        for name in ("README.md", "docs/PLAN.md"):
+            with self.subTest(document=name):
+                flat = " ".join(_text(helpers.ROOT / name).split())
+                self.assertIn(f"swap the label on the stopped release's pull request by hand, {swap}", flat)
+
     def test_the_registry_login_reads_the_token_from_stdin(self) -> None:
         logins = [
             (job, step) for job, block in self.jobs.items() for step in _steps(block)

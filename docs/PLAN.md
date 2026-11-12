@@ -1977,10 +1977,15 @@ As built in milestone 6, from the owner's decisions of 2026-10-25 and
   repository before release-please first runs.
 - **When a publish run fails.** A scan that finds something stops the
   release, which then has no images: fix forward with the next patch
-  release, never by moving the tag. Any other failure is finished by
-  re-running the failed jobs, not all of them: tagging, the notes and the
-  relabelling can each run again, and a full second run of a published
-  version is refused before it builds.
+  release, never by moving the tag. First swap the label on the stopped
+  release's pull request by hand, from `autorelease: pending` to
+  `autorelease: tagged`: `relabel` runs only after `tag`, so the label is
+  still there, and while it is, release-please opens no release PR for the
+  fix. The label says the release was tagged, which it was; only its images
+  are missing. Any other failure is finished by re-running the failed jobs,
+  not all of them: tagging, the notes and the relabelling can each run
+  again, and a full second run of a published version is refused before it
+  builds.
 - A consumer verifies a digest with `gh attestation verify` before pinning
   it (README, "Images and verification").
 - The repository also has `LICENSE` (AGPL-3.0), `SECURITY.md` (private
