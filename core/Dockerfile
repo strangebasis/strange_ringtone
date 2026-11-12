@@ -65,7 +65,7 @@ RUN if grep -Evn '^(#.*|--[a-z0-9-]+(=[a-z0-9_,]+)?)$' configure.txt; then \
 
 # The runtime. util-linux's prlimit (the render's resource limits, 5.3) ships
 # in this base image; the build fails if a base bump ever drops it.
-FROM python:3.12-slim-bookworm@sha256:6a0e06f5ba0b373d051aabd3fffb9b873f27f9a2a3a14bcbe37dee6f0e3bbc70
+FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
 
 # A fixed, non-root UID and GID are part of the deployment contract (5.7), so
 # hosts can grant or deny file access by number. No home directory and no
