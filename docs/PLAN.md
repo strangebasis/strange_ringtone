@@ -1247,6 +1247,12 @@ test to fail.
 - The loudness has a toggle (on by default) and a "Softer ↔ Louder" slider with
   a marker at the baseline and a **Reset** button.
 - The name field is pre-filled from the file name or the video title.
+- The file field asks the picker for `audio/*` and also names the audio types
+  by extension: `.m4a`, `.mp3`, `.wav`, `.aac`, `.aif`, `.aiff`, `.caf`,
+  `.flac` and `.m4r`. Safari on iOS reads `audio/*` as movie types (WebKit bug
+  242110), so with that alone the iPhone's Files picker greys out every audio
+  file and offers videos (found on 2026-11-11). The list only filters the
+  picker. The page decodes by content and refuses what it cannot decode.
 - Buttons: **Hear final**, **Get on this iPhone**, and **Download .m4r**.
 
 ### 7.2 Auto-suggesting the hook
