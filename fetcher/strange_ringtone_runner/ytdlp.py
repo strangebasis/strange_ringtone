@@ -36,6 +36,16 @@ fixed phrases that choose an error code. The metadata whitelist
 and the result types live in strange_ringtone_fetch.metadata, shared with the
 fetcher, which applies the same whitelist again to whatever the runner
 answers. tests/test_fetcher_ytdlp.py pins each guard.
+
+There are two kinds of job (docs/PLAN.md 6.2). Without a start time, yt-dlp
+downloads the audio, unless the video is longer than FETCH_MAX_SECONDS: then
+its filter ends the run (exit 101), and the few fields yt-dlp wrote before
+the filter say whether the video is long (LongVideo, nothing downloaded) or
+live. With a start time, yt-dlp runs with --skip-download and only writes
+the info JSON, and the runner's own window program
+(strange_ringtone_runner/window.py) is run as a second child, fenced in
+exactly like the first, to fetch that window of the audio by byte range. The
+two children share one wall-clock budget.
 """
 from __future__ import annotations
 
@@ -57,7 +67,15 @@ from typing import IO
 # moved with the run code (tests/test_fetcher_ytdlp.py) read them through this
 # module with their bodies unchanged.
 from strange_ringtone_fetch.metadata import ERROR_CODES as ERROR_CODES
-from strange_ringtone_fetch.metadata import VIDEO_ID_RE, Download, FetchError, parse_info
+from strange_ringtone_fetch.metadata import (
+    VIDEO_ID_RE,
+    Download,
+    FetchError,
+    LongVideo,
+    clean_start,
+    clean_window_start,
+    parse_info,
+)
 from strange_ringtone_fetch.metadata import Metadata as Metadata
 
 if sys.platform == "win32":
@@ -77,12 +95,31 @@ DENO = "/usr/local/bin/deno"
 # working directory out of the child too.
 YTDLP_PYTHON = "/opt/yt-dlp/bin/python"
 DEFAULT_COMMAND: tuple[str, ...] = (YTDLP_PYTHON, "-I", "-m", "yt_dlp")
+# The runner's own window program (docs/PLAN.md 6.2), by its path beside this
+# module, on the interpreter that runs the runner: the base interpreter,
+# whose site-packages hold nothing, and never yt-dlp's venv. The program is
+# stdlib only and imports nothing from the project, so -I costs it nothing.
+WINDOW_COMMAND: tuple[str, ...] = (sys.executable, "-I", str(Path(__file__).with_name("window.py")))
 
 WATCH_URL = "https://www.youtube.com/watch?v="
 
 # yt-dlp's exit status when a --break-match-filters filter rejects the video
 # (RejectedVideoReached, a DownloadCancelled): too long, or live.
 EXIT_REJECTED = 101
+# What yt-dlp writes at its pre_process stage, before any filter looks at the
+# video: the fields that tell a long video from a live one, and the ones the
+# page shows for a long video. One JSON object, in the job directory.
+PRE_TEMPLATE = "pre_process:%(.{title,duration,heatmap,is_live})j"
+PRE_NAME = "%(id)s.pre.json"
+# A title and at most a few hundred heatmap points: a few kB.
+PRE_MAX_BYTES = 256 * 1024
+# The window program's result: {"start": seconds, "duration": seconds}.
+WINDOW_RESULT_MAX_BYTES = 1024
+# The window program's exit statuses that have a code of their own
+# (strange_ringtone_runner.window's EXIT_PAST_END, EXIT_BLOCKED and
+# EXIT_TIMED_OUT; a test keeps the two files in step). This module does not
+# import the program: the runner only ever runs it.
+WINDOW_FAILURES = {3: "past_end", 4: "blocked", 5: "timeout"}
 # Phrases yt-dlp prints when YouTube refuses this client. Matched without
 # regard to case, and only to pick an error code.
 _BLOCKED_RE = re.compile(
@@ -202,7 +239,7 @@ def watch_url(video_id: str) -> str:
 
 
 def ytdlp_args(video_id: str, job_dir: Path, max_seconds: int, max_bytes: int) -> list[str]:
-    """yt-dlp's arguments, after the program itself."""
+    """yt-dlp's arguments for a job without a start time, after the program itself: download the audio."""
     return [
         # No configuration file from anywhere: what runs is exactly this list.
         "--ignore-config",
@@ -218,8 +255,12 @@ def ytdlp_args(video_id: str, job_dir: Path, max_seconds: int, max_bytes: int) -
         "-f", "bestaudio[ext=m4a]",
         # A breaking filter, not --match-filters: a plain filter skips the
         # video and exits 0 having written nothing, while this one exits 101,
-        # which is how too_long is told apart from other failures.
+        # which is how a long or live video is told apart from a failure.
         "--break-match-filters", f"duration <= {max_seconds} & !is_live",
+        # Written before the filter looks (yt-dlp's pre_process stage), so a
+        # run the filter ends still says why: read_rejection reads it. It
+        # does not make the run a simulation, as --print would.
+        "--print-to-file", PRE_TEMPLATE, PRE_NAME,
         "--max-filesize", str(max_bytes),
         "--write-info-json",
         "--quiet", "--no-warnings", "--no-progress",
@@ -233,11 +274,59 @@ def ytdlp_args(video_id: str, job_dir: Path, max_seconds: int, max_bytes: int) -
     ]
 
 
+def window_ytdlp_args(video_id: str, job_dir: Path) -> list[str]:
+    """yt-dlp's arguments for a job with a start time: write the info JSON of the chosen format, download nothing.
+
+    The same list as ytdlp_args with three differences: --skip-download, no
+    length in the filter (the window program bounds what is fetched) and no
+    --max-filesize (nothing is downloaded here).
+    """
+    return [
+        "--ignore-config",
+        "--no-playlist",
+        "--use-extractors", "youtube",
+        "--js-runtimes", f"deno:{DENO}",
+        "--no-cache-dir",
+        "-f", "bestaudio[ext=m4a]",
+        # A live stream has no end to count a window from, and its audio is
+        # no single file. Exit 101 here can only mean live.
+        "--break-match-filters", "!is_live",
+        # The whole point: yt-dlp only finds the address. The window
+        # program, not yt-dlp, fetches the bytes.
+        "--skip-download",
+        "--write-info-json",
+        "--quiet", "--no-warnings", "--no-progress",
+        "--socket-timeout", str(SOCKET_TIMEOUT_SECONDS),
+        "-P", str(job_dir),
+        "-o", "%(id)s.%(ext)s",
+        "--",
+        watch_url(video_id),
+    ]
+
+
+def window_args(video_id: str, job_dir: Path, start: int, max_seconds: int, max_bytes: int) -> list[str]:
+    """The window program's six arguments: three paths built from the validated ID, then three numbers."""
+    if not isinstance(video_id, str) or not VIDEO_ID_RE.fullmatch(video_id):
+        raise ValueError("not a video ID")
+    if clean_start(start) is None:
+        raise ValueError("not a start time")
+    return [
+        str(job_dir / f"{video_id}.info.json"),
+        str(job_dir / f"{video_id}.m4a"),
+        str(job_dir / f"{video_id}.window.json"),
+        str(start),
+        str(max_seconds),
+        str(max_bytes),
+    ]
+
+
 def map_failure(returncode: int, stderr: bytes) -> str:
-    """The error code for a run that exited with returncode and did not produce a result."""
-    if returncode == EXIT_REJECTED:
-        return "too_long"
-    if returncode != 0:
+    """The error code for a yt-dlp run that exited with returncode and did not produce a result.
+
+    Exit 101 is not decided here: what a filter's refusal means depends on
+    the run (read_rejection, or live for a run with a start time).
+    """
+    if returncode not in (0, EXIT_REJECTED):
         text = stderr.decode("utf-8", errors="replace")
         if _BLOCKED_RE.search(text):
             return "blocked"
@@ -284,8 +373,12 @@ def read_result(job_dir: Path, video_id: str, max_bytes: int) -> Download:
     if opened is None:
         raise FetchError("failed")
     os.close(opened[0])
-    info_path = job_dir / f"{video_id}.info.json"
-    opened = _open_regular(info_path, INFO_MAX_BYTES)
+    return Download(audio=audio, metadata=read_info(job_dir, video_id))
+
+
+def _load_json(path: Path, max_bytes: int) -> object:
+    """The parsed JSON of a regular file of at most max_bytes at path, or FetchError("failed")."""
+    opened = _open_regular(path, max_bytes)
     if opened is None:
         raise FetchError("failed")
     fd, _size = opened
@@ -293,10 +386,68 @@ def read_result(job_dir: Path, video_id: str, max_bytes: int) -> Download:
         # Closed by the with-block before anything deletes the directory,
         # because Windows can't delete an open file.
         with open(fd, "rb") as handle:
-            info = json.load(handle)
+            return json.load(handle)
     except (ValueError, RecursionError, OSError):
         raise FetchError("failed") from None
-    return Download(audio=audio, metadata=parse_info(info))
+
+
+def read_info(job_dir: Path, video_id: str) -> Metadata:
+    """The whitelisted metadata of <id>.info.json in the job directory, or FetchError("failed")."""
+    return parse_info(_load_json(job_dir / f"{video_id}.info.json", INFO_MAX_BYTES))
+
+
+def read_rejection(job_dir: Path, video_id: str, max_seconds: int) -> Exception:
+    """What to raise for a download run that a filter ended (exit 101).
+
+    The run's filter refuses a video that is live or longer than
+    max_seconds, and <id>.pre.json, which yt-dlp wrote before the filter
+    looked (PRE_TEMPLATE), says which: FetchError("live") for a live stream,
+    LongVideo with the cleaned metadata for a long video. Without that file,
+    or when it names neither reason, the run just failed: nothing here
+    guesses.
+    """
+    try:
+        pre = _load_json(job_dir / f"{video_id}.pre.json", PRE_MAX_BYTES)
+    except FetchError as failure:
+        return failure
+    if not isinstance(pre, dict):
+        return FetchError("failed")
+    # The JSON true only: a live stream has no length to compare.
+    if pre.get("is_live") is True:
+        return FetchError("live")
+    metadata = parse_info(pre)
+    if metadata.duration is not None and metadata.duration > max_seconds:
+        return LongVideo(metadata)
+    return FetchError("failed")
+
+
+def read_window_result(job_dir: Path, video_id: str, start: int, max_seconds: int, max_bytes: int) -> Download:
+    """The audio, metadata and beginning of a window job whose two runs exited 0, or FetchError("failed").
+
+    Success is exactly <id>.m4a (a regular file within the cap),
+    <id>.info.json and <id>.window.json in the job directory, and the last
+    must say something a window asked to start at start can be: it begins at
+    or before the start and less than max_seconds before it
+    (clean_window_start), and it is not longer than max_seconds, which the
+    window program never passes. Exit 0 alone proves nothing.
+    """
+    audio = job_dir / f"{video_id}.m4a"
+    opened = _open_regular(audio, max_bytes)
+    if opened is None:
+        raise FetchError("failed")
+    os.close(opened[0])
+    metadata = read_info(job_dir, video_id)
+    result = _load_json(job_dir / f"{video_id}.window.json", WINDOW_RESULT_MAX_BYTES)
+    if not isinstance(result, dict) or set(result) != {"start", "duration"}:
+        raise FetchError("failed")
+    begin = clean_window_start(result["start"], start, max_seconds)
+    length = result["duration"]
+    if begin is None or isinstance(length, bool) or not isinstance(length, int | float):
+        raise FetchError("failed")
+    # Written this way round so that NaN, which compares false, is refused.
+    if not 0 < length <= max_seconds:
+        raise FetchError("failed")
+    return Download(audio=audio, metadata=metadata, window_start=begin)
 
 
 class YtDlp:
@@ -310,16 +461,19 @@ class YtDlp:
         limits: Limits | None = None,
         proxies: tuple[tuple[str, str], ...] = (),
         sweep_strays: bool = False,
+        window_command: tuple[str, ...] = WINDOW_COMMAND,
     ) -> None:
         # Nothing here touches the filesystem, so a checkout on Windows starts
         # without yt-dlp or Deno and only a fetch fails. sweep_strays turns on
         # kill_and_reap at both run boundaries; off by default, so only the
         # runner's entry, as PID 1, ever turns it on (sweep_is_safe_here).
-        if not command:
+        if not command or not window_command:
             raise ValueError("command must name a program")
         if max_seconds < 1 or max_bytes < 1 or timeout_seconds < 1:
             raise ValueError("max_seconds, max_bytes and timeout_seconds must be at least 1")
         self.command = tuple(command)
+        # The second child of a job with a start time (docs/PLAN.md 6.2).
+        self.window_command = tuple(window_command)
         self.max_seconds = max_seconds
         self.max_bytes = max_bytes
         self.timeout_seconds = timeout_seconds
@@ -333,13 +487,22 @@ class YtDlp:
         self.sweep_strays = bool(sweep_strays)
         self._lock = threading.Lock()
         self._running: set[subprocess.Popen[bytes]] = set()
+        # How often cancel() was called. A job notes the count when it
+        # starts and starts no child once the count has changed, so a
+        # cancel() that falls between a job's two children still ends the
+        # job (as the fetcher's client does between its two requests).
+        self._cancels = 0
         # Held for a whole run while sweeping, so no sweep's waitpid(-1) runs
         # while another thread's Popen is in flight. The runner's own lock
         # already allows one run at a time; this keeps the rule in here too.
         self._run_lock = threading.Lock()
 
-    def full_command(self, args: list[str]) -> list[str]:
-        """prlimit (when configured), then the yt-dlp command, then args."""
+    def full_command(self, args: list[str], program: tuple[str, ...] | None = None) -> list[str]:
+        """prlimit (when configured), then the program (yt-dlp unless one is given), then args.
+
+        Both of a job's children run under the same limits: the window
+        program is given as program.
+        """
         prefix: list[str] = []
         if self.prlimit is not None:
             limits = self.limits
@@ -352,7 +515,7 @@ class YtDlp:
                 # Everything after -- is the program and its arguments.
                 "--",
             ]
-        return [*prefix, *self.command, *args]
+        return [*prefix, *(self.command if program is None else program), *args]
 
     def child_env(self, job_dir: Path) -> dict[str, str]:
         """The child's whole environment: fixed values plus the operator's proxy settings.
@@ -383,11 +546,27 @@ class YtDlp:
         return env
 
     def fetch(self, video_id: str, job_dir: Path) -> Download:
-        """Download video_id's audio into job_dir, or raise FetchError. The caller removes job_dir."""
+        """Download video_id's audio into job_dir, or raise FetchError. The caller removes job_dir.
+
+        LongVideo, with the video's metadata, when it is longer than
+        max_seconds: nothing was downloaded then (docs/PLAN.md 6.2).
+        """
         if not self.sweep_strays:
             return self._fetch(video_id, job_dir)
         with self._run_lock:
             return self._fetch(video_id, job_dir)
+
+    def fetch_window(self, video_id: str, job_dir: Path, start: int) -> Download:
+        """Fetch at most max_seconds of video_id's audio from second start into job_dir, or raise FetchError.
+
+        Two children, one after the other: yt-dlp, which only writes the
+        info JSON, then the window program, which fetches the bytes. The
+        Download's window_start says where the audio really begins.
+        """
+        if not self.sweep_strays:
+            return self._fetch_window(video_id, job_dir, start)
+        with self._run_lock:
+            return self._fetch_window(video_id, job_dir, start)
 
     def _sweep(self) -> bool:
         """kill_and_reap when sweeping is on; False when the sweep could not run."""
@@ -399,8 +578,65 @@ class YtDlp:
             return False
         return True
 
+    def _cancel_count(self) -> int:
+        with self._lock:
+            return self._cancels
+
     def _fetch(self, video_id: str, job_dir: Path) -> Download:
         command = self.full_command(ytdlp_args(video_id, job_dir, self.max_seconds, self.max_bytes))
+        returncode, stderr = self._run_child(command, job_dir, self.timeout_seconds, self._cancel_count())
+        if returncode == EXIT_REJECTED:
+            # The filter ended the run: long (nothing downloaded, and the
+            # page may ask for a window), live, or neither.
+            raise read_rejection(job_dir, video_id, self.max_seconds)
+        if returncode != 0:
+            raise FetchError(map_failure(returncode, stderr))
+        return read_result(job_dir, video_id, self.max_bytes)
+
+    def _fetch_window(self, video_id: str, job_dir: Path, start: int) -> Download:
+        # Both built first: a value that is no ID or no start time is a
+        # ValueError before anything runs.
+        find = self.full_command(window_ytdlp_args(video_id, job_dir))
+        cut = self.full_command(
+            window_args(video_id, job_dir, start, self.max_seconds, self.max_bytes), self.window_command
+        )
+        # Noted once for both children: a cancel() after this ends the job
+        # wherever it is, between the two as well.
+        cancels = self._cancel_count()
+        # One wall-clock budget for the two children, so a job with a start
+        # time holds the runner no longer than one without.
+        deadline = time.monotonic() + self.timeout_seconds
+        returncode, stderr = self._run_child(find, job_dir, self.timeout_seconds, cancels)
+        if returncode == EXIT_REJECTED:
+            # This run's only filter is !is_live.
+            raise FetchError("live")
+        if returncode != 0:
+            raise FetchError(map_failure(returncode, stderr))
+        # The info JSON must be there and whole before the second child is
+        # started on it: exit 0 alone proves nothing.
+        read_info(job_dir, video_id)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise FetchError("timeout")
+        # The first child and everything it started are gone by now (the
+        # group kill and the sweep in _run_child), so nothing of yt-dlp's
+        # runs beside the window program or touches what it writes.
+        returncode, _stderr = self._run_child(cut, job_dir, left, cancels)
+        if returncode != 0:
+            # The program's exit status is its whole answer; what it printed
+            # is never read.
+            raise FetchError(WINDOW_FAILURES.get(returncode, "failed"))
+        return read_window_result(job_dir, video_id, start, self.max_seconds, self.max_bytes)
+
+    def _run_child(self, command: list[str], job_dir: Path, timeout: float, cancels: int) -> tuple[int, bytes]:
+        """Run one child to its end under every guard of a run: (its exit status, the tail of its stderr).
+
+        The tail is read only for a status other than 0. FetchError("timeout")
+        when the child outlived timeout, FetchError("failed") when it could
+        not be started, a sweep could not run, or cancel() was called since
+        the job noted cancels. Used for yt-dlp and for the window program
+        alike, so both get the same fence.
+        """
         # The boundary before the run: nothing a past run (or anything else of
         # this UID) left running may watch this job's directory or results/
         # while yt-dlp writes. No Popen is in flight here. A sweep that can't
@@ -408,31 +644,37 @@ class YtDlp:
         if not self._sweep():
             raise FetchError("failed")
         try:
-            # Safe by construction: an argument list with no shell, a program
-            # fixed in code (DEFAULT_COMMAND or PRLIMIT), arguments that are
-            # constants, validated numbers, a server-created directory and a
-            # URL built from an ID that matched VIDEO_ID_RE, an environment
-            # built from scratch, and a wall-clock timeout below.
-            # tests/test_fetcher_ytdlp.py pins each of these guards.
-            proc = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                # Nothing reads stdout: map_failure looks at stderr and
-                # read_result at the files. Discarded, it costs no memory and
-                # can't fill a pipe.
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                cwd=job_dir,
-                env=self.child_env(job_dir),
-                # Its own session and process group, so a timeout can kill
-                # everything yt-dlp started, Deno included.
-                start_new_session=True,
-            )
+            # Under the lock cancel() takes, so a child is either in _running
+            # when cancel() looks, and is killed, or is never started: a
+            # cancel() that falls between a job's two children ends the job.
+            with self._lock:
+                if self._cancels != cancels:
+                    raise FetchError("failed")
+                # Safe by construction: an argument list with no shell, a
+                # program fixed in code (DEFAULT_COMMAND, WINDOW_COMMAND or
+                # PRLIMIT), arguments that are constants, validated numbers,
+                # paths in a server-created directory and a URL built from
+                # an ID that matched VIDEO_ID_RE, an environment built from
+                # scratch, and a wall-clock timeout below.
+                # tests/test_fetcher_ytdlp.py pins each of these guards.
+                proc = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    # Nothing reads stdout: map_failure looks at stderr and
+                    # read_result at the files. Discarded, it costs no memory
+                    # and can't fill a pipe.
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    cwd=job_dir,
+                    env=self.child_env(job_dir),
+                    # Its own session and process group, so a timeout can
+                    # kill everything yt-dlp started, Deno included.
+                    start_new_session=True,
+                )
+                self._running.add(proc)
         except OSError:
             # Missing interpreter, missing prlimit, or no resources to start it.
             raise FetchError("failed") from None
-        with self._lock:
-            self._running.add(proc)
         tail: _Tail | None = None
         try:
             try:
@@ -442,7 +684,7 @@ class YtDlp:
                 # holds a bounded tail. It is never logged and never leaves
                 # this module.
                 tail = _Tail(proc.stderr, STDERR_TAIL_BYTES)
-                proc.wait(timeout=self.timeout_seconds)
+                proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 _kill_group(proc)
                 # A bounded drain: stderr's end and the exit, for at most
@@ -482,8 +724,8 @@ class YtDlp:
         finally:
             with self._lock:
                 self._running.discard(proc)
-            # The boundary after the run, on every path, before read_result
-            # and so before the runner answers: kill(-1) reaches what left
+            # The boundary after the run, on every path, before any result
+            # is read and so before the runner answers: kill(-1) reaches what left
             # the group, and the reap clears the zombies of everything the
             # kills ended. Only once Popen has reaped its own child
             # (returncode set), so waitpid(-1) never steals yt-dlp's status;
@@ -491,26 +733,29 @@ class YtDlp:
             swept = not self.sweep_strays or (proc.returncode is not None and self._sweep())
         try:
             if not swept:
-                # A stray may still be running next to the files read_result
+                # A stray may still be running next to the files the caller
                 # would check: the result can't be trusted.
                 raise FetchError("failed")
-            if proc.returncode != 0:
+            stderr = b""
+            if proc.returncode != 0 and tail is not None:
                 # The last lines yt-dlp printed are the ones that name the
                 # error. Waited for after the kills above, which ended
                 # everything else that could hold the pipe; still bounded,
                 # for a survivor where no sweep runs.
-                stderr = b""
-                if tail is not None:
-                    tail.join(DRAIN_SECONDS)
-                    stderr = tail.value()
-                raise FetchError(map_failure(proc.returncode, stderr))
-            return read_result(job_dir, video_id, self.max_bytes)
+                tail.join(DRAIN_SECONDS)
+                stderr = tail.value()
+            return proc.returncode, stderr
         finally:
             _stop_reading(tail, proc)
 
     def cancel(self) -> None:
-        """Kill every running yt-dlp and what it started; used when the server stops."""
+        """Kill every running child and what it started, and end the jobs in flight; used when the server stops.
+
+        A job that is between its two children starts no second one. A job
+        that begins after this call runs as usual.
+        """
         with self._lock:
+            self._cancels += 1
             running = list(self._running)
         for proc in running:
             _kill_group(proc)

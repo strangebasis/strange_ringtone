@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  bestWindow, scoreHeatmap, snapToQuiet, suggestionRule, suggestSelection,
+  bestWindow, scoreHeatmap, snapToQuiet, suggestionRule, suggestSelection, suggestWindowStart, windowHeatmap,
 } from "../../core/static/audio/suggest.js";
 
 const RATE = 44100;
@@ -391,4 +391,90 @@ test("the snap measures 50 ms inside the input at either end", () => {
   assert.equal(snapToQuiet(prefixOf(end), end.length, 390), 397);
   // Shorter than 50 ms: nothing to compare, the start stays.
   assert.equal(snapToQuiet(prefixOf([1, 1, 0]), 3, 1), 1);
+});
+
+// --- a window of a longer video (docs/PLAN.md 6.2) -----------------------------------------
+
+// An hour in 200 points of 18 s, hot from 1206 s to 1800 s.
+const HOUR = 3600;
+const HOUR_MAP = Array.from({ length: 200 }, (_, i) => ({
+  start: i * 18, end: (i + 1) * 18, value: i >= 67 && i < 100 ? 1 : 0.1,
+}));
+
+test("the default window is the ten minutes with the most replays, from a whole second", () => {
+  // The hot stretch is 594 s long: every window from 1200 to 1206 holds it
+  // whole and six more seconds of the same value, so the earliest wins.
+  assert.equal(suggestWindowStart(HOUR_MAP, HOUR, 600), 1200);
+  const start = suggestWindowStart(HOUR_MAP, HOUR, 300);
+  assert.ok(Number.isInteger(start) && start >= 1206 && start <= 1500, String(start));
+});
+
+test("a hot stretch at the very end gives the last window", () => {
+  const map = HOUR_MAP.map((point, i) => ({ ...point, value: i >= 190 ? 1 : 0.1 }));
+  assert.equal(suggestWindowStart(map, HOUR, 600), 3000);
+  // And one at the beginning gives the first.
+  const early = HOUR_MAP.map((point, i) => ({ ...point, value: i < 10 ? 1 : 0.1 }));
+  assert.equal(suggestWindowStart(early, HOUR, 600), 0);
+});
+
+test("without a usable heatmap there is no default window", () => {
+  for (const heatmap of [null, undefined, [], "x", {}, [{ start: 0, end: 5 }], [{ start: 5, end: 5, value: 1 }],
+    [{ start: 0, end: 5, value: 2 }], [...HOUR_MAP, { start: 0, end: 1, value: 0.5 }],
+    [{ start: 0, end: HOUR + 5, value: 1 }]]) {
+    assert.equal(suggestWindowStart(heatmap, HOUR, 600), null, JSON.stringify(heatmap)?.slice(0, 60));
+  }
+  for (const [duration, windowSeconds] of [[0, 600], [-1, 600], [Number.NaN, 600], [HOUR, 0], [HOUR, Number.NaN],
+    ["3600", 600]]) {
+    assert.equal(suggestWindowStart(HOUR_MAP, duration, windowSeconds), null);
+  }
+});
+
+test("a video no longer than the window starts at zero", () => {
+  const map = [{ start: 0, end: 300, value: 0.2 }, { start: 300, end: 600, value: 1 }];
+  assert.equal(suggestWindowStart(map, 600, 600), 0);
+  assert.equal(suggestWindowStart(map, 600, 900), 0);
+});
+
+test("a ten-hour video's default is found quickly", () => {
+  const points = Array.from({ length: 100 }, (_, i) => ({ start: i * 360, end: (i + 1) * 360, value: i === 50 ? 1 : 0.2 }));
+  const started = Date.now();
+  const start = suggestWindowStart(points, 36000, 600);
+  assert.ok(Date.now() - started < 2000, "too slow for a phone");
+  // The hot six minutes run from 18000 s to 18360 s: the earliest window that
+  // holds all of them ends where they end.
+  assert.equal(start, 17760);
+});
+
+test("a window's heatmap is the video's, moved to the window's own time and cut to it", () => {
+  // A window of 60 s that begins at 1195 s: the last 11 s of a cool point,
+  // then hot points to its end.
+  assert.deepEqual(windowHeatmap(HOUR_MAP, 1195, 60), [
+    { start: 0, end: 11, value: 0.1 }, { start: 11, end: 29, value: 1 }, { start: 29, end: 47, value: 1 },
+    { start: 47, end: 60, value: 1 },
+  ]);
+  // A point that ends where the window begins, or begins where it ends, covers none of it.
+  assert.deepEqual(windowHeatmap(HOUR_MAP, 1206, 18), [{ start: 0, end: 18, value: 1 }]);
+  assert.deepEqual(windowHeatmap([{ start: 0, end: 10, value: 1 }, { start: 10, end: 20, value: 0.5 }], 0, 15),
+    [{ start: 0, end: 10, value: 1 }, { start: 10, end: 15, value: 0.5 }]);
+});
+
+test("what a moved heatmap gives rule 2 is a list it accepts", () => {
+  const moved = windowHeatmap(HOUR_MAP, 1195, 60);
+  assert.equal(suggestionRule(60, { heatmap: moved }), "heatmap");
+  // The best 15 s of that window begin where its hot part begins.
+  near(scoreHeatmap(moved, 15, 60, 0.1), 11, 1e-9, "the start");
+  // Unmoved, the video's own list reaches far past a 60 s clip and is not used at all.
+  assert.equal(suggestionRule(60, { heatmap: HOUR_MAP }), "loudness");
+});
+
+test("a heatmap that reaches nowhere into the window, or is no heatmap, gives none", () => {
+  assert.equal(windowHeatmap([{ start: 0, end: 100, value: 1 }], 100, 60), null);
+  assert.equal(windowHeatmap([{ start: 500, end: 600, value: 1 }], 100, 60), null);
+  for (const heatmap of [null, undefined, [], "x", [{ start: 0, end: 5 }], [{ start: 5, end: 5, value: 1 }],
+    [{ start: -1, end: 5, value: 1 }], [{ start: 0, end: 5, value: 1.5 }], [null]]) {
+    assert.equal(windowHeatmap(heatmap, 0, 60), null);
+  }
+  for (const [windowStart, windowSeconds] of [[-1, 60], [Number.NaN, 60], [0, 0], [0, -5], ["0", 60]]) {
+    assert.equal(windowHeatmap(HOUR_MAP, windowStart, windowSeconds), null);
+  }
 });

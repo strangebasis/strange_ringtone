@@ -17,7 +17,7 @@ from unittest import mock
 import helpers  # noqa: F401  (puts core/ and fetcher/ on sys.path)
 from strange_ringtone_fetch import jobs as jobs_module
 from strange_ringtone_fetch.jobs import JOB_ID_RE, Jobs, QueueFull
-from strange_ringtone_fetch.metadata import Download, FetchError, Metadata
+from strange_ringtone_fetch.metadata import Download, FetchError, LongVideo, Metadata
 from test_fetcher_ytdlp import StubYtDlp
 
 VIDEO_ID = "dQw4w9WgXcQ"
@@ -48,9 +48,23 @@ class FakeRunner:
         self.running = 0
         self.max_running = 0
         self.cancelled = 0
+        # Videos the runner answers "long" for, and what it says about them.
+        self.long: dict[str, Metadata] = {}
+        # (video ID, start) of every window asked for.
+        self.windows: list[tuple[str, int]] = []
+        # Set to make a window come back without its beginning.
+        self.no_window_start = False
         self._lock = threading.Lock()
 
     def fetch(self, video_id: str, job_dir: Path) -> Download:
+        return self._run(video_id, job_dir, None)
+
+    def fetch_window(self, video_id: str, job_dir: Path, start: int) -> Download:
+        with self._lock:
+            self.windows.append((video_id, start))
+        return self._run(video_id, job_dir, start)
+
+    def _run(self, video_id: str, job_dir: Path, start: int | None) -> Download:
         with self._lock:
             self.running += 1
             self.max_running = max(self.max_running, self.running)
@@ -69,9 +83,14 @@ class FakeRunner:
             failure = self.failures.get(video_id)
             if failure is not None:
                 raise failure
+            if start is None and video_id in self.long:
+                raise LongVideo(self.long[video_id])
             audio = job_dir / f"{video_id}.m4a"
             audio.write_bytes(b"AUDIO " + video_id.encode("ascii"))
-            return Download(audio=audio, metadata=METADATA)
+            # A window begins with the fragment that holds its start: here,
+            # the last multiple of ten seconds.
+            begin = None if start is None or self.no_window_start else float(start - start % 10)
+            return Download(audio=audio, metadata=METADATA, window_start=begin)
         finally:
             with self._lock:
                 self.running -= 1
@@ -106,8 +125,8 @@ class JobsTestCase(unittest.TestCase):
         names = [p.relative_to(self.scratch).as_posix() for p in self.scratch.rglob("*")]
         return sorted(name for name in names if name != "results")
 
-    def run_job(self, video_id: str = VIDEO_ID) -> str:
-        job_id = self.jobs.submit(video_id)
+    def run_job(self, video_id: str = VIDEO_ID, start: int | None = None) -> str:
+        job_id = self.jobs.submit(video_id) if start is None else self.jobs.submit(video_id, start)
         self.assertTrue(self.jobs.run_next(timeout=0))
         return job_id
 
@@ -359,10 +378,10 @@ class HeldResultTest(JobsTestCase):
     def test_a_newer_download_does_not_evict_a_failed_job(self) -> None:
         # Only older downloads are evicted: a client still polling a failed
         # job must see its error code, not a 404.
-        self.runner.failures[OTHER_ID] = FetchError("too_long")
+        self.runner.failures[OTHER_ID] = FetchError("blocked")
         failed = self.run_job(OTHER_ID)
         done = self.run_job(VIDEO_ID)
-        self.assertEqual(self.jobs.status(failed), {"status": "failed", "error": "too_long"})
+        self.assertEqual(self.jobs.status(failed), {"status": "failed", "error": "blocked"})
         self.assertEqual(self.jobs.status(done)["status"], "done")  # type: ignore[index]
 
     def test_a_download_being_streamed_is_not_evicted(self) -> None:
@@ -539,6 +558,114 @@ class ExpiryTest(JobsTestCase):
                 Jobs(self.scratch, self.runner, **kwargs)
 
 
+class WindowJobsTest(JobsTestCase):
+    """Long videos and windows of them (docs/PLAN.md 6.2), with the fake runner."""
+
+    LONG = Metadata(title="A long one", duration=3600, heatmap=({"start": 0.0, "end": 36.0, "value": 1.0},))
+
+    def test_a_long_video_ends_long_with_its_length_and_nothing_to_collect(self) -> None:
+        self.runner.long[VIDEO_ID] = self.LONG
+        job_id = self.run_job(VIDEO_ID)
+        self.assertEqual(self.jobs.status(job_id), {
+            "status": "long", "title": "A long one", "duration": 3600,
+            "heatmap": [{"start": 0.0, "end": 36.0, "value": 1.0}],
+        })
+        self.assertIsNone(self.jobs.claim(job_id))
+        # The status is still there after the refused claim, and nothing is on the tmpfs.
+        self.assertEqual(self.jobs.status(job_id)["status"], "long")  # type: ignore[index]
+        self.assertEqual(self.scratch_contents(), [])
+        self.assertEqual(self.runner.windows, [])
+
+    def test_a_long_answer_expires_like_any_finished_job(self) -> None:
+        self.runner.long[VIDEO_ID] = self.LONG
+        job_id = self.run_job(VIDEO_ID)
+        self.clock.now += 599
+        self.assertEqual(self.jobs.sweep(), 0)
+        self.assertEqual(self.jobs.status(job_id)["status"], "long")  # type: ignore[index]
+        self.clock.now += 1
+        self.assertIsNone(self.jobs.status(job_id))
+        self.assertEqual(self.jobs.sweep(), 1)
+        self.assertEqual(len(self.jobs), 0)
+
+    def test_a_long_answer_does_not_evict_the_download_that_waits(self) -> None:
+        # Nothing was downloaded for it, so nothing needs the space.
+        done = self.run_job(OTHER_ID)
+        self.runner.long[VIDEO_ID] = self.LONG
+        self.run_job(VIDEO_ID)
+        self.assertEqual(self.jobs.status(done)["status"], "done")  # type: ignore[index]
+        self.assertIsNotNone(self.jobs.claim(done))
+        self.jobs.release(done)
+
+    def test_a_job_with_a_start_time_asks_the_runner_for_a_window(self) -> None:
+        job_id = self.run_job(VIDEO_ID, 1234)
+        self.assertEqual(self.runner.windows, [(VIDEO_ID, 1234)])
+        self.assertEqual(self.runner.calls, [VIDEO_ID])
+        status = self.jobs.status(job_id)
+        assert status is not None
+        self.assertEqual(status["status"], "done")
+        self.assertEqual(status["window_start"], 1230.0)
+        path = self.jobs.claim(job_id)
+        assert path is not None
+        self.assertEqual(path.read_bytes(), b"AUDIO " + VIDEO_ID.encode("ascii"))
+        self.jobs.release(job_id)
+
+    def test_a_start_of_zero_is_a_window_too(self) -> None:
+        job_id = self.run_job(VIDEO_ID, 0)
+        self.assertEqual(self.runner.windows, [(VIDEO_ID, 0)])
+        self.assertEqual(self.jobs.status(job_id)["window_start"], 0.0)  # type: ignore[index]
+
+    def test_a_whole_download_s_status_has_no_window_start(self) -> None:
+        job_id = self.run_job(VIDEO_ID)
+        self.assertNotIn("window_start", self.jobs.status(job_id))  # type: ignore[arg-type]
+        self.assertEqual(self.runner.windows, [])
+
+    def test_a_long_answer_to_a_job_with_a_start_time_is_impossible(self) -> None:
+        # The fake runner answers long only without a start, as the real
+        # ones do; a job with one gets its window.
+        self.runner.long[VIDEO_ID] = self.LONG
+        job_id = self.run_job(VIDEO_ID, 90)
+        self.assertEqual(self.jobs.status(job_id)["status"], "done")  # type: ignore[index]
+
+    def test_a_long_answer_to_a_job_with_a_start_time_fails_the_job(self) -> None:
+        # No runner of ours answers so. One that did would send the page
+        # round in a circle: it would ask for a start time again.
+        self.runner.failures[VIDEO_ID] = LongVideo(self.LONG)
+        job_id = self.run_job(VIDEO_ID, 90)
+        self.assertEqual(self.jobs.status(job_id), {"status": "failed", "error": "failed"})
+        self.assertEqual(self.scratch_contents(), [])
+        # To a job without a start time the same answer is the "long" status.
+        job_id = self.run_job(VIDEO_ID)
+        self.assertEqual(self.jobs.status(job_id)["status"], "long")  # type: ignore[index]
+
+    def test_a_window_without_its_beginning_fails_the_job(self) -> None:
+        self.runner.no_window_start = True
+        job_id = self.run_job(VIDEO_ID, 1234)
+        self.assertEqual(self.jobs.status(job_id), {"status": "failed", "error": "failed"})
+        self.assertEqual(self.scratch_contents(), [])
+
+    def test_a_value_that_is_no_start_is_never_queued(self) -> None:
+        for start in (-1, 360_000, True, False, 1.5, 90.0, "90", [90], 10**30):
+            with self.subTest(start=start), self.assertRaises(ValueError):
+                self.jobs.submit(VIDEO_ID, start)  # type: ignore[arg-type]
+        self.assertEqual(len(self.jobs), 0)
+        self.assertFalse(self.jobs.run_next(timeout=0))
+
+    def test_the_start_is_kept_only_until_the_job_starts(self) -> None:
+        job_id = self.jobs.submit(VIDEO_ID, 1234)
+        self.assertEqual(self.jobs._jobs[job_id].start, 1234)
+        self.assertTrue(self.jobs.run_next(timeout=0))
+        self.assertIsNone(self.jobs._jobs[job_id].start)
+        self.assertIsNone(self.jobs._jobs[job_id].video_id)
+
+    def test_a_failed_window_is_a_failed_job_with_its_code(self) -> None:
+        for code in ("past_end", "live", "blocked", "timeout", "failed"):
+            with self.subTest(code=code):
+                self.runner.failures[VIDEO_ID] = FetchError(code)
+                job_id = self.run_job(VIDEO_ID, 5)
+                self.assertEqual(self.jobs.status(job_id), {"status": "failed", "error": code})
+                self.assertEqual(self.scratch_contents(), [])
+
+
 class StubRunTest(JobsTestCase):
     """The real runner with the stub: every outcome leaves only what the index knows."""
 
@@ -559,7 +686,8 @@ class StubRunTest(JobsTestCase):
 
     def test_failures_leave_nothing_behind(self) -> None:
         cases = {
-            "tooLong____": "too_long",
+            "liveStream_": "live",
+            "rejected___": "failed",
             "blocked____": "blocked",
             "notFound___": "not_found",
             "failing____": "failed",
@@ -571,6 +699,33 @@ class StubRunTest(JobsTestCase):
         for video_id, code in cases.items():
             with self.subTest(video_id=video_id):
                 job_id = self.run_job(video_id)
+                self.assertEqual(self.jobs.status(job_id), {"status": "failed", "error": code})
+                self.assertEqual(self.scratch_contents(), [])
+
+    def test_a_stubbed_long_video_and_a_window_of_it(self) -> None:
+        long_id = self.run_job("tooLong____")
+        status = self.jobs.status(long_id)
+        assert status is not None
+        self.assertEqual(sorted(status), ["duration", "heatmap", "status", "title"])
+        self.assertEqual((status["status"], status["duration"]), ("long", 3600))
+        self.assertEqual(self.scratch_contents(), [])
+        job_id = self.run_job("tooLong____", 1234)
+        status = self.jobs.status(job_id)
+        assert status is not None
+        self.assertEqual(sorted(status), ["duration", "heatmap", "status", "title", "window_start"])
+        self.assertEqual((status["status"], status["duration"], status["window_start"]), ("done", 3600, 1230.0))
+        self.assertEqual(self.scratch_contents(), [f"results/{job_id}.m4a"])
+        path = self.jobs.claim(job_id)
+        assert path is not None
+        self.assertEqual(path.read_bytes(), b"STUB-WINDOW\n" + b"tooLong____@1234")
+        self.jobs.release(job_id)
+
+    def test_a_stubbed_window_s_failures_leave_nothing_behind(self) -> None:
+        cases = {"liveStream_": "live", "pastEnd____": "past_end", "winBlocked_": "blocked",
+                 "winTimeout_": "timeout", "winFailing_": "failed", "winHanging_": "timeout"}
+        for video_id, code in cases.items():
+            with self.subTest(video_id=video_id):
+                job_id = self.run_job(video_id, 1234)
                 self.assertEqual(self.jobs.status(job_id), {"status": "failed", "error": code})
                 self.assertEqual(self.scratch_contents(), [])
 

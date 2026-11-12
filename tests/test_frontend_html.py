@@ -375,8 +375,33 @@ class TemplateTest(unittest.TestCase):
         section = ids.index("youtube")
         following = ids[section + 1:]
         self.assertLess(following.index("yt-status"), following.index("pick"))
-        for name in ("yt-link", "yt-fetch"):
+        for name in ("yt-link", "yt-fetch", "yt-start-row", "yt-start"):
             self.assertLess(following.index(name), following.index("pick"))
+
+    def test_the_start_field_for_a_long_video(self) -> None:
+        # docs/PLAN.md 6.2. Hidden until the server calls a video long: the
+        # page shows it, filled in, and asks before any window is fetched.
+        page = _Page()
+        page.feed(self.text)
+        by_id = {dict(attrs).get("id"): (tag, dict(attrs)) for tag, attrs in page.elements}
+        self.assertEqual(by_id["yt-start-row"], ("div", {"id": "yt-start-row", "hidden": None}))
+        tag, attrs = by_id["yt-start"]
+        self.assertEqual(tag, "input")
+        # A text field with the number pad: a time is digits and separators,
+        # and the pad's point stands in for the colon it lacks. Not
+        # type="time", which is a time of day, and not type="number", which
+        # would refuse 1:23:45.
+        self.assertEqual(attrs["type"], "text")
+        self.assertEqual(attrs["inputmode"], "decimal")
+        self.assertEqual(attrs["autocomplete"], "off")
+        self.assertEqual(attrs["placeholder"], "0:00")
+        labels = [dict(attrs) for tag, attrs in page.elements if tag == "label"]
+        self.assertIn({"class": "field-label", "for": "yt-start"}, labels)
+        # Between the link and the status line, inside the YouTube section.
+        ids = template_ids(self.text)
+        self.assertLess(ids.index("yt-fetch"), ids.index("yt-start-row"))
+        self.assertLess(ids.index("yt-start-row"), ids.index("yt-start"))
+        self.assertLess(ids.index("yt-start"), ids.index("yt-status"))
 
     def test_help_text(self) -> None:
         text = re.sub(r"\s+", " ", self.text)
@@ -388,7 +413,7 @@ class TemplateTest(unittest.TestCase):
             "If you hear nothing, turn off Silent mode.",
             "paste a video link under <strong>From YouTube</strong>",
             "<strong>Make Ringtone</strong> Shortcut",
-            "Only the video's ID reaches the server.",
+            "Only the video's ID reaches the server, and for a video over 10 minutes the start time you choose.",
         ):
             self.assertIn(phrase, text)
 
@@ -399,7 +424,11 @@ class TemplateTest(unittest.TestCase):
         # has a message of its own when it refuses.
         text = re.sub(r"\s+", " ", self.text)
         section = text[text.index('id="youtube"'):text.index('id="pick"')]
-        self.assertIn("The server fetches the audio (up to 10 minutes) from YouTube.", section)
+        self.assertIn("The server fetches up to 10 minutes of audio from YouTube.", section)
+        # What leaves the phone, said where the link is pasted (docs/PLAN.md
+        # 6.2): the ID, and for a long video one more thing.
+        self.assertIn("Only the video's ID is sent, and for a video over 10 minutes the start time you choose.",
+                      section)
         self.assertNotRegex(section, r"\b\d+(?:\.\d+)? ?(?:[KMG]i?B|bytes?)\b")
 
 

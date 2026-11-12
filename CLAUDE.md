@@ -37,15 +37,25 @@ is authoritative.
   The bundled ffmpeg is a minimal source build (WAV in, AAC/MP4 out, `file`
   protocol only), and a test fails if its build configuration grows.
 - **Fetcher image** (opt-in, the owner's explicit exception for YouTube): it
-  accepts only an 11-character video ID and runs as three containers of one
-  image. The **fetcher** (CMD, port 8080) is the API behind the reverse
-  proxy. It never runs yt-dlp: it sends the **runner**
+  accepts only an 11-character video ID and a start time in whole seconds,
+  and runs as three containers of one image. The **fetcher** (CMD, port
+  8080) is the API behind the reverse proxy. It never runs yt-dlp: it sends
+  the **runner**
   (`python -I /app/fetcher/runner.py`, port 8080, at `FETCH_RUNNER_URL`) only
-  the validated ID and a token of its own, and trusts nothing that comes
+  the validated ID, the validated start time when there is one, and a token
+  of its own, and trusts nothing that comes
   back: capped JSON of a fixed shape, audio of exactly the declared length up
   to `FETCH_MAX_BYTES`, per-read and total deadlines, the metadata
   re-validated, no retry. The runner is the only container that runs yt-dlp
-  (from the venv, as a subprocess) and Deno. It builds the URL itself, takes
+  (from the venv, as a subprocess) and Deno. It never downloads a video
+  longer than `FETCH_MAX_SECONDS` whole: without a start time it answers
+  only the video's length, and with one yt-dlp only finds the audio's
+  address (`--skip-download`) and the runner's own stdlib program
+  (`strange_ringtone_runner/window.py`, a second subprocess under the same
+  limits and sweeps) fetches the file's index and at most
+  `FETCH_MAX_SECONDS` of audio from that time, by byte range, through the
+  forwarder, from a subdomain of `googlevideo.com` only. It builds the URL
+  itself, takes
   one job at a time, deletes its job directory in `finally` and the audio
   once collected, when the next job starts or after 60 s, and shares no
   network with the reverse proxy. Neither reaches the core. The browser is
@@ -95,13 +105,16 @@ is authoritative.
   `X-Forwarded-For` is trusted only from `TRUSTED_PROXIES` (empty by default;
   the compose example pins the fetcher's to empty, and it never covers the
   `jobs` network).
-- **Subprocesses** (ffmpeg, yt-dlp): an argument list, never a shell. Each gets
+- **Subprocesses** (ffmpeg, yt-dlp, the runner's window program): an argument
+  list, never a shell. Each gets
   a wall-clock timeout, `prlimit` resource limits, a fresh per-job directory, and
   server-generated names only. Clean up in `finally`. yt-dlp runs only in the
   runner container, from the image's venv
   (`/opt/yt-dlp/bin/python -I -m yt_dlp`), never from a server's
   interpreter, whose site-packages hold nothing; the build fills the venv
   with the base interpreter's `pip install --prefix`, never `pip --python`.
+  The window program is stdlib only and runs on the base interpreter
+  (`python -I`), in the runner container only.
 
 ## Code and tests
 

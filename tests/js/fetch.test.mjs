@@ -4,8 +4,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  FETCH_ERROR_CODES, FetchError, LINK_HOSTS, MAX_POLLS, POLL_INTERVAL_MS, VIDEO_ID_RE, fetchAudio, fetchErrorMessage,
-  fetchJob, parseTimestamp, parseYouTubeLink, pollJob,
+  FETCH_ERROR_CODES, FetchError, LINK_HOSTS, MAX_POLLS, MAX_START_SECONDS, POLL_INTERVAL_MS, VIDEO_ID_RE, fetchAudio,
+  fetchErrorMessage, fetchJob, formatStartTime, parseStartTime, parseTimestamp, parseYouTubeLink, pollJob,
 } from "../../core/static/fetch.js";
 // The page's byte cap, through the namespace so this file still loads where
 // decode.js lacks the export.
@@ -277,7 +277,7 @@ test("pollJob asks every interval until done and reports each state", async (t) 
   const started = Date.now();
   const done = await pollJob(JOB, { intervalMs: 20, onStatus: (status) => heard.push(status) });
   assert.ok(Date.now() - started >= 55, "three waits between four polls");
-  assert.deepEqual(done, { status: "done", title: "A Title", duration: 215.5, heatmap: DONE.heatmap });
+  assert.deepEqual(done, { status: "done", title: "A Title", duration: 215.5, heatmap: DONE.heatmap, windowStart: null });
   assert.deepEqual(heard, ["queued", "queued", "running"]);
   assert.equal(calls.length, 4);
   for (const { url, init } of calls) {
@@ -294,7 +294,7 @@ test("the poll defaults: every 2 s, for 15 minutes", () => {
 });
 
 test("pollJob rejects with the job's own error", async (t) => {
-  for (const error of ["blocked", "too_long", "not_found", "timeout", "failed"]) {
+  for (const error of ["blocked", "live", "not_found", "past_end", "timeout", "failed"]) {
     fakeFetch(t, () => json({ status: "failed", error }));
     await rejectsWith(pollJob(JOB, { intervalMs: 0 }), error);
   }
@@ -365,7 +365,7 @@ test("pollJob keeps only the documented metadata, checked", async (t) => {
   ];
   for (const [body, expected] of cases) {
     fakeFetch(t, () => json(body));
-    assert.deepEqual(await pollJob(JOB, { intervalMs: 0 }), { status: "done", ...expected });
+    assert.deepEqual(await pollJob(JOB, { intervalMs: 0 }), { status: "done", ...expected, windowStart: null });
   }
 });
 
@@ -400,10 +400,15 @@ test("every error code has its own words", () => {
     assert.ok(message.length > 10, code);
     assert.equal(new FetchError(code).message, message);
   }
-  for (const code of ["blocked", "too_long", "not_found", "timeout", "failed", "rate_limited", "busy"]) {
+  for (const code of ["blocked", "live", "not_found", "past_end", "timeout", "failed", "rate_limited", "busy",
+    "bad_start", "bad_time"]) {
     assert.ok(FETCH_ERROR_CODES.includes(code), code);
   }
-  assert.match(fetchErrorMessage("too_long"), /10 minutes/);
+  // A long video is no error any more: the page asks where to start.
+  assert.ok(!FETCH_ERROR_CODES.includes("too_long"));
+  assert.match(fetchErrorMessage("live"), /live stream/);
+  assert.match(fetchErrorMessage("past_end"), /end of the video/);
+  assert.match(fetchErrorMessage("bad_time"), /1:23:45/);
   assert.equal(fetchErrorMessage("http_502"), "The server answered with an error (HTTP 502). Try again.");
   // Only http_ and three digits is shown; anything else gets the plain words.
   for (const code of ["http_5023", "http_abc", "<b>", null, undefined, 42, "toString", "__proto__"]) {
@@ -636,4 +641,97 @@ test("a body longer than its Content-Length is returned whole, inside the cap", 
   const fewer = await fetchAudio(JOB, { maxBytes: CAP });
   assert.equal(fewer.length, 2 * CHUNK);
   assert.ok(fewer.every((byte) => byte === 7));
+});
+
+// --- long videos and windows of them (docs/PLAN.md 6.2) ------------------------------------
+
+test("fetchJob with a start posts exactly {video_id, start}", async (t) => {
+  const calls = fakeFetch(t, () => json({ job_id: JOB }, 202));
+  assert.equal(await fetchJob(ID, 4500), JOB);
+  assert.equal(await fetchJob(ID, 0), JOB);
+  assert.equal(await fetchJob(ID, MAX_START_SECONDS), JOB);
+  assert.deepEqual(calls.map((call) => call.init.body), [
+    `{"video_id":"${ID}","start":4500}`, `{"video_id":"${ID}","start":0}`, `{"video_id":"${ID}","start":359999}`,
+  ]);
+  // Without one, the body is what it always was.
+  assert.equal(await fetchJob(ID, null), JOB);
+  assert.equal(calls[3].init.body, `{"video_id":"${ID}"}`);
+});
+
+test("fetchJob never sends a start that is no whole number of seconds in range", async (t) => {
+  const calls = fakeFetch(t, () => json({ job_id: JOB }, 202));
+  for (const start of [-1, MAX_START_SECONDS + 1, 1.5, Number.NaN, Infinity, "90", true, [90], {}]) {
+    await rejectsWith(fetchJob(ID, start), "bad_time");
+  }
+  assert.equal(calls.length, 0);
+  assert.equal(MAX_START_SECONDS, 99 * 3600 + 59 * 60 + 59);
+});
+
+test("the fetcher's refusal of a start keeps its code", async (t) => {
+  fakeFetch(t, () => json({ error: "bad_start" }, 400));
+  await rejectsWith(fetchJob(ID, 5), "bad_start");
+});
+
+test("pollJob ends at long with the video's length, and there is no audio to fetch", async (t) => {
+  const long = { status: "long", title: " A Long One ", duration: 3600, heatmap: DONE.heatmap, window_start: 5 };
+  const calls = fakeFetch(t, (url, init, n) => json(n === 1 ? { status: "running" } : long));
+  const heard = [];
+  const result = await pollJob(JOB, { intervalMs: 0, onStatus: (status) => heard.push(status) });
+  // The same cleaned metadata as a finished job's, and nothing about a window.
+  assert.deepEqual(result, { status: "long", title: "A Long One", duration: 3600, heatmap: DONE.heatmap });
+  assert.deepEqual(heard, ["running"]);
+  assert.equal(calls.length, 2);
+});
+
+test("long without a length is no answer", async (t) => {
+  for (const body of [{ status: "long" }, { status: "long", duration: "3600" }, { status: "long", duration: 0 },
+    { status: "long", duration: null, title: "T" }, { status: "LONG", duration: 3600 }]) {
+    fakeFetch(t, () => json(body));
+    await rejectsWith(pollJob(JOB, { intervalMs: 0 }), "bad_response");
+  }
+});
+
+test("a window's done says where its audio begins", async (t) => {
+  fakeFetch(t, () => json({ ...DONE, window_start: 1229.875 }));
+  assert.equal((await pollJob(JOB, { intervalMs: 0 })).windowStart, 1229.875);
+  fakeFetch(t, () => json({ ...DONE, window_start: 0 }));
+  assert.equal((await pollJob(JOB, { intervalMs: 0 })).windowStart, 0);
+  // Anything that is no place in a video is no beginning.
+  for (const value of ["1230", -1, true, null, [1230], {}]) {
+    fakeFetch(t, () => json({ ...DONE, window_start: value }));
+    assert.equal((await pollJob(JOB, { intervalMs: 0 })).windowStart, null, JSON.stringify(value));
+  }
+});
+
+test("parseStartTime reads a time as a person types it", () => {
+  const cases = {
+    "0": 0, "90": 90, "0:00": 0, "12:30": 750, "1:23:45": 5025, "83:45": 5025, "01:02:03": 3723,
+    // The iPhone's number pad has a point and no colon; a comma or a space works too.
+    "12.30": 750, "1.23.45": 5025, "12,30": 750, "12 30": 750, "1 23 45": 5025, "1:23.45": 5025,
+    " 1:02:03 ": 3723, "1::02": 62,
+    // YouTube's own way of writing it.
+    "1h23m45s": 5025, "45s": 45, "2m": 120, "3h": 10800, "1H2M3S": 3723, "1m30": 90,
+    "99:59:59": 359999, "359999": 359999,
+  };
+  for (const [text, seconds] of Object.entries(cases)) {
+    assert.equal(parseStartTime(text), seconds, JSON.stringify(text));
+  }
+});
+
+test("parseStartTime refuses what is no time", () => {
+  for (const text of ["", " ", "abc", "1:2:3:4", "-1", "1:-2", ":30", "30:", "1e3", "0x10", "1/2", "１２:３０",
+    "100:00:00", "360000", "1234567", "12:30pm", "half past", "30m1h", null, undefined, 90, 12.5, ["1:00"], {}]) {
+    assert.equal(parseStartTime(text), null, JSON.stringify(text));
+  }
+});
+
+test("formatStartTime writes what the start field shows", () => {
+  const cases = [[0, "0:00"], [5, "0:05"], [59, "0:59"], [60, "1:00"], [750, "12:30"], [3599, "59:59"],
+    [3600, "1:00:00"], [5025, "1:23:45"], [36000, "10:00:00"], [359999, "99:59:59"], [12.9, "0:12"],
+    [-5, "0:00"], [Number.NaN, "0:00"]];
+  for (const [seconds, text] of cases) assert.equal(formatStartTime(seconds), text, String(seconds));
+  // What the page writes into the field, it reads back as the same second.
+  for (const seconds of [0, 1, 59, 60, 61, 3599, 3600, 3661, 86399, 359999]) {
+    assert.equal(parseStartTime(formatStartTime(seconds)), seconds);
+  }
 });

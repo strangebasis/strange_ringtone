@@ -174,6 +174,59 @@ export function scoreHeatmap(points, maxSeconds, duration, hopSeconds) {
   return best;
 }
 
+// Candidate windows of a longer video start a whole second apart: the start
+// is sent to the fetcher as a whole number of seconds.
+const WINDOW_HOP_SECONDS = 1;
+
+function usablePoints(points) {
+  return Array.isArray(points) && points.length > 0 && points.length <= MAX_HEATMAP_POINTS
+    && points.every((point) => point !== null && typeof point === "object"
+      && isFiniteNumber(point.start) && isFiniteNumber(point.end) && isFiniteNumber(point.value)
+      && point.start >= 0 && point.start < point.end && point.value >= 0 && point.value <= 1);
+}
+
+/**
+ * Where a window of a video longer than the server fetches whole should start
+ * unless the user says otherwise (docs/PLAN.md 6.2): the start, in whole
+ * seconds, of the windowSeconds with the highest summed heatmap value, scored
+ * as rule 2 scores the selection.
+ * @param {unknown} heatmap the fetcher's points for the whole video
+ * @param {number} duration the video's length in seconds
+ * @param {number} windowSeconds the window's length
+ * @returns {number | null} null when there is no usable heatmap; 0 when the
+ *   video is no longer than the window
+ */
+export function suggestWindowStart(heatmap, duration, windowSeconds) {
+  if (!(isFiniteNumber(duration) && duration > 0 && isFiniteNumber(windowSeconds) && windowSeconds > 0)) return null;
+  if (!validHeatmap(heatmap, duration)) return null;
+  if (duration <= windowSeconds) return 0;
+  return Math.floor(scoreHeatmap(heatmap, windowSeconds, duration, WINDOW_HOP_SECONDS));
+}
+
+/**
+ * A whole video's heatmap as the heatmap of one window of it: each point
+ * moved windowStart earlier and cut to the window, so that rule 2 can read
+ * it against the window's own audio.
+ * @param {unknown} heatmap the fetcher's points, in the video's time
+ * @param {number} windowStart where the window begins in the video, in seconds
+ * @param {number} windowSeconds the window's length
+ * @returns {{start: number, end: number, value: number}[] | null} null when
+ *   the list is not usable or no point reaches into the window
+ */
+export function windowHeatmap(heatmap, windowStart, windowSeconds) {
+  if (!(isFiniteNumber(windowStart) && windowStart >= 0 && isFiniteNumber(windowSeconds) && windowSeconds > 0)) {
+    return null;
+  }
+  if (!usablePoints(heatmap)) return null;
+  const moved = [];
+  for (const point of heatmap) {
+    const start = Math.max(point.start - windowStart, 0);
+    const end = Math.min(point.end - windowStart, windowSeconds);
+    if (end > start) moved.push({ start, end, value: point.value });
+  }
+  return moved.length > 0 ? moved : null;
+}
+
 /**
  * Rule 3's choice: the candidate window with the highest mean of the hop
  * loudness values inside it, -Infinity and anything below -70 counted as -70.

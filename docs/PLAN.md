@@ -116,7 +116,7 @@ install through Finder or iMazing.
  │ decode (Web Audio) → waveform → select / fade / gain   │
  │ preview locally → encode the selection as PCM WAV      │
  └──────┬─────────────────────────────────┬───────────────┘
-        │ POST /api/render  (audio/wav)   │ POST /fetch/api/jobs {video_id}
+        │ POST /api/render  (audio/wav)   │ POST /fetch/api/jobs {video_id[, start]}
         │ GET  /api/result/<id>.m4a / .m4r│ GET  /fetch/api/jobs/<id>[/audio]
         ▼                                 ▼
  ┌──────────────────────────┐   ┌───────────────────────────────┐
@@ -439,8 +439,12 @@ core still needs no egress, and `FETCH_ENABLED` only shows the YouTube box.
 Section 6.1, decided on 2026-11-03, moves yt-dlp into a container of its own
 and gives the image its own egress gate. Its two PRs have landed: the
 bullets below describe the image as of PR B, with yt-dlp in the runner.
+Section 6.2, decided on 2026-11-11, adds a start time to the input and a
+second kind of job, a window of a video longer than `FETCH_MAX_SECONDS`;
+where it changes a bullet below, the bullet says so.
 
-- **Input:** JSON `{video_id}` only. The ID must match `^[A-Za-z0-9_-]{11}$`.
+- **Input:** JSON `{video_id}`, or `{video_id, start}` for a window (6.2), and
+  nothing else. The ID must match `^[A-Za-z0-9_-]{11}$`.
   The fetcher validates it and sends it to the runner, which validates it
   again and builds `https://www.youtube.com/watch?v=<id>` itself. No URL a
   user typed ever reaches yt-dlp, which removes the SSRF path (yt-dlp's
@@ -457,8 +461,10 @@ bullets below describe the image as of PR B, with yt-dlp in the runner.
     no ffmpeg)
   - `--break-match-filters "duration <= FETCH_MAX_SECONDS & !is_live"`, not
     `--match-filter`: a plain filter skips the video and exits 0 having
-    written nothing, while the breaking one exits 101, which is how
-    `too_long` is told apart
+    written nothing, while the breaking one exits 101, which is how a long
+    or live video is told apart from a failure
+  - `--print-to-file "pre_process:%(.{title,duration,heatmap,is_live})j"
+    "%(id)s.pre.json"`, which says why the filter ended a run (6.2)
   - `--max-filesize FETCH_MAX_BYTES` (checked before the download; a larger
     file is skipped with exit 0 and no audio, which maps to `failed`)
   - `--write-info-json --quiet --no-warnings --no-progress --socket-timeout 20`
@@ -494,19 +500,22 @@ bullets below describe the image as of PR B, with yt-dlp in the runner.
   --cached-only`.
 - **Success** is judged by the runner: exactly `<id>.m4a` (a regular file of
   at most `FETCH_MAX_BYTES`) and `<id>.info.json` being in the job directory, never
-  by exit 0 alone. Exit 101 is `too_long`, a timeout is `timeout`, and other
+  by exit 0 alone. Exit 101 is the status `long` or the error `live` (6.2),
+  a timeout is `timeout`, and other
   failures are `blocked` or `not_found` when stderr matches a few fixed
   phrases (bot checks, HTTP 403; unavailable, private or removed videos) and
   `failed` otherwise. The job directory is removed in `finally` on every path.
 - **Logging:** yt-dlp runs with `--quiet --no-warnings --no-progress`, and its
   stdout and stderr are never logged; neither the runner nor the fetcher logs them:
   they carry the destination filename, which contains the title that becomes
-  the tone name (CLAUDE.md: tone names stay out of logs). Failures map to a fixed error set: `blocked`, `too_long`,
-  `not_found`, `timeout`, `failed`. A test with a stubbed yt-dlp asserts the
+  the tone name (CLAUDE.md: tone names stay out of logs). Failures map to a fixed error set: `blocked`, `live`,
+  `not_found`, `past_end`, `timeout`, `failed`. A test with a stubbed yt-dlp asserts the
   log never contains the stub's title.
 - **Output:** `POST /fetch/api/jobs` answers 202 with `{job_id}` (128 random
   bits). `GET /fetch/api/jobs/<id>` returns `status` (`queued`, `running`,
-  `done` or `failed`), `error` (from the fixed set below, only when failed)
+  `done`, `failed`, or `long` for a video longer than `FETCH_MAX_SECONDS`,
+  6.2), `error` (from the fixed set above, only when failed), `window_start`
+  (only for a finished window)
   and whitelisted metadata only:
   - `title` (sanitised, at most 200 characters)
   - `duration`
@@ -587,8 +596,10 @@ bullets below describe the image as of PR B, with yt-dlp in the runner.
   `RATE_LIMIT_FETCHES_PER_MINUTE` (5), `FETCH_RESULT_TTL_SECONDS` (600),
   `FETCH_ALLOW_DEFAULT_ROUTE` and `FETCH_RUNNER_URL`
   (`http://fetcher-runner:8080`); the runner reads `FETCH_MAX_SECONDS` (600,
-  at most 600: `decode.js` refuses input over 10 minutes, so a longer video
-  would be downloaded only for the phone to refuse it), `FETCH_MAX_BYTES`
+  at most 600: `decode.js` refuses input over 10 minutes, so more audio
+  would be downloaded only for the phone to refuse it; since 6.2 it is the
+  most audio fetched in one go, a longer video's window included),
+  `FETCH_MAX_BYTES`
   (40 MiB; 10 minutes of YouTube's AAC is about 10 MB),
   `FETCH_TIMEOUT_SECONDS` (120; the fetcher waits that long plus 15 s for
   the runner's answer), `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`,
@@ -1212,11 +1223,11 @@ test to fail.
 | G8 | Concurrent tunnels and new tunnels per minute are capped | unit | PR A |
 | G9 | Upload and download bytes are capped, with an idle timeout and a lifetime | unit; in-image for the download cap against the pinned yt-dlp's range size | PR A |
 | G10 | Logs hold the name and the reason only | unit | PR A |
-| R1 | The runner accepts only `POST /jobs` with a small JSON object of exactly a valid video ID and a 32-hex token, and one job at a time: a second `POST`, or an audio `GET`, during a run or a stream gets 503 `busy`; `/healthz` still answers | unit | PR B |
+| R1 | The runner accepts only `POST /jobs` with a small JSON object of exactly a valid video ID and a 32-hex token (since 6.2, at most a start time beside them), and one job at a time: a second `POST`, or an audio `GET`, during a run or a stream gets 503 `busy`; `/healthz` still answers | unit | PR B |
 | R2 | The runner builds yt-dlp's environment from scratch: fixed values, `HOME` and `DENO_DIR` in the job directory, and exactly the proxy variables its own settings read (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, uppercase, `http://` only, no credentials); the fetcher reads no proxy variable | unit (the fetcher's former tests move) | PR B |
 | R3 | The runner deletes its job directory in `finally` on every path; the audio is served once and deleted, deleted when a new job starts, `COLLECT_DEADLINE_SECONDS` (60) after the run if uncollected, and on shutdown, so at most one audio file is on its `/tmp` at any time | unit; in-image | PR B |
 | R4 | The runner's log holds method, path with the token masked, status and duration only; never a video ID, a title, a token, an address or yt-dlp's output | unit | PR B |
-| S1 | The fetcher sends the runner only the validated ID and a token it minted, never its job ID, and consults no proxy variable; it fails the job (nothing left behind, never retried) on any answer that is not status 200 with exactly one `Content-Type` and `Content-Length`, no `Transfer-Encoding`, JSON of at most 256 KiB of the shape `{status, info}` or `{status, error}`, or audio of 1 to `FETCH_MAX_BYTES` bytes of `audio/mp4` within the per-read and total deadlines; it re-validates the metadata with `parse_info`, follows no redirect, accepts nothing past the declared length, and ends each exchange only at the runner's close, which comes after the runner let go of its one-job lock, so its next request never finds it busy; the budget of the runner's clean-up after a run keeps its answer inside the fetcher's deadline (R10) | unit, with a fake runner; the fetcher's flow against a real runner with the stub yt-dlp | PR B |
+| S1 | The fetcher sends the runner only the validated ID and a token it minted (since 6.2, the validated start time too, for a window), never its job ID, and consults no proxy variable; it fails the job (nothing left behind, never retried) on any answer that is not status 200 with exactly one `Content-Type` and `Content-Length`, no `Transfer-Encoding`, JSON of at most 256 KiB of the shape `{status, info}` or `{status, error}`, or audio of 1 to `FETCH_MAX_BYTES` bytes of `audio/mp4` within the per-read and total deadlines; it re-validates the metadata with `parse_info`, follows no redirect, accepts nothing past the declared length, and ends each exchange only at the runner's close, which comes after the runner let go of its one-job lock, so its next request never finds it busy; the budget of the runner's clean-up after a run keeps its answer inside the fetcher's deadline (R10) | unit, with a fake runner; the fetcher's flow against a real runner with the stub yt-dlp | PR B |
 | S2 | The fetcher (PR A) and the runner (PR B) refuse to start with a default route, or an unreadable or unparsable route table, unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | unit (fake `/proc`), in-image and Compose topology tests | PR A (the fetcher), PR B (the runner) |
 | R5 | The runner's kill-and-reap sweep runs only as its container's PID 1, at both run boundaries, never while a `Popen` is in flight; where it can't run, the entry exits 4 before building the server unless `FETCH_ALLOW_NO_SWEEP=true` (parsed like `FETCH_ALLOW_DEFAULT_ROUTE`; a bad value exits 2), which never turns the sweep off as PID 1; the example runs the runner as PID 1 and never sets the override | unit (fake `kill`, `waitpid` and `getpid` that never pass -1 on); in-image as PID 1 (a real sweep of a run's leftovers); Compose topology tests (no init, the exact command, no override, `/proc/1/cmdline` in the running runner) | PR B |
 | R6 | The example gives the runner's container only the runner's own settings: no `env_file`, the three limits `FETCH_MAX_SECONDS`, `FETCH_MAX_BYTES` and `FETCH_TIMEOUT_SECONDS` from `.env` by name, and `HTTPS_PROXY` on the service, so that a health check or `docker exec` there, whose environment yt-dlp can read, holds no `PUBLIC_ORIGIN`, no setting of the core and nothing else from `.env` | Compose topology tests (static: no `env_file` in the runner's block, and the exact names of its resolved environment against an env file that also sets `PUBLIC_ORIGIN`, `TRUSTED_PROXIES` and a stand-in for an operator's own variable; running: what a process started in the runner's container sees) | PR B |
@@ -1231,6 +1242,235 @@ test to fail.
 | T1 | In the compose layout, the fetcher and the runner have no default route (IPv4 or IPv6), each resolves its own peer (the fetcher the runner, the runner the forwarder) and no external name, the fetcher can't resolve the forwarder, and the host has no IPv4 or IPv6 address on `fetcher`, `jobs` or `egress` (also with IPv6 turned on for such a network); the forwarder has the only default route, and the fetcher's CMD and the runner's command each refuse to start on `outside` unless `FETCH_ALLOW_DEFAULT_ROUTE` is set | Compose topology tests | PR A, extended in PR B |
 | T2 | The runner reaches the forwarder over `egress`; the fetcher can't reach the forwarder while it reaches the runner over `jobs`; the forwarder can't reach either fetcher address while it reaches the runner over `egress`; nothing on the `fetcher` network reaches the forwarder or the runner, and nothing on `jobs` reaches the forwarder; all three containers run the base interpreter with `-I` | Compose topology tests | PR A, reworded in PR B |
 | T3 | The running forwarder refuses an unlisted name, an IP literal, port 80 and other methods before DNS, and logs the name and the reason only (run from the runner, the only container that reaches it) | Compose topology tests | PR A |
+
+### 6.2 A window of a longer video (decided 2026-11-11)
+
+Before this section the fetcher refused a video longer than
+`FETCH_MAX_SECONDS` (`too_long`). It now brings up to that much of it,
+starting where the user says: a window. A video no longer than
+`FETCH_MAX_SECONDS` is fetched exactly as before.
+
+The owner's decisions (interview of 2026-11-11):
+
+| # | Question | Decision | Cost accepted |
+| --- | --- | --- | --- |
+| 1 | How the window is cut | **The runner fetches the byte range itself**, read from the file's own index. No ffmpeg in the fetcher image. | Code of our own that reads YouTube's bytes. It works only while YouTube serves the audio as one plain file. |
+| 2 | How the user picks the start | **One time field with a default**: the link's own timestamp, else the ten minutes with the most replays, else the beginning. | The user types a time; there is no replay strip and no slider. |
+| 3 | A setting | **None. Always on.** | A deployment that runs the fetcher can no longer refuse long videos. |
+| 4 | Release | **In v0.1.0.** | v0.1.0 waited for it. |
+| 5 | Who makes the range requests | **A small stdlib program of the runner's own**, a second child process after yt-dlp. Not yt-dlp as a library, and not the runner process. | A few hundred lines to maintain, two children per window, and YouTube's changes are ours to follow. |
+| 6 | When the download starts | **The page asks first.** For a long video whose link has no timestamp, the first request only learns the length. | One more tap, and two look-ups at YouTube for every long video. |
+| 7 | CLAUDE.md | The fetcher bullet names the start time, the rule that a long video is never downloaded whole, and the second subprocess. | A longer bullet. |
+
+**Why not yt-dlp's own option.** `--download-sections "*START-END"` is
+yt-dlp's only time-range option, and in the pinned 2026.10.26 it hands the
+download to ffmpeg: `_get_suitable_downloader` picks `FFmpegFD` for a format
+with a section, yt-dlp's own downloaders hold no range code, and without
+ffmpeg the run stops with "You have requested downloading the video
+partially, but ffmpeg is not installed". The fetcher image has no ffmpeg on
+purpose (section 6). `--max-filesize` and the length filter refuse a video;
+neither cuts one.
+
+**What YouTube serves** (measured on 2026-11-11 with the owner's approval:
+three yt-dlp runs on videos of 19 minutes, 28 minutes and 10 hours, through
+the forwarder, from throwaway containers):
+
+- `bestaudio[ext=m4a]` is one plain file at an https address under
+  `googlevideo.com`: `ftyp` (24 bytes), `moov` (699 bytes), one `sidx` index,
+  then `moof`/`mdat` pairs of about 10 s each. The index takes 12 bytes a
+  fragment: 43 kB for ten hours.
+- A byte-range request with yt-dlp's four request headers is answered 206.
+  Ten minutes are 60 fragments, 599 s and 9.7 MB.
+- A video with an advertisement in front refuses the audio (403) until a few
+  seconds have passed. yt-dlp writes that moment into the info JSON
+  (`available_at`), and its own downloader waits for it.
+- The cut files decode in ffmpeg, Chromium and Safari on an iPhone, whether
+  or not the fragments' times are moved. The variant built is the one whose
+  header states the window's own length.
+- In the 437 fragments saved from those runs, every fragment's decode time
+  is exactly the time the index lists it under, the track has no edit list,
+  and a `moof` takes 1.1 to 1.8 kB. The window program requires all three.
+
+**The two requests.** `POST /fetch/api/jobs` takes `{video_id}` or
+`{video_id, start}`. `start` is a JSON integer from 0 to 359,999 (99:59:59);
+anything else is 400 `bad_start`.
+
+- Without `start` the run is section 6's. A video longer than
+  `FETCH_MAX_SECONDS` ends in the status **`long`**, with `duration` and,
+  when there, `title` and `heatmap`. Nothing was downloaded, and its
+  `…/audio` is a 404.
+- With `start` the job is a window: `done` then also carries
+  **`window_start`**, the second of the video at which the audio begins. The
+  window begins with the fragment that holds the start, so up to one
+  fragment (about 10 s) before it.
+- The job errors are now `blocked`, `live`, `not_found`, `past_end`,
+  `timeout` and `failed`. `live` is a live stream, which used to be reported
+  as too long. `past_end` is a start at or after the end. `too_long` is gone.
+
+The page's first request never carries a start, so a video up to
+`FETCH_MAX_SECONDS` behaves as before, and its link's `t=` still never leaves
+the phone. On `long`:
+
+- a link with a timestamp inside the video is fetched from that second at
+  once, with no further tap;
+- any other link shows the video's length and the **Start at** field, filled
+  with the start of the ten minutes with the most replays (rule 2's score
+  from 7.2, with candidates a second apart) or with 0:00, and nothing is
+  requested until the user taps **Fetch** again.
+
+The field takes `1:23:45`, `83:45`, a bare number of seconds and YouTube's
+`1h23m45s`. A point, a comma or a space separates the parts as a colon does,
+because the iPhone's number pad has a point and no colon. It stays after the
+window has loaded, so another part is one edit and one tap away, without a
+new look-up. Inside a window the page moves the heatmap to the window's own
+time before any rule reads it. A start that the link or the user named is
+where the selection begins (rule 1, counted from the window's beginning); a
+default start leaves the selection to rules 2 and 3.
+
+The field belongs to the link it was filled for. When the same video comes
+again under a link whose timestamp was added, changed or taken away (pasted,
+or shared with `#yt=`) and nobody has typed in the field, the page fills it
+again for that link, as on the first `long`: a timestamp inside the video is
+fetched at once, anything else is asked about. It never fetches the old
+start again as if the new link had named it. A time the user typed stays,
+and is what the next tap fetches. A tap for the part that is already on its
+way does nothing; a tap for another part replaces it, as another link
+would, and asking again stops a part that is on its way or still being
+decoded. While the first look-up or a whole download is on its way, a tap
+on the same video opens no second job: the link in the box when the answer
+arrives is the one whose timestamp counts.
+
+What this costs: a long video is looked up twice at YouTube (the first run
+ends at its filter after the look-up, and the window job looks the video up
+again), and it uses two of the client's five fetches a minute. Each further
+part is one more of both.
+
+**In the runner.** `POST /jobs` takes the same optional `start`, checked
+again, and answers `done` (with `window_start` for a job with a start),
+`long` or `failed`. The fetcher's client accepts an answer only when it fits
+the request: `long` for a job without a start, and with a length; `past_end`
+for a job with one; a `window_start` for a job with one, and then at most
+one second after the start asked for and at most ten minutes before it
+(the longest window a runner can be set to fetch, because a window holds
+its start). The job queue fails a job with a start that was answered `long`.
+
+- **A job without a start** runs section 6's argument list with one addition:
+  `--print-to-file "pre_process:%(.{title,duration,heatmap,is_live})j"
+  "%(id)s.pre.json"`. yt-dlp writes those four fields at its `pre_process`
+  stage, which comes before the filter (`YoutubeDL.process_video_result`),
+  and `--print-to-file`, unlike `--print`, does not turn the run into a
+  simulation. So when the filter ends the run (exit 101), the file says why:
+  `is_live` true is `live`, a length over `FETCH_MAX_SECONDS` is `long`, and
+  anything else, a missing file included, is `failed`.
+- **A job with a start** runs two children, one after the other, under one
+  `FETCH_TIMEOUT_SECONDS`:
+  1. yt-dlp with `--skip-download`: the same list without `--max-filesize`,
+     with `!is_live` as its only filter (exit 101 is `live`), writing only
+     the info JSON.
+  2. the window program, `strange_ringtone_runner/window.py`, with six
+     arguments: the info JSON, the audio file and the result file in the job
+     directory, the start, `FETCH_MAX_SECONDS` and `FETCH_MAX_BYTES`.
+
+  Each child gets section 6's whole fence: `prlimit`, an environment built
+  from scratch, its own session, the group kill and the sweep before and
+  after it. Nothing yt-dlp started is still running when the window program
+  starts. The second child is not started when the first used up the time,
+  or when the runner was told to stop between the two.
+- **Success** is the audio file (a regular file within `FETCH_MAX_BYTES`),
+  the info JSON and the result file `{"start", "duration"}`, whose start is
+  at most a second after the one asked for and at most `FETCH_MAX_SECONDS`
+  before it, and whose duration is at most `FETCH_MAX_SECONDS`. Exit 0 alone
+  proves nothing.
+
+**The window program.** Stdlib only, importing nothing from the project, run
+by path on the base interpreter (`python -I`), never in yt-dlp's venv. The
+runner's process does not import it. It reads two things it does not trust,
+yt-dlp's info JSON and the media server's bytes:
+
+- From the info JSON it takes the chosen format's `url`, used only as https
+  on a subdomain of `googlevideo.com` with no user name and no port but 443
+  (the whole network location is matched, not only the host name); four of
+  its `http_headers` (`User-Agent`, `Accept`, `Accept-Language`,
+  `Sec-Fetch-Mode`), each one plain line; and `available_at`, which it
+  waits for. The format must be `protocol` `https` and `ext` `m4a`.
+- Every request is a byte range of at most 8 MiB on a connection of its own,
+  through `HTTPS_PROXY`, so through the forwarder, whose allowlist is the
+  second check and whose 16 MiB a tunnel holds one request. An answer is
+  read only when it is a 206 for the range asked for, unencoded, with the
+  same file size every time. A 200, which would be the whole file, is
+  refused unread. A 403 is `blocked`.
+- It follows a redirect (301, 302, 303, 307 or 308) itself, three at most.
+  The answer must name exactly one address, and that address, read against
+  the one it came from, must pass the address check before anything is sent
+  to it. The body of a redirect or of an error is never read: the standard
+  library's own redirect handling would read it whole first.
+- It accepts one layout: `ftyp`, `moov`, `sidx` first, one track with no
+  edit list, an index of at most 1 MiB that lists fragments (not other
+  indexes), all of them inside the file. Anything else fails closed.
+- The window is the fragments from the one that holds the start, as many as
+  fit in `FETCH_MAX_SECONDS` and in `FETCH_MAX_BYTES` with the file's first
+  part. It ends early rather than pass either. A start at or after the end
+  is `past_end`.
+- Each fragment must be exactly one `moof` of at most 64 KiB and one `mdat`,
+  together the size the index gives, with one track, at exactly the decode
+  time the index lists the fragment under. A fragment that says it plays at
+  any other time, a tick or an hour off, is refused: the index chose these
+  bytes for this time, and the length written into the header comes from
+  the index too. The program moves every decode time so that the window
+  starts at zero, writes the window's length into `mvhd`, `tkhd`, `mdhd`
+  and `mehd`, and writes the file's own `ftyp` and `moov` followed by the
+  fragments. The index is left out: its offsets describe the whole file.
+- The audio goes from the network into the file in pieces of 64 KiB, and the
+  fragments' times are then changed in the file itself. Whatever the
+  window's size, the program holds the start of the file (at most 1 MiB)
+  and one fragment's `moof`; the file is created new, owner-only, and
+  removed again when anything after that fails.
+- Its exit status is its whole answer: 0, or 1 `failed`, 3 `past_end`,
+  4 `blocked`, 5 `timeout`. What it prints is a fixed phrase and is never
+  read.
+
+**What it does not do.**
+
+- It does not check the audio. The runner hands over bytes that have the
+  right boxes; the browser decodes them, as it decodes everything else it is
+  given (6.1, Accepted risks).
+- It does not read a fragment's table of samples, so it does not know how
+  long a fragment really plays. The index's lengths bound the window, and
+  each fragment's start is tied to the index, but a server whose fragments
+  hold more audio than its index says could make a file that decodes to
+  more than `FETCH_MAX_SECONDS`. The page's own limits are what bound that,
+  as for a picked file: 64 MiB before decoding and 10 minutes after
+  (section 4).
+- It does not survive a change in how YouTube serves audio. A manifest
+  instead of one file, an index elsewhere, or a request the media server
+  wants signed differently, and windows fail (`failed` or `blocked`) while
+  shorter videos may still work through yt-dlp. That is the cost of
+  decision 5.
+- An advertisement's wait counts against `FETCH_TIMEOUT_SECONDS`, for both
+  children together. A wait longer than what is left is a `timeout`.
+- No test decodes a cut file: the images hold no decoder. On 2026-11-11 the
+  program, run over the bytes saved during the measurements, wrote byte for
+  byte the two files Safari had decoded on an iPhone.
+
+**Checks.**
+
+| # | Check | Type |
+| --- | --- | --- |
+| W1 | A start is a JSON integer from 0 to 359,999 at the fetcher, in its client, in the job queue and at the runner; anything else is refused before anything runs (`bad_start`, or a `ValueError` inside) | unit |
+| W2 | The download list carries the `pre_process` print, and the pinned yt-dlp writes it before its filter ends the run (exit 101) | unit, in-image |
+| W3 | Exit 101 is `long` only for a length over `FETCH_MAX_SECONDS`, `live` only for the JSON `true`, and `failed` otherwise | unit |
+| W4 | A job with a start runs yt-dlp with `--skip-download`, then the window program, each fenced and swept, under one time budget; a first child that fails or uses up the time starts no second, and neither does a job cancelled between the two | unit |
+| W5 | The window program takes an address only as https on a `googlevideo.com` subdomain, sends only the four headers, and follows a redirect only to one such address, without reading the redirect's body | unit |
+| W6 | It reads an answer only when it is a 206 for the range asked for; a server that ignores the range is cut off unread | unit |
+| W7 | Any other layout, and any fragment that is not one `moof` and one `mdat` at the index's time, is refused; no window passes either limit, and the file written never grows past the planned size | unit |
+| W8 | A refused run leaves no file behind, also when it fails with the audio half written, and nothing printed names the address or the title | unit |
+| W9 | The fetcher's client accepts `long`, `past_end` and `window_start` only as answers to the request that can have them, and a `window_start` only within the longest window before the start | unit |
+| W10 | A long video's first job downloads nothing and holds nothing; the page asks before any window is requested, and a link's timestamp leaves the phone only for a long video | unit, JS |
+| W11 | The window program is stdlib only, is not imported by the runner's process, and runs in the image as UID 10001 under `prlimit` | unit, in-image |
+| W12 | One request stays under the forwarder's download budget for a tunnel | unit |
+| W13 | What the window program holds in memory does not grow with the window: 18 MB through the real client into a file stay under 2 MiB | unit |
+| W14 | The same video under a link with another timestamp is never fetched from the old start in the new link's name, also when the link changes while a look-up is on its way; a typed start stays; another part replaces the one on its way; asking again stops a part on its way or being decoded | JS |
+| W15 | Every check of the window program, of the runner's and the client's handling of a window and of the page's flow was removed or weakened once (mutation run, 2026-11-12) and a test failed each time | unit, JS |
 
 ## 7. Web app
 
@@ -1259,7 +1499,10 @@ test to fail.
 
 The first rule that applies places the selection:
 
-1. If the shared link has a `t=` timestamp, the selection starts there.
+1. If the shared link has a `t=` timestamp, the selection starts there. In a
+   window of a longer video (6.2) the time is counted from the window's
+   beginning, and a start the user typed into the Start at field counts as
+   the link's timestamp does.
 2. If the audio came from the fetcher and YouTube supplied a "Most Replayed"
    heatmap, the selection goes on the window with the highest summed value.
 3. Otherwise, it goes on the window with the highest mean short-term loudness,
@@ -1305,13 +1548,16 @@ video ID and `t=` on the device, from `watch?v=`, `/shorts/`, `/live/`,
 `/embed/` and `/v/` links on `youtube.com`, `www.youtube.com`,
 `m.youtube.com` and `music.youtube.com`, from `youtu.be/` links, or from a
 bare 11-character ID. It drops tracking parameters such as
-`si=` and sends only the ID to the fetcher. The README documents how to build
-the Shortcut, with a placeholder origin.
+`si=` and sends only the ID to the fetcher, and for a video longer than
+`FETCH_MAX_SECONDS` the link's timestamp as the window's start (6.2). The
+README documents how to build the Shortcut, with a placeholder origin.
 
 Opening the app with `#yt=` in its address starts the fetch without a tap,
 which is what the Shortcut needs, so any web page can start one by linking
 there. It is one fetch against the shared rate limit, of a video named by
-its ID alone, shown to the person who followed the link.
+its ID alone, shown to the person who followed the link; for a video longer
+than `FETCH_MAX_SECONDS` whose link carries a timestamp it is two, the
+second with that timestamp as its start (6.2).
 
 ### 7.5 AGPL source link
 
@@ -1708,11 +1954,13 @@ fetcher/
   runner.py                 # the runner's entry point: python -I fetcher/runner.py; puts ../core and fetcher/ on sys.path
   strange_ringtone_fetch/{__init__,__main__,config,server,jobs,routes,metadata,runner_client}.py   # imports only config and http_guard from core
   strange_ringtone_runner/{__init__,__main__,config,server,ytdlp}.py   # yt-dlp's container: imports config and http_guard from core, config, metadata and routes from the fetcher
+  strange_ringtone_runner/window.py   # the window program (6.2): stdlib only, imports nothing of the project, run by path as the runner's second child
   strange_ringtone_forwarder/{__init__,__main__,policy,server}.py   # the CONNECT gate: stdlib only, imports nothing from core or the fetcher
-tests/  tests/corpus/  tests/image/  tests/image_fetcher/  tests/compose/  tests/stubs/{ffmpeg_stub,ytdlp_stub}.py  tests/js/
+tests/  tests/corpus/  tests/image/  tests/image_fetcher/  tests/compose/  tests/stubs/{ffmpeg_stub,ytdlp_stub,window_stub}.py  tests/js/
+tests/fmp4_fixture.py       # a fragmented MP4 in YouTube's layout, with no audio, for the window program's tests
 scripts/{check_pr_title.py,check_contract_change.py,check_ffmpeg_release.py}   # stdlib checks CI runs
 tools/spike/phase0.py       # regenerates the iOS test tones into spike-out/
-tools/dev_fetch_stack.py    # loopback dev stack: core, runner with the stub, fetcher, one origin, for the offline product check
+tools/dev_fetch_stack.py    # loopback dev stack: core, runner with the two stubs, fetcher, one origin, for the offline product check
 .github/{dependabot.yml,workflows/{ci,pr-checks,security_gate,release-please,ffmpeg-watch}.yml}
 release-please-config.json  .release-please-manifest.json
 docs/PLAN.md
@@ -1872,6 +2120,16 @@ docs/PLAN.md
    them. Finally a verification panel tries to refute "done", which includes
    removing each check and expecting a test to fail. The owner adds "Compose
    topology tests" to the ruleset when PR A opens.
+
+   **Follow-up: a window of a longer video (section 6.2, decided on
+   2026-11-11).** One PR, branch `feat/fetch-window`, after the measurements
+   of 6.2 and before the release. It delivered the runner's window program
+   and its fence (W4 to W8, W11, W12), the start time through the fetcher,
+   its client, the queue and the runner (W1, W9), the `pre_process` print
+   that tells a long video from a live one (W2, W3), the status `long`, the
+   errors `live` and `past_end` in place of `too_long`, the page's Start at
+   field and its two requests (W10), a stub for the window program beside
+   the one for yt-dlp, the dev stack with both, and the documentation.
 6. **Release:** release-please, publish with provenance, SBOM and image scans, a
    complete README contract, then **v0.1.0**. Stop there. Integration into an
    infrastructure repository happens from that repository.
@@ -1882,6 +2140,11 @@ docs/PLAN.md
   account or cookies are used.
 - The Shortcut uses a URL fragment, so proxies never log the link that was
   shared, and `si=` share tracking is stripped on the device.
+- Of a link, the fetcher is sent the video's ID. A timestamp stays on the
+  phone unless the video is longer than `FETCH_MAX_SECONDS`: then the start
+  of the window, the link's own or the one the user chose, is sent as one
+  whole number of seconds in the request's body (6.2). Neither server logs
+  it.
 - Rendered files carry no metadata except a title. The server keeps nothing:
   each result is deleted after `RESULT_TTL_SECONDS`, and tone names stay out of
   URLs and out of the app's own logs. A name does travel in the `X-Tone-Name`

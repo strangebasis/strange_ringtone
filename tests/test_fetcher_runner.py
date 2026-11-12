@@ -76,7 +76,8 @@ SHARED_MODULES = {
 }
 # The stub's ID table (tests/stubs/ytdlp_stub.py) and the code each must give.
 FAILURES = {
-    "tooLong____": "too_long",
+    "liveStream_": "live",
+    "rejected___": "failed",
     "blocked____": "blocked",
     "notFound___": "not_found",
     "failing____": "failed",
@@ -92,8 +93,11 @@ def token() -> str:
     return secrets.token_hex(16)
 
 
-def job_body(video_id: str, job: str) -> bytes:
-    return json.dumps({"video_id": video_id, "job": job}).encode("ascii")
+def job_body(video_id: str, job: str, start: int | None = None) -> bytes:
+    body: dict[str, Any] = {"video_id": video_id, "job": job}
+    if start is not None:
+        body["start"] = start
+    return json.dumps(body).encode("ascii")
 
 
 def exchange_to_close(port: int, data: bytes, half_close: bool = False) -> Response:
@@ -393,11 +397,41 @@ class JobRequestTest(unittest.TestCase):
         ]
         for body in cases:
             with self.subTest(body=body):
-                self.assertEqual(parse_job_request(body), (VIDEO_ID, job))
+                self.assertEqual(parse_job_request(body), (VIDEO_ID, job, None))
         for video_id in ("a" * 11, "-_-_-_-_-_-", "AZaz09_-AZ0"):
             for other in ("0" * 32, "f" * 32, "0123456789abcdef" * 2):
                 with self.subTest(video_id=video_id, job=other):
-                    self.assertEqual(parse_job_request(job_body(video_id, other)), (video_id, other))
+                    self.assertEqual(parse_job_request(job_body(video_id, other)), (video_id, other, None))
+
+    def test_a_start_time_is_the_only_other_key_and_a_whole_number_of_seconds(self) -> None:
+        job = token()
+        for start in (0, 1, 600, 4500, 359_999):
+            with self.subTest(start=start):
+                self.assertEqual(parse_job_request(job_body(VIDEO_ID, job, start)), (VIDEO_ID, job, start))
+        self.assertEqual(
+            parse_job_request(b'{"start": 90, "job": "%s", "video_id": "dQw4w9WgXcQ"}' % job.encode("ascii")),
+            (VIDEO_ID, job, 90),
+        )
+        # The start goes into the window program's arguments, so it is
+        # checked again here: a JSON integer within the bound and nothing
+        # else. A key that is there must hold one: null is not "no start".
+        for start in ("-1", "360000", "1e3", "90.0", "90.5", '"90"', "true", "false", "null", "[90]", '{"s": 90}',
+                      "1" + "0" * 30, "-0.0", '""'):
+            with self.subTest(start=start):
+                body = b'{"video_id": "dQw4w9WgXcQ", "job": "%s", "start": %s}' % (job.encode(), start.encode())
+                self.assertRefused(body, "bad_start")
+        for label, body in {
+            "a start and another key":
+                json.dumps({"video_id": VIDEO_ID, "job": job, "start": 5, "end": 9}).encode("ascii"),
+            "a renamed start": json.dumps({"video_id": VIDEO_ID, "job": job, "Start": 5}).encode("ascii"),
+            "a start twice": b'{"video_id": "dQw4w9WgXcQ", "job": "%s", "start": 5, "start": 6}' % job.encode(),
+            "a start without a job": json.dumps({"video_id": VIDEO_ID, "start": 5}).encode("ascii"),
+        }.items():
+            with self.subTest(label):
+                self.assertRefused(body, "bad_json")
+        # The ID and the token are judged first, as without a start.
+        self.assertRefused(json.dumps({"video_id": "x", "job": job, "start": 5}).encode("ascii"), "bad_video_id")
+        self.assertRefused(json.dumps({"video_id": VIDEO_ID, "job": "x", "start": 5}).encode("ascii"), "bad_job")
 
     def test_anything_else_is_refused(self) -> None:
         job = token()
@@ -515,8 +549,8 @@ class RunnerServerTestCase(unittest.TestCase):
         headers = [("Content-Type", content_type), ("Content-Length", str(len(body)))]
         return self.request("POST", "/jobs", headers, body)
 
-    def post(self, video_id: str = VIDEO_ID, job: str | None = None) -> Response:
-        return self.post_body(job_body(video_id, job or token()))
+    def post(self, video_id: str = VIDEO_ID, job: str | None = None, start: int | None = None) -> Response:
+        return self.post_body(job_body(video_id, job or token(), start))
 
     def post_in_background(self, video_id: str, job: str) -> tuple[threading.Thread, list[Any]]:
         """POST from a thread; the outcome list gets the Response or the exception."""
@@ -645,6 +679,98 @@ class RunnerFlowTest(RunnerServerTestCase):
         self.assertNotIn("s3cr3t-env-value", json.dumps(run))
         self.assertNotIn("RUNNER_SECRET", run["env"])
         self.assertNotIn("HTTPS_PROXY", run["env"])
+
+    def test_a_long_video_answers_long_with_its_metadata_and_holds_nothing(self) -> None:
+        # docs/PLAN.md 6.2: nothing of a video longer than the runner
+        # fetches whole is downloaded; the answer says how long it is.
+        job = token()
+        response = self.post("tooLong____", job)
+        self.assertEqual(response.status, 200, response.body)
+        self.assertNoStore(response)
+        answer = response.json()
+        self.assertEqual(set(answer), {"status", "info"})
+        self.assertEqual(answer["status"], "long")
+        info = answer["info"]
+        self.assertEqual(set(info), {"title", "duration", "heatmap"})
+        self.assertEqual(info["title"], stub_title("tooLong____"))
+        self.assertEqual(info["duration"], 3600)
+        self.assertEqual(len(info["heatmap"]), 100)
+        # The same whitelist as a finished job's: the fetcher reads it back.
+        self.assertEqual(parse_info(info).duration, 3600)
+        # One yt-dlp run, no window program, no audio to collect, nothing left.
+        self.assertEqual(len(self.runs()), 1)
+        self.assertJsonError(self.audio(job), 404, "not_found")
+        self.assertScratchEmpty()
+        self.assertEqual(len(self.server.results), 0)
+
+    def test_a_job_with_a_start_time_answers_done_with_where_the_window_begins(self) -> None:
+        job = token()
+        response = self.post("tooLong____", job, start=1234)
+        self.assertEqual(response.status, 200, response.body)
+        self.assertNoStore(response)
+        answer = response.json()
+        self.assertEqual(set(answer), {"status", "info", "window_start"})
+        self.assertEqual(answer["status"], "done")
+        self.assertEqual(answer["window_start"], 1230.0)
+        self.assertEqual(set(answer["info"]), {"title", "duration", "heatmap"})
+        self.assertEqual(answer["info"]["duration"], 3600)
+        # Nothing of the info JSON's address or headers leaves the runner.
+        for never in ("googlevideo", "videoplayback", "http_headers", "stub-agent", "url", "format_id"):
+            self.assertNotIn(never.encode("ascii"), response.body)
+        # yt-dlp for the address, then the window program, in one job
+        # directory, and neither saw the token.
+        first, second = self.runs()
+        self.assertIn("--skip-download", first["argv"])
+        self.assertEqual(first["argv"][-1], "https://www.youtube.com/watch?v=tooLong____")
+        self.assertEqual(second["argv"][3:], ["1234", "600", str(MIB)])
+        self.assertEqual(os.path.normcase(first["cwd"]), os.path.normcase(second["cwd"]))
+        self.assertTrue(Path(first["cwd"]).name.startswith("job-"), first["cwd"])
+        self.assertNotIn(job, json.dumps([first, second]))
+        # The window is held and collected like any audio: once, by its token.
+        self.assertEqual(self.scratch_contents(), [f"results/{job}.m4a"])
+        audio = self.audio(job)
+        self.assertEqual(audio.status, 200, audio.body)
+        self.assertEqual(audio.body, b"STUB-WINDOW\n" + b"tooLong____@1234")
+        self.assertJsonError(self.audio(job), 404, "not_found")
+        self.assertScratchEmpty()
+
+    def test_a_download_s_answer_has_no_window_start(self) -> None:
+        self.assertEqual(set(self.post(VIDEO_ID).json()), {"status", "info"})
+
+    def test_a_window_job_s_failures_answer_failed_with_the_code_and_leave_nothing_behind(self) -> None:
+        cases = {
+            # yt-dlp's part of the job.
+            "liveStream_": "live", "blocked____": "blocked", "notFound___": "not_found", "failing____": "failed",
+            # The window program's part.
+            "pastEnd____": "past_end", "winBlocked_": "blocked", "winTimeout_": "timeout", "winFailing_": "failed",
+        }
+        for video_id, code in cases.items():
+            with self.subTest(video_id=video_id):
+                job = token()
+                response = self.post(video_id, job, start=1234)
+                self.assertEqual(response.status, 200, response.body)
+                self.assertEqual(response.json(), {"status": "failed", "error": code})
+                self.assertJsonError(self.audio(job), 404, "not_found")
+                self.assertScratchEmpty()
+        # A start after the end of the stub's ordinary video (215.5 s).
+        self.assertEqual(self.post(VIDEO_ID, start=300).json(), {"status": "failed", "error": "past_end"})
+        self.assertScratchEmpty()
+        # A window program that hangs, with a short wall clock and drain.
+        self.ytdlp.timeout_seconds = 2
+        with mock.patch.object(ytdlp_module, "DRAIN_SECONDS", 0.5):
+            job = token()
+            response = self.post("winHanging_", job, start=1234)
+        self.assertEqual(response.json(), {"status": "failed", "error": "timeout"})
+        self.assertJsonError(self.audio(job), 404, "not_found")
+        self.assertScratchEmpty()
+
+    def test_a_refused_start_runs_nothing(self) -> None:
+        for start in (-1, 360_000, 1.5, "90", True, None):
+            with self.subTest(start=start):
+                body = json.dumps({"video_id": VIDEO_ID, "job": token(), "start": start}).encode("ascii")
+                self.assertJsonError(self.post_body(body), 400, "bad_start")
+        self.assertEqual(self.runs(), [])
+        self.assertScratchEmpty()
 
     def test_audio_is_served_once_then_deleted(self) -> None:
         # R3: the audio leaves once, to the holder of its token, and is gone.
@@ -1245,7 +1371,7 @@ class RunnerImportsTest(unittest.TestCase):
 
     def test_runner_package_files_are_exactly(self) -> None:
         self.assertEqual(sorted(path.name for path in RUNNER_PACKAGE.glob("*.py")),
-                         ["__init__.py", "__main__.py", "config.py", "server.py", "ytdlp.py"])
+                         ["__init__.py", "__main__.py", "config.py", "server.py", "window.py", "ytdlp.py"])
         self.assertEqual([path.name for path in RUNNER_PACKAGE.iterdir()
                           if path.is_dir() and path.name != "__pycache__"], [])
 

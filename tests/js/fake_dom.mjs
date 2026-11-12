@@ -241,12 +241,31 @@ class FakeOfflineAudioContext {
 
   decodeAudioData(bytes) {
     decodedInputs.push(new Uint8Array(bytes));
-    return Promise.resolve(nextDecoded);
+    const decoded = nextDecoded;
+    return decodeGate === null ? Promise.resolve(decoded) : decodeGate.then(() => decoded);
   }
 }
 
 // The bytes each decodeFile call handed the decoder, in order.
 let decodedInputs = [];
+// While set, every decode waits for it (holdDecoding).
+let decodeGate = null;
+
+/**
+ * Make every decode from now on wait, so a test can act while one is in
+ * flight. Call after loadApp, which lets decodes through again.
+ * @returns {() => void} lets the waiting decodes, and all later ones, finish
+ */
+export function holdDecoding() {
+  let open;
+  decodeGate = new Promise((resolve) => {
+    open = resolve;
+  });
+  return () => {
+    decodeGate = null;
+    open();
+  };
+}
 
 /** The audio the next decodeFile call returns: these channels at 44100 Hz. */
 export function setDecoded(channels) {
@@ -280,6 +299,7 @@ export async function loadApp(options = {}) {
   };
   contexts = [];
   decodedInputs = [];
+  decodeGate = null;
   // The player's pump timer must not keep node running when a test that
   // started playback fails before stopping it.
   globalThis.setInterval = (callback, ms) => {

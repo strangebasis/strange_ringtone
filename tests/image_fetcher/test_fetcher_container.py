@@ -85,7 +85,10 @@ RUNNER_CMD = ["python", "-I", "/app/fetcher/runner.py"]
 RUNNER_PORT = 8080
 RUNNER_HEALTH_PATH = "/healthz"
 RUNNER_PACKAGE = Path("/app/fetcher/strange_ringtone_runner")
-RUNNER_MODULES = {"__init__.py", "__main__.py", "config.py", "server.py", "ytdlp.py"}
+RUNNER_MODULES = {"__init__.py", "__main__.py", "config.py", "server.py", "window.py", "ytdlp.py"}
+# The runner's second child for a job with a start time (docs/PLAN.md 6.2),
+# written out so that a change of its place fails here too.
+WINDOW_PROGRAM = "/app/fetcher/strange_ringtone_runner/window.py"
 RUNNER_SCRATCH = "/tmp/strange_ringtone_runner"
 FETCHER_SCRATCH = "/tmp/strange_ringtone_fetch"
 # The forwarder, the image's second command (compose.example.yaml), on its
@@ -868,6 +871,172 @@ class RealYtDlpOfflineTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, "failed")
         self.assertEqual(ytdlp.map_failure(1, b"Temporary failure in name resolution"), "failed")
 
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        command = self.fetcher.full_command(args)
+        self.assertEqual(command[0], PRLIMIT)
+        return subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=self.fetcher.child_env(self.job_dir),
+            cwd=self.job_dir,
+            timeout=RUN_SECONDS,
+            start_new_session=True,
+        )
+
+    def test_the_argument_list_of_a_job_with_a_start_time_is_accepted(self) -> None:
+        # docs/PLAN.md 6.2: the same proof for the list with --skip-download.
+        proc = self._run(ytdlp.window_ytdlp_args(OFFLINE_VIDEO_ID, self.job_dir))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("no such option", proc.stderr)
+        self.assertRegex(proc.stderr, r"(?i)resolution|resolve|getaddrinfo|name or service")
+        self.assertFalse((self.job_dir / f"{OFFLINE_VIDEO_ID}.info.json").exists())
+        with self.assertRaises(FetchError) as caught:
+            self.fetcher.fetch_window(OFFLINE_VIDEO_ID, self.job_dir, 90)
+        self.assertEqual(caught.exception.code, "failed")
+
+    # What yt-dlp knows about a video once it has looked it up, as an info
+    # JSON it can be handed instead of the network (--load-info-json).
+    LOADED: dict[str, Any] = {
+        "id": OFFLINE_VIDEO_ID,
+        "title": "A loaded title",
+        "duration": 3600,
+        "is_live": False,
+        "extractor": "youtube",
+        "extractor_key": "Youtube",
+        "webpage_url": f"https://www.youtube.com/watch?v={OFFLINE_VIDEO_ID}",
+        "heatmap": [{"start_time": 0.0, "end_time": 36.0, "value": 0.5}],
+        "formats": [{
+            "format_id": "140", "url": "https://rr1---sn-offline.googlevideo.com/videoplayback", "ext": "m4a",
+            "vcodec": "none", "acodec": "mp4a.40.2", "protocol": "https",
+        }],
+    }
+
+    def _loaded(self, info: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+        """The download list on an info JSON instead of YouTube: its URL replaced by --load-info-json."""
+        source = self.job_dir / "loaded.json"
+        source.write_text(json.dumps(info), encoding="utf-8")
+        args = ytdlp_args(OFFLINE_VIDEO_ID, self.job_dir, 600, 40 * 1024 * 1024)
+        self.assertEqual(args[-2], "--")
+        return self._run([*args[:-2], "--load-info-json", str(source)])
+
+    def test_the_fields_are_written_before_the_filter_ends_the_run(self) -> None:
+        # docs/PLAN.md 6.2 (W2), on the pinned yt-dlp itself: a video of an
+        # hour is refused by the filter (exit 101), and the four fields are
+        # in the job directory all the same, because yt-dlp wrote them at
+        # its pre_process stage, before the filter looked.
+        proc = self._loaded(self.LOADED)
+        self.assertEqual(proc.returncode, 101, proc.stderr)
+        self.assertNotIn("no such option", proc.stderr)
+        pre = self.job_dir / f"{OFFLINE_VIDEO_ID}.pre.json"
+        self.assertTrue(pre.is_file(), sorted(os.listdir(self.job_dir)))
+        self.assertEqual(json.loads(pre.read_text(encoding="utf-8")), {
+            "title": "A loaded title", "duration": 3600, "is_live": False,
+            "heatmap": [{"start_time": 0.0, "end_time": 36.0, "value": 0.5}],
+        })
+        # Nothing was downloaded, and the run wrote no info JSON either.
+        self.assertFalse((self.job_dir / f"{OFFLINE_VIDEO_ID}.m4a").exists())
+        self.assertFalse((self.job_dir / f"{OFFLINE_VIDEO_ID}.info.json").exists())
+        # And the runner reads it as a long video with its length.
+        outcome = ytdlp.read_rejection(self.job_dir, OFFLINE_VIDEO_ID, 600)
+        self.assertEqual(type(outcome).__name__, "LongVideo")
+        self.assertEqual(outcome.metadata.duration, 3600)  # type: ignore[attr-defined]
+        self.assertEqual(outcome.metadata.title, "A loaded title")  # type: ignore[attr-defined]
+
+    def test_a_live_stream_is_told_apart_from_a_long_video(self) -> None:
+        proc = self._loaded(dict(self.LOADED, is_live=True, duration=None))
+        self.assertEqual(proc.returncode, 101, proc.stderr)
+        outcome = ytdlp.read_rejection(self.job_dir, OFFLINE_VIDEO_ID, 600)
+        self.assertIsInstance(outcome, FetchError)
+        self.assertEqual(outcome.code, "live")  # type: ignore[attr-defined]
+
+    def test_the_print_does_not_turn_the_run_into_a_simulation(self) -> None:
+        # A video the filter passes: yt-dlp writes the fields and then goes
+        # on to the download, which can only fail at name resolution here.
+        # With --print in place of --print-to-file it would stop at the print
+        # and exit 0, having downloaded nothing.
+        proc = self._loaded(dict(self.LOADED, duration=100))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertRegex(proc.stderr, r"(?i)resolution|resolve|getaddrinfo|name or service")
+        pre = self.job_dir / f"{OFFLINE_VIDEO_ID}.pre.json"
+        self.assertEqual(json.loads(pre.read_text(encoding="utf-8"))["duration"], 100)
+        self.assertFalse((self.job_dir / f"{OFFLINE_VIDEO_ID}.m4a").exists())
+
+
+class WindowProgramTest(unittest.TestCase):
+    """The runner's second child, as the image ships it (docs/PLAN.md 6.2, W11).
+
+    Run the way the runner runs it: by path on the base interpreter, under
+    prlimit, with the runner's environment for a child. The container has no
+    network, so a request can only fail.
+    """
+
+    def setUp(self) -> None:
+        self.assertEqual(_interfaces(), {"lo"}, "refusing to run the window program with a network")
+        self.job_dir = Path(tempfile.mkdtemp(prefix="job-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, self.job_dir, ignore_errors=True)
+        self.fetcher = _ytdlp()
+
+    def run_window(self, info: dict[str, Any], start: int = 90) -> subprocess.CompletedProcess[str]:
+        (self.job_dir / f"{OFFLINE_VIDEO_ID}.info.json").write_text(json.dumps(info), encoding="utf-8")
+        command = self.fetcher.full_command(
+            ytdlp.window_args(OFFLINE_VIDEO_ID, self.job_dir, start, 600, 40 * 1024 * 1024),
+            self.fetcher.window_command,
+        )
+        self.assertEqual(command[0], PRLIMIT)
+        return subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=self.fetcher.child_env(self.job_dir),
+            cwd=self.job_dir,
+            timeout=RUN_SECONDS,
+            start_new_session=True,
+        )
+
+    def test_the_program_is_the_runners_own_file_on_the_base_interpreter(self) -> None:
+        self.assertEqual(ytdlp.WINDOW_COMMAND, (sys.executable, "-I", WINDOW_PROGRAM))
+        self.assertEqual(self.fetcher.window_command, ytdlp.WINDOW_COMMAND)
+        # The base interpreter, which holds no distribution: never yt-dlp's venv.
+        self.assertTrue(os.path.realpath(sys.executable).startswith(BASE_PREFIX + "/"), sys.executable)
+        self.assertFalse(os.path.realpath(sys.executable).startswith(str(VENV)), sys.executable)
+        info = os.stat(WINDOW_PROGRAM)
+        self.assertEqual((info.st_uid, info.st_mode & 0o022), (0, 0))
+
+    def test_it_loads_nothing_but_the_standard_library(self) -> None:
+        probe = (
+            "import json, runpy, sys\n"
+            "before = set(sys.modules)\n"
+            "module = runpy.run_path(sys.argv[1], run_name='window_probe')\n"
+            "names = sorted(name.split('.')[0] for name in set(sys.modules) - before)\n"
+            "print(json.dumps(sorted(set(names) - set(sys.stdlib_module_names))))\n"
+        )
+        proc = subprocess.run([sys.executable, "-I", "-c", probe, WINDOW_PROGRAM], capture_output=True, text=True,
+                              timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout), [])
+
+    def test_it_refuses_an_address_that_is_not_the_media_servers_before_any_request(self) -> None:
+        proc = self.run_window({"url": "https://example.invalid/videoplayback", "protocol": "https", "ext": "m4a"})
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual((proc.stdout, proc.stderr), ("", "window: no usable address\n"))
+        self.assertEqual(sorted(os.listdir(self.job_dir)), [f"{OFFLINE_VIDEO_ID}.info.json"])
+
+    def test_offline_it_fails_at_its_first_request_and_leaves_nothing(self) -> None:
+        proc = self.run_window({
+            "url": "https://rr1---sn-offline.googlevideo.com/videoplayback?expire=1",
+            "http_headers": {"User-Agent": "test", "Accept": "*/*"}, "protocol": "https", "ext": "m4a",
+        })
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertEqual((proc.stdout, proc.stderr), ("", "window: the request failed\n"))
+        self.assertEqual(sorted(os.listdir(self.job_dir)), [f"{OFFLINE_VIDEO_ID}.info.json"])
+
+    def test_other_arguments_are_a_usage_error(self) -> None:
+        proc = subprocess.run([*ytdlp.WINDOW_COMMAND, "one", "two"], capture_output=True, text=True, timeout=60)
+        self.assertEqual((proc.returncode, proc.stdout, proc.stderr), (2, "", ""))
+
 
 class NetworkTest(unittest.TestCase):
     # The CI run has no network; in a deployment the fetcher has egress, and
@@ -1145,6 +1314,22 @@ class RunnerTest(unittest.TestCase):
         # Nothing to collect: the failed run left no audio.
         status, _headers, _body = self._exchange("GET", f"/jobs/{token}/audio")
         self.assertEqual(status, 404)
+        # The same for a job with a start time (docs/PLAN.md 6.2): yt-dlp
+        # with --skip-download fails at name resolution too, and the window
+        # program is never started.
+        window_token = secrets.token_hex(16)
+        request = json.dumps({"video_id": OFFLINE_VIDEO_ID, "job": window_token, "start": 90}).encode("ascii")
+        status, headers, body = self._exchange(
+            "POST", "/jobs", request, {"Content-Type": "application/json"}, timeout=RUN_SECONDS + 30,
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body), {"status": "failed", "error": "failed"})
+        status, _headers, _body = self._exchange("GET", f"/jobs/{window_token}/audio")
+        self.assertEqual(status, 404)
+        # A start that is no whole number of seconds is refused before any run.
+        request = json.dumps({"video_id": OFFLINE_VIDEO_ID, "job": window_token, "start": "90"}).encode("ascii")
+        status, _headers, body = self._exchange("POST", "/jobs", request, {"Content-Type": "application/json"})
+        self.assertEqual((status, json.loads(body)), (400, {"error": "bad_start"}))
         # The job directory is gone and no result waits: only the empty
         # results directory remains.
         self.assertEqual(sorted(os.listdir(RUNNER_SCRATCH)), ["results"])
@@ -1166,6 +1351,9 @@ class RunnerTest(unittest.TestCase):
         self.assertNotIn("youtube", log.lower())
         self.assertNotIn(OFFLINE_VIDEO_ID, log)
         self.assertNotIn(token, log)
+        self.assertNotIn(window_token, log)
+        self.assertEqual(len(re.findall(r"(?m)^POST /jobs 200 ", log)), 2)
+        self.assertEqual(len(re.findall(r"(?m)^POST /jobs 400 ", log)), 1)
 
     def test_runner_process_loads_only_the_allowed_modules(self) -> None:
         # The entry is a script beside the packages, so its process loads the

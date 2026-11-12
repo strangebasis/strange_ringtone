@@ -24,8 +24,17 @@ from typing import Any
 # trailing newline is refused too.
 VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}", re.ASCII)
 
-ERROR_CODES = ("blocked", "too_long", "not_found", "timeout", "failed")
+ERROR_CODES = ("blocked", "live", "not_found", "past_end", "timeout", "failed")
 TITLE_MAX_CHARS = 200
+# A window's start time (docs/PLAN.md 6.2): whole seconds from the video's
+# beginning. 99:59:59 is longer than any video YouTube takes, and keeps the
+# number small wherever it is written.
+MAX_START_SECONDS = 359_999
+# How far after the start asked for a window may claim to begin. It begins
+# with the fragment that holds the start, so at or before it; one second
+# covers rounding and audio that begins a moment after zero. How far before
+# the start it may begin is the caller's to say (clean_window_start).
+WINDOW_START_SLACK_SECONDS = 1.0
 HEATMAP_MAX_POINTS = 200
 # yt-dlp's duration is whole seconds, while the last heatmap point ends at the
 # exact length, so it may run past the duration by a fraction of a second.
@@ -62,6 +71,24 @@ class Metadata:
 class Download:
     audio: Path
     metadata: Metadata
+    # For a window of a longer video: where in the video the audio begins,
+    # in seconds. None when the audio is the whole video's.
+    window_start: float | None = None
+
+
+class LongVideo(Exception):
+    """The video is longer than the runner fetches whole, so nothing was downloaded (docs/PLAN.md 6.2).
+
+    Not a failure: the page asks where to start and sends a second request
+    with that start time. metadata is the cleaned title, length and heatmap;
+    the length is always there, because it is what makes the video long.
+    """
+
+    def __init__(self, metadata: Metadata) -> None:
+        if metadata.duration is None:
+            raise ValueError("a long video has a length")
+        super().__init__("long")
+        self.metadata = metadata
 
 
 def clean_title(value: Any) -> str | None:
@@ -99,6 +126,31 @@ def clean_duration(value: Any) -> int | float | None:
     if number is None or number <= 0:
         return None
     return value if isinstance(value, int) else number
+
+
+def clean_start(value: Any) -> int | None:
+    """value when it is a start time a window may have, else None.
+
+    A whole number of seconds from 0 to MAX_START_SECONDS, and a JSON integer
+    only: true is not 1 here, 12.0 is not 12, and "12" is no number. The
+    fetcher, the runner and the client all check a start with this, because
+    it ends up in the argument list of the runner's window program.
+    """
+    if type(value) is not int or not 0 <= value <= MAX_START_SECONDS:
+        return None
+    return value
+
+
+def clean_window_start(value: Any, start: int, max_seconds: int) -> float | None:
+    """Where a window asked to start at start really begins, in seconds, or None when the value can't be that.
+
+    A window holds its start and is at most max_seconds long, so it begins
+    within the max_seconds before the start, and never before second zero.
+    """
+    number = _number(value)
+    if number is None or not max(0, start - max_seconds) <= number <= start + WINDOW_START_SLACK_SECONDS:
+        return None
+    return number
 
 
 def clean_heatmap(value: Any, duration: int | float | None) -> tuple[dict[str, float], ...] | None:

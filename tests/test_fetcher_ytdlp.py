@@ -32,31 +32,44 @@ from unittest import mock
 import helpers
 from helpers import alive
 from strange_ringtone_fetch.metadata import (
+    MAX_START_SECONDS,
     FetchError,
+    LongVideo,
     Metadata,
     clean_duration,
     clean_heatmap,
+    clean_start,
     clean_title,
+    clean_window_start,
     metadata_to_info,
     parse_info,
 )
-from strange_ringtone_runner import ytdlp
+from strange_ringtone_runner import window, ytdlp
 from strange_ringtone_runner.ytdlp import (
     DEFAULT_COMMAND,
     DENO,
     PRLIMIT,
+    WINDOW_COMMAND,
     YTDLP_PYTHON,
     Limits,
     YtDlp,
     default_prlimit,
     map_failure,
     watch_url,
+    window_args,
+    window_ytdlp_args,
     ytdlp_args,
 )
 
 STUB = helpers.ROOT / "tests" / "stubs" / "ytdlp_stub.py"
 STUB_COMMAND = (sys.executable, "-I", str(STUB))
+# The stand-in for the runner's window program, the second child of a job
+# with a start time (tests/stubs/window_stub.py).
+WINDOW_STUB = helpers.ROOT / "tests" / "stubs" / "window_stub.py"
+WINDOW_STUB_COMMAND = (sys.executable, "-I", str(WINDOW_STUB))
 MODE_VAR = "STRANGE_RINGTONE_YTDLP_STUB"
+WINDOW_MODE_VAR = "STRANGE_RINGTONE_WINDOW_STUB"
+# One log for both stubs: a job's children in the order they ran.
 LOG_VAR = "STRANGE_RINGTONE_YTDLP_STUB_LOG"
 VIDEO_ID = "dQw4w9WgXcQ"
 MIB = 1024 * 1024
@@ -74,14 +87,19 @@ class StubYtDlp(YtDlp):
     the jobs' and the runner's tests.
     """
 
-    def __init__(self, *args: Any, log: Path | None = None, mode: str | None = None, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, log: Path | None = None, mode: str | None = None,
+                 window_mode: str | None = None, **kwargs: Any) -> None:
         kwargs.setdefault("command", STUB_COMMAND)
+        # Never the real window program: it would open a connection.
+        kwargs.setdefault("window_command", WINDOW_STUB_COMMAND)
         super().__init__(*args, **kwargs)
         self.extra: dict[str, str] = {}
         if log is not None:
             self.extra[LOG_VAR] = str(log)
         if mode is not None:
             self.extra[MODE_VAR] = mode
+        if window_mode is not None:
+            self.extra[WINDOW_MODE_VAR] = window_mode
 
     def child_env(self, job_dir: Path) -> dict[str, str]:
         env = super().child_env(job_dir)
@@ -138,6 +156,7 @@ class ArgumentsTest(unittest.TestCase):
             "--js-runtimes", "deno:/usr/local/bin/deno", "--no-cache-dir",
             "-f", "bestaudio[ext=m4a]",
             "--break-match-filters", "duration <= 600 & !is_live",
+            "--print-to-file", "pre_process:%(.{title,duration,heatmap,is_live})j", "%(id)s.pre.json",
             "--max-filesize", "41943040",
             "--write-info-json", "--quiet", "--no-warnings", "--no-progress",
             "--socket-timeout", "20",
@@ -145,6 +164,66 @@ class ArgumentsTest(unittest.TestCase):
             "-o", "%(id)s.%(ext)s",
             "--", f"https://www.youtube.com/watch?v={VIDEO_ID}",
         ])
+
+    def test_the_argument_list_of_a_job_with_a_start_time_is_pinned(self) -> None:
+        job = Path("scratch") / "job-x"
+        self.assertEqual(window_ytdlp_args(VIDEO_ID, job), [
+            "--ignore-config", "--no-playlist", "--use-extractors", "youtube",
+            "--js-runtimes", "deno:/usr/local/bin/deno", "--no-cache-dir",
+            "-f", "bestaudio[ext=m4a]",
+            "--break-match-filters", "!is_live",
+            "--skip-download",
+            "--write-info-json", "--quiet", "--no-warnings", "--no-progress",
+            "--socket-timeout", "20",
+            "-P", str(job),
+            "-o", "%(id)s.%(ext)s",
+            "--", f"https://www.youtube.com/watch?v={VIDEO_ID}",
+        ])
+
+    def test_a_job_with_a_start_time_never_downloads_through_yt_dlp(self) -> None:
+        args = window_ytdlp_args(VIDEO_ID, Path("job"))
+        self.assertIn("--skip-download", args)
+        # Every guard of the download list that is not about the download.
+        download = ytdlp_args(VIDEO_ID, Path("job"), 600, MIB)
+        for guard in ("--ignore-config", "--no-playlist", "--use-extractors", "--js-runtimes", "--no-cache-dir",
+                      "--quiet", "--no-warnings", "--no-progress", "--socket-timeout", "--"):
+            self.assertIn(guard, args)
+            self.assertIn(guard, download)
+        self.assertEqual(args[args.index("--use-extractors") + 1], "youtube")
+        self.assertEqual(args[-2:], ["--", f"https://www.youtube.com/watch?v={VIDEO_ID}"])
+        for video_id in ("", "a" * 12, "dQw4w9WgXc\n", None):
+            with self.subTest(video_id=video_id), self.assertRaises(ValueError):
+                window_ytdlp_args(video_id, Path("job"))  # type: ignore[arg-type]
+
+    def test_the_window_program_s_arguments_are_three_paths_and_three_numbers(self) -> None:
+        job = Path("scratch") / "job-x"
+        self.assertEqual(window_args(VIDEO_ID, job, 4500, 600, 41943040), [
+            str(job / f"{VIDEO_ID}.info.json"), str(job / f"{VIDEO_ID}.m4a"), str(job / f"{VIDEO_ID}.window.json"),
+            "4500", "600", "41943040",
+        ])
+        self.assertEqual(window_args(VIDEO_ID, job, 0, 1, 1)[3:], ["0", "1", "1"])
+        self.assertEqual(window_args(VIDEO_ID, job, MAX_START_SECONDS, 600, MIB)[3], "359999")
+
+    def test_a_start_that_is_no_whole_number_of_seconds_never_becomes_an_argument(self) -> None:
+        for start in (-1, MAX_START_SECONDS + 1, 1.0, 1.5, True, False, "5", "", None, [5], float("nan"),
+                      10**30):
+            with self.subTest(start=start), self.assertRaises(ValueError):
+                window_args(VIDEO_ID, Path("job"), start, 600, MIB)  # type: ignore[arg-type]
+        for video_id in ("", "a" * 12, "../../etc/pw", "dQw4w9WgXc/", None):
+            with self.subTest(video_id=video_id), self.assertRaises(ValueError):
+                window_args(video_id, Path("job"), 5, 600, MIB)  # type: ignore[arg-type]
+
+    def test_the_fields_written_before_the_filter_are_pinned(self) -> None:
+        args = ytdlp_args(VIDEO_ID, Path("job"), 600, MIB)
+        at = args.index("--print-to-file")
+        # At the pre_process stage, which runs before the filter, and into a
+        # file named after the ID only, in the job directory (-P).
+        self.assertEqual(args[at + 1], "pre_process:%(.{title,duration,heatmap,is_live})j")
+        self.assertEqual(args[at + 2], "%(id)s.pre.json")
+        # --print would make the run a simulation: nothing would be downloaded.
+        self.assertNotIn("--print", args)
+        self.assertNotIn("-O", args)
+        self.assertNotIn("--print-to-file", window_ytdlp_args(VIDEO_ID, Path("job")))
 
     def test_the_url_comes_last_after_the_option_guard(self) -> None:
         args = ytdlp_args("-_-_-_-_-_-", Path("job"), 1, 1)
@@ -154,10 +233,10 @@ class ArgumentsTest(unittest.TestCase):
 
     def test_a_plain_match_filter_is_never_used(self) -> None:
         # A plain --match-filters skip exits 0 having written nothing, which
-        # would hide too_long behind failed.
-        args = ytdlp_args(VIDEO_ID, Path("job"), 600, MIB)
-        self.assertNotIn("--match-filters", args)
-        self.assertNotIn("--match-filter", args)
+        # would hide a long or live video behind failed.
+        for args in (ytdlp_args(VIDEO_ID, Path("job"), 600, MIB), window_ytdlp_args(VIDEO_ID, Path("job"))):
+            self.assertNotIn("--match-filters", args)
+            self.assertNotIn("--match-filter", args)
 
     def test_fixed_program_paths(self) -> None:
         self.assertEqual(PRLIMIT, "/usr/bin/prlimit")
@@ -166,6 +245,30 @@ class ArgumentsTest(unittest.TestCase):
         # interpreter, whose site-packages must hold no third-party wheel.
         self.assertEqual(YTDLP_PYTHON, "/opt/yt-dlp/bin/python")
         self.assertEqual(DEFAULT_COMMAND, (YTDLP_PYTHON, "-I", "-m", "yt_dlp"))
+
+    def test_the_window_program_runs_by_path_on_the_runner_s_own_interpreter(self) -> None:
+        # Never yt-dlp's venv: the program is stdlib only, and the base
+        # interpreter's site-packages hold nothing (I1).
+        # Beside ytdlp.py, wherever the package lies: the checkout, or
+        # /app/fetcher in the image.
+        program = Path(ytdlp.__file__).with_name("window.py")
+        self.assertEqual(program, Path(window.__file__))
+        self.assertEqual(WINDOW_COMMAND, (sys.executable, "-I", str(program)))
+        self.assertTrue(program.is_file())
+        self.assertNotIn(YTDLP_PYTHON, WINDOW_COMMAND)
+        self.assertEqual(YtDlp(600, MIB, 7).window_command, WINDOW_COMMAND)
+
+    def test_the_window_program_s_statuses_map_to_the_fixed_codes(self) -> None:
+        # ytdlp.py does not import the program, so the numbers are written
+        # out there; this keeps the two files in step.
+        self.assertEqual(ytdlp.WINDOW_FAILURES, {
+            window.EXIT_PAST_END: "past_end", window.EXIT_BLOCKED: "blocked", window.EXIT_TIMED_OUT: "timeout",
+        })
+        for code in ytdlp.WINDOW_FAILURES.values():
+            self.assertIn(code, ytdlp.ERROR_CODES)
+        self.assertNotIn(window.EXIT_OK, ytdlp.WINDOW_FAILURES)
+        self.assertNotIn(window.EXIT_FAILED, ytdlp.WINDOW_FAILURES)
+        self.assertNotIn(window.EXIT_USAGE, ytdlp.WINDOW_FAILURES)
 
 
 class CommandTest(unittest.TestCase):
@@ -195,6 +298,14 @@ class CommandTest(unittest.TestCase):
     def test_full_command_without_prlimit(self) -> None:
         self.assertEqual(YtDlp(600, MIB, 7, command=STUB_COMMAND).full_command(["-a"]), [*STUB_COMMAND, "-a"])
 
+    def test_the_window_program_runs_under_the_same_limits(self) -> None:
+        runner = YtDlp(600, 41943040, 120, prlimit=(PRLIMIT,), window_command=("python", "-I", "window.py"))
+        self.assertEqual(
+            runner.full_command(["a", "b"], runner.window_command),
+            ["/usr/bin/prlimit", "--cpu=120", "--fsize=42991616", "--nofile=256", "--nproc=512", "--",
+             "python", "-I", "window.py", "a", "b"],
+        )
+
     def test_prlimit_always_on_linux_and_never_elsewhere(self) -> None:
         with mock.patch.object(ytdlp.sys, "platform", "linux"), \
                 mock.patch("os.path.exists", side_effect=AssertionError("looked on disk")):
@@ -213,6 +324,8 @@ class CommandTest(unittest.TestCase):
                 YtDlp(*args)
         with self.assertRaises(ValueError):
             YtDlp(600, MIB, 7, command=())
+        with self.assertRaises(ValueError):
+            YtDlp(600, MIB, 7, window_command=())
 
 
 class EnvironmentTest(unittest.TestCase):
@@ -262,9 +375,13 @@ class EnvironmentTest(unittest.TestCase):
 
 
 class MappingTest(unittest.TestCase):
-    def test_exit_101_is_too_long(self) -> None:
-        self.assertEqual(map_failure(101, b""), "too_long")
-        self.assertEqual(map_failure(101, b"ERROR: Sign in to confirm you're not a bot"), "too_long")
+    def test_exit_101_is_never_decided_from_what_was_printed(self) -> None:
+        # A filter's refusal: the run's own files say why (read_rejection),
+        # or the run has only one filter. Nothing printed turns it into a
+        # refusal by YouTube.
+        self.assertEqual(map_failure(101, b""), "failed")
+        self.assertEqual(map_failure(101, b"ERROR: Sign in to confirm you're not a bot"), "failed")
+        self.assertEqual(map_failure(101, b"Video unavailable"), "failed")
 
     def test_blocked_phrases(self) -> None:
         for text in (
@@ -295,7 +412,7 @@ class MappingTest(unittest.TestCase):
                 self.assertEqual(map_failure(code, text), "failed")
 
     def test_error_codes_are_the_fixed_set(self) -> None:
-        self.assertEqual(ytdlp.ERROR_CODES, ("blocked", "too_long", "not_found", "timeout", "failed"))
+        self.assertEqual(ytdlp.ERROR_CODES, ("blocked", "live", "not_found", "past_end", "timeout", "failed"))
         with self.assertRaises(ValueError):
             FetchError("Stub Title")
 
@@ -555,7 +672,9 @@ class FetchTest(StubTestCase):
 
     def test_failures_map_to_the_fixed_codes(self) -> None:
         cases = {
-            "tooLong____": "too_long",
+            "liveStream_": "live",
+            # A filter's refusal that left no word about why.
+            "rejected___": "failed",
             "blocked____": "blocked",
             "notFound___": "not_found",
             "failing____": "failed",
@@ -571,15 +690,41 @@ class FetchTest(StubTestCase):
     def test_a_failed_exit_is_failure_even_with_both_files(self) -> None:
         # Success needs exit 0 and the files: a rejected or failed run that
         # still left <id>.m4a and <id>.info.json behind is not a download.
-        for video_id, code in (("tooLongFile", "too_long"), ("failedFiles", "failed")):
+        for video_id, code in (("tooLongFile", "failed"), ("failedFiles", "failed")):
             with self.subTest(video_id=video_id):
                 self.assertEqual(self.fetch_error(video_id), code)
                 self.assertTrue((self.job / f"{video_id}.m4a").is_file())
                 self.assertTrue((self.job / f"{video_id}.info.json").is_file())
 
-    def test_too_long_writes_nothing(self) -> None:
-        self.assertEqual(self.fetch_error("tooLong____"), "too_long")
-        self.assertEqual(self.job_names(), [])
+    def test_a_long_video_is_not_downloaded_and_not_an_error(self) -> None:
+        with self.assertRaises(LongVideo) as raised:
+            self.runner().fetch("tooLong____", self.job)
+        metadata = raised.exception.metadata
+        self.assertEqual(metadata.title, stub_title("tooLong____"))
+        self.assertEqual(metadata.duration, 3600)
+        assert metadata.heatmap is not None
+        self.assertEqual(len(metadata.heatmap), 100)
+        # Only what yt-dlp wrote before its filter: no audio, no info JSON.
+        self.assertEqual(self.job_names(), ["tooLong____.pre.json"])
+        # One run: the long video costs no second look here.
+        self.assertEqual(len(self.runs()), 1)
+        self.assertNotIsInstance(raised.exception, FetchError)
+
+    def test_a_live_stream_and_a_bare_refusal_write_no_audio(self) -> None:
+        self.assertEqual(self.fetch_error("liveStream_"), "live")
+        self.assertEqual(self.job_names(), ["liveStream_.pre.json"])
+        self.assertEqual(self.fetch_error("rejected___"), "failed")
+        self.assertEqual(self.job_names(), ["liveStream_.pre.json"])
+
+    def test_the_length_that_makes_a_video_long_is_the_runner_s_own(self) -> None:
+        # The stub's long video lasts an hour; a video of 215.5 s is long
+        # only for a runner that fetches less. The stub does not apply the
+        # filter itself, so this shows what read_rejection makes of exit 101.
+        self.assertEqual(self.fetch_error("tooLongFile"), "failed")
+        runner = StubYtDlp(200, MIB, 30, log=self.runs_log)
+        with self.assertRaises(LongVideo) as raised:
+            runner.fetch("tooLongFile", self.job)
+        self.assertEqual(raised.exception.metadata.duration, 215.5)
 
     def test_metadata_problems_drop_only_that_value(self) -> None:
         runner = self.runner()
@@ -1074,6 +1219,483 @@ class OutputBoundTest(StubTestCase):
         self.assertEqual(download.audio.read_bytes(), b"STUB-M4A\n" + VIDEO_ID.encode("ascii"))
         self.assertLess(time.monotonic() - started, 30)
         self.assertLess(peak, 4 * MIB, f"the run held {peak} bytes of a run's output")
+
+
+class StartTest(unittest.TestCase):
+    def test_a_start_is_a_whole_number_of_seconds_within_the_bound(self) -> None:
+        for value in (0, 1, 600, 4500, MAX_START_SECONDS):
+            with self.subTest(value=value):
+                self.assertEqual(clean_start(value), value)
+        # 99:59:59.
+        self.assertEqual(MAX_START_SECONDS, 99 * 3600 + 59 * 60 + 59)
+
+    def test_anything_else_is_no_start(self) -> None:
+        for value in (-1, MAX_START_SECONDS + 1, 10**30, True, False, 0.0, 12.0, 12.5, float("nan"), float("inf"),
+                      "12", "", b"12", None, [12], {"start": 12}):
+            with self.subTest(value=value):
+                self.assertIsNone(clean_start(value))
+
+    def test_a_window_begins_at_or_before_the_start_asked_for(self) -> None:
+        self.assertEqual(clean_window_start(120.0, 125, 600), 120.0)
+        self.assertEqual(clean_window_start(0, 0, 600), 0.0)
+        self.assertEqual(clean_window_start(0, 125, 600), 0.0)
+        self.assertEqual(clean_window_start(125, 125, 600), 125.0)
+        # One second of slack, for rounding and audio that begins just after zero.
+        self.assertEqual(clean_window_start(126.0, 125, 600), 126.0)
+        for value in (126.01, 500, -0.001, -1, float("nan"), float("inf"), "120", True, None, [120], 10**400):
+            with self.subTest(value=value):
+                self.assertIsNone(clean_window_start(value, 125, 600))
+
+    def test_a_window_begins_less_than_its_longest_length_before_the_start(self) -> None:
+        # A window holds its start, so one that began any earlier would have to be longer than allowed.
+        self.assertEqual(clean_window_start(2400, 3000, 600), 2400.0)
+        self.assertEqual(clean_window_start(2990.5, 3000, 10), 2990.5)
+        self.assertEqual(clean_window_start(0, 600, 600), 0.0)
+        for value, start, max_seconds in ((2399.99, 3000, 600), (0, 3000, 600), (2989.9, 3000, 10), (0, 601, 600)):
+            with self.subTest(value=value, start=start, max_seconds=max_seconds):
+                self.assertIsNone(clean_window_start(value, start, max_seconds))
+
+    def test_a_long_video_always_has_a_length(self) -> None:
+        self.assertEqual(LongVideo(Metadata("T", 3600, None)).metadata, Metadata("T", 3600, None))
+        with self.assertRaises(ValueError):
+            LongVideo(Metadata("T", None, None))
+
+
+class RejectionTest(unittest.TestCase):
+    """What a download run's exit 101 means, from the file yt-dlp wrote before its filter looked."""
+
+    HEATMAP = [{"start_time": 0.0, "end_time": 36.0, "value": 0.5},
+               {"start_time": 36.0, "end_time": 72.0, "value": 1.0}]
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.job = Path(temp.name)
+        self.pre = self.job / f"{VIDEO_ID}.pre.json"
+
+    def write(self, content: Any) -> None:
+        self.pre.write_bytes(content if isinstance(content, bytes) else json.dumps(content).encode("utf-8"))
+
+    def outcome(self, max_seconds: int = 600) -> str:
+        result = ytdlp.read_rejection(self.job, VIDEO_ID, max_seconds)
+        if isinstance(result, LongVideo):
+            return "long"
+        assert isinstance(result, FetchError)
+        return result.code
+
+    def test_a_video_longer_than_the_runner_fetches_is_long(self) -> None:
+        self.write({"title": "  A \x07 title\n", "duration": 3600, "heatmap": self.HEATMAP, "is_live": False})
+        result = ytdlp.read_rejection(self.job, VIDEO_ID, 600)
+        assert isinstance(result, LongVideo)
+        self.assertEqual(result.metadata.title, "A title")
+        self.assertEqual(result.metadata.duration, 3600)
+        self.assertEqual(result.metadata.heatmap, (
+            {"start": 0.0, "end": 36.0, "value": 0.5}, {"start": 36.0, "end": 72.0, "value": 1.0},
+        ))
+
+    def test_yt_dlp_s_line_end_after_the_object_is_no_problem(self) -> None:
+        self.write(json.dumps({"duration": 3600, "is_live": False}).encode("ascii") + os.linesep.encode("ascii"))
+        self.assertEqual(self.outcome(), "long")
+
+    def test_the_length_is_compared_with_the_runner_s_own_limit(self) -> None:
+        for duration, max_seconds, outcome in ((600, 600, "failed"), (600.5, 600, "long"), (601, 600, "long"),
+                                               (215.5, 600, "failed"), (215.5, 200, "long"), (1, 1, "failed"),
+                                               (2, 1, "long")):
+            with self.subTest(duration=duration, max_seconds=max_seconds):
+                self.write({"duration": duration, "is_live": False})
+                self.assertEqual(self.outcome(max_seconds), outcome)
+
+    def test_a_live_stream_is_live_whatever_else_the_file_says(self) -> None:
+        for pre in ({"is_live": True}, {"is_live": True, "duration": None}, {"is_live": True, "duration": 3600},
+                    {"is_live": True, "duration": 5, "title": "T"}):
+            with self.subTest(pre=pre):
+                self.write(pre)
+                self.assertEqual(self.outcome(), "live")
+
+    def test_only_the_json_true_means_live(self) -> None:
+        for value in ("true", 1, "yes", [True], {"live": True}, None, False):
+            with self.subTest(value=value):
+                self.write({"is_live": value, "duration": 3600})
+                self.assertEqual(self.outcome(), "long")
+                self.write({"is_live": value, "duration": 100})
+                self.assertEqual(self.outcome(), "failed")
+
+    def test_a_file_that_names_neither_reason_is_a_failure(self) -> None:
+        for pre in ({}, {"duration": None}, {"duration": "3600"}, {"duration": -5}, {"duration": 0}, {"duration": True},
+                    {"title": "long"}, [{"duration": 3600}], "long", 3600, None, True):
+            with self.subTest(pre=pre):
+                self.write(pre)
+                self.assertEqual(self.outcome(), "failed")
+        for raw in (b'{"duration": NaN}', b'{"duration": Infinity}', b'{"duration": 1e999}'):
+            with self.subTest(raw=raw):
+                self.write(raw)
+                self.assertEqual(self.outcome(), "failed")
+
+    def test_a_file_that_cannot_be_read_is_a_failure(self) -> None:
+        self.assertEqual(self.outcome(), "failed")  # no file
+        for raw in (b"", b"{", b"not json", b'{"duration": 3600}\n{"duration": 3600}\n', b"\xff\xfe",
+                    b"[" * 100_000):
+            with self.subTest(raw=raw[:20]):
+                self.write(raw)
+                self.assertEqual(self.outcome(), "failed")
+        self.write(json.dumps({"duration": 3600, "title": "x" * ytdlp.PRE_MAX_BYTES}).encode("ascii"))
+        self.assertEqual(self.outcome(), "failed")
+        self.pre.unlink()
+        self.pre.mkdir()
+        self.assertEqual(self.outcome(), "failed")
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW is POSIX")
+    def test_a_link_is_not_followed(self) -> None:
+        real = self.job / "real.json"
+        real.write_bytes(json.dumps({"duration": 3600}).encode("ascii"))
+        os.symlink(real, self.pre)
+        self.assertEqual(self.outcome(), "failed")
+
+    def test_only_the_whitelisted_metadata_is_kept(self) -> None:
+        self.write({"title": "T", "duration": 3600, "heatmap": [{"start_time": 0, "end_time": 5, "value": 9}],
+                    "url": "https://example.invalid/x", "formats": [{"url": "x"}], "uploader": "U"})
+        result = ytdlp.read_rejection(self.job, VIDEO_ID, 600)
+        assert isinstance(result, LongVideo)
+        self.assertEqual(result.metadata, Metadata("T", 3600, None))
+
+
+class WindowResultTest(unittest.TestCase):
+    """What the runner accepts as a window job's result, from the three files in the job directory."""
+
+    INFO = {"title": "T", "duration": 3600, "url": "https://example.invalid/x"}
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.job = Path(temp.name)
+        self.audio = self.job / f"{VIDEO_ID}.m4a"
+        self.info = self.job / f"{VIDEO_ID}.info.json"
+        self.result = self.job / f"{VIDEO_ID}.window.json"
+        self.audio.write_bytes(b"audio")
+        self.info.write_bytes(json.dumps(self.INFO).encode("ascii"))
+
+    def write(self, result: Any) -> None:
+        self.result.write_bytes(result if isinstance(result, bytes) else json.dumps(result).encode("ascii"))
+
+    def read(self, start: int = 1234, max_seconds: int = 600, max_bytes: int = MIB) -> Any:
+        return ytdlp.read_window_result(self.job, VIDEO_ID, start, max_seconds, max_bytes)
+
+    def refused(self, **kwargs: Any) -> None:
+        with self.assertRaises(FetchError) as raised:
+            self.read(**kwargs)
+        self.assertEqual(raised.exception.code, "failed")
+
+    def test_the_result_is_the_audio_the_metadata_and_where_the_window_begins(self) -> None:
+        self.write({"start": 1229.875, "duration": 599.075})
+        download = self.read()
+        self.assertEqual(download.audio, self.audio)
+        self.assertEqual(download.metadata, Metadata("T", 3600, None))
+        self.assertEqual(download.window_start, 1229.875)
+
+    def test_the_bounds_are_the_start_asked_for_and_the_longest_window(self) -> None:
+        for result in ({"start": 1234, "duration": 600}, {"start": 1235.0, "duration": 600.0},
+                       {"start": 634, "duration": 0.001}, {"start": 634.0, "duration": 600}):
+            with self.subTest(result=result):
+                self.write(result)
+                self.assertEqual(self.read().window_start, float(result["start"]))
+        # Both bounds are the runner's own limit, not fixed numbers.
+        self.write({"start": 0, "duration": 300})
+        self.assertEqual(self.read(start=0, max_seconds=300).window_start, 0.0)
+        self.assertEqual(self.read(start=300, max_seconds=300).window_start, 0.0)
+        self.refused(start=301, max_seconds=300)
+        self.write({"start": 0, "duration": 300.001})
+        self.refused(start=0, max_seconds=300)
+
+    def test_a_result_no_window_could_have_is_refused(self) -> None:
+        for result in (
+            {"start": 1235.01, "duration": 600}, {"start": 5000, "duration": 600}, {"start": -0.5, "duration": 600},
+            {"start": 1230, "duration": 600.001}, {"start": 1230, "duration": 0}, {"start": 1230, "duration": -1},
+            {"start": 633.99, "duration": 600}, {"start": 0, "duration": 600},
+            {"start": "1230", "duration": 600}, {"start": 1230, "duration": "600"}, {"start": True, "duration": 600},
+            {"start": 1230, "duration": True}, {"start": None, "duration": 600}, {"start": 1230, "duration": None},
+            {"start": 1230}, {"duration": 600}, {}, {"start": 1230, "duration": 600, "address": "x"},
+            [1230, 600], "1230", 1230, None,
+        ):
+            with self.subTest(result=result):
+                self.write(result)
+                self.refused()
+        for raw in (b"", b"{not json", b'{"start": NaN, "duration": 600}', b'{"start": 1230, "duration": NaN}',
+                    b'{"start": 1230, "duration": Infinity}', b'{"start": 1230, "duration": 600}{}',
+                    json.dumps({"start": 1230, "duration": 600}).encode("ascii") + b" " * 1024):
+            with self.subTest(raw=raw[:30]):
+                self.write(raw)
+                self.refused()
+
+    def test_every_one_of_the_three_files_must_be_there(self) -> None:
+        self.write({"start": 1230, "duration": 600})
+        self.read()
+        self.result.unlink()
+        self.refused()
+        self.write({"start": 1230, "duration": 600})
+        self.info.unlink()
+        self.refused()
+        self.info.write_bytes(json.dumps(self.INFO).encode("ascii"))
+        self.audio.unlink()
+        self.refused()
+        self.audio.write_bytes(b"")
+        self.refused()
+        self.audio.write_bytes(b"x" * 11)
+        self.assertEqual(self.read(max_bytes=11).audio, self.audio)
+        self.refused(max_bytes=10)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "O_NOFOLLOW is POSIX")
+    def test_no_file_is_read_through_a_link(self) -> None:
+        self.write({"start": 1230, "duration": 600})
+        for path in (self.audio, self.result, self.info):
+            with self.subTest(path=path.name):
+                real = self.job / f"real-{path.name}"
+                os.replace(path, real)
+                os.symlink(real, path)
+                self.refused()
+                path.unlink()
+                os.replace(real, path)
+        self.read()
+
+
+class WindowFetchTest(StubTestCase):
+    """A job with a start time: yt-dlp with --skip-download, then the window program, both stubs here."""
+
+    LONG_ID = "tooLong____"
+
+    def window_error(self, video_id: str, start: int = 1234, **kwargs: Any) -> str:
+        with self.assertRaises(FetchError) as raised:
+            self.runner(**kwargs).fetch_window(video_id, self.job, start)
+        return raised.exception.code
+
+    def test_it_runs_yt_dlp_for_the_address_and_then_the_window_program(self) -> None:
+        download = self.runner().fetch_window(self.LONG_ID, self.job, 1234)
+        self.assertEqual(download.audio, self.job / f"{self.LONG_ID}.m4a")
+        self.assertEqual(download.audio.read_bytes(), b"STUB-WINDOW\n" + f"{self.LONG_ID}@1234".encode("ascii"))
+        self.assertEqual(download.window_start, 1230.0)
+        self.assertEqual(download.metadata.title, stub_title(self.LONG_ID))
+        self.assertEqual(download.metadata.duration, 3600)
+        first, second = self.runs()
+        self.assertEqual(first["argv"], window_ytdlp_args(self.LONG_ID, self.job))
+        self.assertEqual(second["argv"], window_args(self.LONG_ID, self.job, 1234, 600, MIB))
+        # The same fence for both: the working directory and the environment.
+        self.assertEqual(os.path.normcase(first["cwd"]), os.path.normcase(second["cwd"]))
+        self.assertEqual(first["env"], second["env"])
+        self.assertEqual(self.job_names(), sorted(f"{self.LONG_ID}.{suffix}" for suffix in
+                                                  ("info.json", "m4a", "window.json")))
+
+    def test_a_download_has_no_window_start(self) -> None:
+        self.assertIsNone(self.runner().fetch(VIDEO_ID, self.job).window_start)
+
+    def test_a_window_of_a_video_that_is_not_long_is_fetched_the_same_way(self) -> None:
+        # The stub's ordinary video lasts 215.5 s.
+        download = self.runner().fetch_window(VIDEO_ID, self.job, 125)
+        self.assertEqual(download.window_start, 120.0)
+        self.assertEqual(download.audio.read_bytes(), b"STUB-WINDOW\n" + f"{VIDEO_ID}@125".encode("ascii"))
+
+    def test_the_first_child_s_failures_map_to_the_fixed_codes_and_end_the_job(self) -> None:
+        cases = {
+            "liveStream_": "live",
+            # This run's only filter is !is_live.
+            "rejected___": "live",
+            "blocked____": "blocked",
+            "notFound___": "not_found",
+            "failing____": "failed",
+            "notADict___": "failed",
+        }
+        for count, (video_id, code) in enumerate(cases.items(), start=1):
+            with self.subTest(video_id=video_id):
+                self.assertEqual(self.window_error(video_id), code)
+                # The window program never ran.
+                self.assertEqual(len(self.runs()), count)
+                self.assertFalse((self.job / f"{video_id}.m4a").exists())
+
+    def test_exit_0_without_the_info_json_starts_no_window_program(self) -> None:
+        self.assertEqual(self.window_error(VIDEO_ID, mode="no_info"), "failed")
+        self.assertEqual(len(self.runs()), 1)
+        self.assertEqual(self.job_names(), [])
+
+    def test_the_window_program_s_statuses_map_to_the_fixed_codes(self) -> None:
+        cases = {"pastEnd____": "past_end", "winBlocked_": "blocked", "winTimeout_": "timeout",
+                 "winFailing_": "failed"}
+        for video_id, code in cases.items():
+            with self.subTest(video_id=video_id):
+                self.assertEqual(self.window_error(video_id), code)
+        # A start at or after the end of the stub's 215.5 s video.
+        self.assertEqual(self.window_error(VIDEO_ID, start=216), "past_end")
+        self.assertEqual(self.window_error(VIDEO_ID, start=MAX_START_SECONDS), "past_end")
+
+    def test_exit_0_is_not_success_on_its_own(self) -> None:
+        modes = ["no_result", "no_audio", "late", "early", "too_long", "not_json", "extra_key", "files_1"]
+        if hasattr(os, "O_NOFOLLOW"):
+            modes.append("symlink")
+        for mode in modes:
+            with self.subTest(mode=mode):
+                job = self.temp / f"job-{mode}"
+                job.mkdir()
+                with self.assertRaises(FetchError) as raised:
+                    self.runner(window_mode=mode).fetch_window(self.LONG_ID, job, 1234)
+                self.assertEqual(raised.exception.code, "failed")
+        job = self.temp / "job-oversize"
+        job.mkdir()
+        with self.assertRaises(FetchError) as raised:
+            self.runner(max_bytes=1024, window_mode="oversize").fetch_window(self.LONG_ID, job, 1234)
+        self.assertEqual(raised.exception.code, "failed")
+
+    def test_other_arguments_than_the_six_fail_the_job(self) -> None:
+        # The stub refuses any list but the pinned one (exit 2).
+        with mock.patch.object(ytdlp, "window_args", lambda *a: [*window_args(*a), "--verbose"]):
+            self.assertEqual(self.window_error(self.LONG_ID), "failed")
+        with mock.patch.object(ytdlp, "window_ytdlp_args",
+                               lambda *a: [arg for arg in window_ytdlp_args(*a) if arg != "--skip-download"]):
+            self.assertEqual(self.window_error(self.LONG_ID), "failed")
+
+    def test_a_value_that_is_no_id_or_no_start_runs_nothing(self) -> None:
+        runner = self.runner()
+        for video_id, start in (("../../etc/pw", 5), ("a" * 12, 5), (VIDEO_ID, -1), (VIDEO_ID, MAX_START_SECONDS + 1),
+                                (VIDEO_ID, 1.5), (VIDEO_ID, True), (VIDEO_ID, "5"), (VIDEO_ID, None)):
+            with self.subTest(video_id=video_id, start=start), self.assertRaises(ValueError):
+                runner.fetch_window(video_id, self.job, start)  # type: ignore[arg-type]
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(self.job_names(), [])
+
+    def test_the_two_children_share_one_time_budget(self) -> None:
+        timeouts: list[float] = []
+
+        class Recording(StubYtDlp):
+            def _run_child(self, command: list[str], job_dir: Path, timeout: float,
+                           cancels: int) -> tuple[int, bytes]:
+                timeouts.append(timeout)
+                return super()._run_child(command, job_dir, timeout, cancels)
+
+        Recording(600, MIB, 30, log=self.runs_log).fetch_window(self.LONG_ID, self.job, 1234)
+        self.assertEqual(len(timeouts), 2)
+        self.assertEqual(timeouts[0], 30)
+        # What the first child left of the 30 s, never the whole 30 s again.
+        self.assertTrue(0 < timeouts[1] < 30, timeouts)
+
+    def test_a_budget_the_first_child_used_up_starts_no_second_child(self) -> None:
+        started: list[float] = []
+
+        class Slow(StubYtDlp):
+            def _run_child(self, command: list[str], job_dir: Path, timeout: float,
+                           cancels: int) -> tuple[int, bytes]:
+                started.append(timeout)
+                result = super()._run_child(command, job_dir, timeout, cancels)
+                # As if yt-dlp had taken all of the job's time and a little more.
+                time.sleep(self.timeout_seconds + 0.2)
+                return result
+
+        with self.assertRaises(FetchError) as raised:
+            Slow(600, MIB, 3, log=self.runs_log).fetch_window(self.LONG_ID, self.job, 1234)
+        self.assertEqual(raised.exception.code, "timeout")
+        # Counted where a child is started, not in the stub's log: a second
+        # child given no time at all would be killed before it could write
+        # its line there.
+        self.assertEqual(started, [3])
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_a_cancel_between_the_two_children_starts_no_second_child(self) -> None:
+        asked: list[list[str]] = []
+
+        class Stopped(StubYtDlp):
+            def _run_child(self, command: list[str], job_dir: Path, timeout: float,
+                           cancels: int) -> tuple[int, bytes]:
+                asked.append(command)
+                result = super()._run_child(command, job_dir, timeout, cancels)
+                if len(asked) == 1:
+                    # The server stops in the moment between the two
+                    # children: nothing runs, so cancel() finds nothing to kill.
+                    self.cancel()
+                return result
+
+        runner = Stopped(600, MIB, 30, log=self.runs_log)
+        with self.assertRaises(FetchError) as raised:
+            runner.fetch_window(self.LONG_ID, self.job, 1234)
+        self.assertEqual(raised.exception.code, "failed")
+        # The second child was asked for and never started.
+        self.assertEqual(len(asked), 2)
+        self.assertEqual(len(self.runs()), 1)
+        self.assertFalse((self.job / f"{self.LONG_ID}.m4a").exists())
+        # The cancel ended that job, not the next one: a job that begins
+        # after it runs both of its children.
+        with tempfile.TemporaryDirectory(dir=self.job.parent) as other:
+            download = runner.fetch_window(self.LONG_ID, Path(other), 1234)
+            self.assertEqual(download.window_start, 1230.0)
+        self.assertEqual(len(self.runs()), 3)
+
+    def test_a_cancel_before_a_job_does_not_stop_it(self) -> None:
+        runner = self.runner()
+        runner.cancel()
+        self.assertEqual(runner.fetch_window(self.LONG_ID, self.job, 1234).window_start, 1230.0)
+        self.assertEqual(len(self.runs()), 2)
+
+    def test_a_window_program_that_hangs_is_killed_at_the_timeout(self) -> None:
+        started = time.monotonic()
+        self.assertEqual(self.window_error("winHanging_", timeout=3), "timeout")
+        self.assertLess(time.monotonic() - started, 3 + ytdlp.DRAIN_SECONDS + 10)
+        self.assertEqual(len(self.runs()), 2)
+        self.assertFalse((self.job / "winHanging_.m4a").exists())
+
+    def test_a_first_child_that_hangs_times_out_and_starts_no_second(self) -> None:
+        self.assertEqual(self.window_error(self.LONG_ID, timeout=2, mode="hang"), "timeout")
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_nothing_either_child_prints_leaves_the_runner(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.runner().fetch_window(self.LONG_ID, self.job, 1234)
+            for video_id in ("winFailing_", "pastEnd____", "blocked____"):
+                with self.assertRaises(FetchError) as raised:
+                    self.runner().fetch_window(video_id, self.job, 1234)
+                self.assertEqual(raised.exception.args, (raised.exception.code,))
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_flood_from_the_window_program_never_blocks_the_run(self) -> None:
+        started = time.monotonic()
+        download = self.runner(timeout=60, window_mode="loud").fetch_window(self.LONG_ID, self.job, 1234)
+        self.assertEqual(download.window_start, 1230.0)
+        self.assertLess(time.monotonic() - started, 30)
+
+    def test_cancel_ends_a_running_window_program(self) -> None:
+        runner = self.runner(timeout=60)
+        outcome: list[str] = []
+
+        def run() -> None:
+            try:
+                runner.fetch_window("winHanging_", self.job, 1234)
+            except FetchError as error:
+                outcome.append(error.code)
+
+        thread = threading.Thread(target=run, daemon=True)
+        started = time.monotonic()
+        thread.start()
+        # Both children have logged their run: the second one is the one that hangs.
+        while len(self.runs()) < 2 and time.monotonic() - started < 30:
+            time.sleep(0.05)
+        self.assertEqual(len(self.runs()), 2)
+        runner.cancel()
+        thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcome, ["failed"])
+        self.assertLess(time.monotonic() - started, 40)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux") and os.path.exists(PRLIMIT), "util-linux prlimit")
+class WindowPrlimitTest(StubTestCase):
+    def test_the_window_program_runs_under_the_same_limits_as_yt_dlp(self) -> None:
+        import resource
+
+        self.runner(timeout=20, max_bytes=2 * MIB, prlimit=(PRLIMIT,)).fetch_window("tooLong____", self.job, 1234)
+        first, second = self.runs()
+        self.assertEqual(second["limits"], {
+            "RLIMIT_AS": resource.RLIM_INFINITY,
+            "RLIMIT_CPU": 20,
+            "RLIMIT_FSIZE": 3 * MIB,
+            "RLIMIT_NOFILE": 256,
+            "RLIMIT_NPROC": 512,
+        })
+        self.assertEqual(first["limits"], second["limits"])
 
 
 if __name__ == "__main__":

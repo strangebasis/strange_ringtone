@@ -1,9 +1,16 @@
 """A stand-in for yt-dlp, so the fetcher tests run anywhere with no network and no yt-dlp.
 
 The fetcher runs it as (sys.executable, "-I", this file, *yt-dlp arguments).
-It refuses (exit 2) any argument list that is not exactly what the fetcher
-must send (strange_ringtone_runner.ytdlp.ytdlp_args), so a loosened argument
-fails the tests here too. The video ID is taken from the watch URL.
+It refuses (exit 2) any argument list that is not exactly one of the two the
+runner must send (strange_ringtone_runner.ytdlp.ytdlp_args for a download,
+window_ytdlp_args for a job with a start time), so a loosened argument fails
+the tests here too. The video ID is taken from the watch URL.
+
+A download run writes <id>.pre.json first, as yt-dlp's --print-to-file does
+at its pre_process stage, whenever the "extraction" got that far. A run with
+--skip-download writes only <id>.info.json, with the chosen format's address
+and headers at the top level (WINDOW_URL, WINDOW_HEADERS), which
+tests/stubs/window_stub.py expects to find there.
 
 The behaviour comes from STRANGE_RINGTONE_YTDLP_STUB when set, and otherwise
 from the video ID (BY_ID below; any other ID is "ok"). The fetcher builds the
@@ -15,7 +22,14 @@ what tools/dev_fetch_stack.py relies on.
                   duration 215.5, a 100-point heatmap, and keys that must
                   never be passed on. The title is printed on stdout and
                   stderr, as yt-dlp prints the destination filename.
-    too_long      exit 101, nothing written (a --break-match-filters reject)
+    long          <id>.pre.json with a duration of LONG_DURATION, then exit
+                  101: a video longer than the filter allows. With
+                  --skip-download, as "ok" with that duration
+    live          <id>.pre.json with is_live true and no duration, then exit
+                  101; with --skip-download, exit 101 and nothing written
+    rejected      exit 101, nothing written: a filter's refusal that says
+                  nothing about why
+    no_info       exit 0, nothing written
     blocked       exit 1, "Sign in to confirm you're not a bot" on stderr
     not_found     exit 1, "Video unavailable" on stderr
     fail          exit 1
@@ -90,14 +104,17 @@ LOG_VAR = "STRANGE_RINGTONE_YTDLP_STUB_LOG"
 AUDIO_VAR = "STRANGE_RINGTONE_YTDLP_STUB_AUDIO"
 DURATION_VAR = "STRANGE_RINGTONE_YTDLP_STUB_DURATION"
 MODES = (
-    "ok", "too_long", "blocked", "not_found", "fail", "oversize", "no_audio", "ctrl_title", "huge_heatmap",
+    "ok", "long", "live", "rejected", "no_info", "blocked", "not_found", "fail", "oversize", "no_audio",
+    "ctrl_title", "huge_heatmap",
     "bad_heatmap", "bare_info", "not_a_dict", "symlink", "files_101", "files_1", "hang", "grandchild",
     "survivor", "loud", "loud_ok", "litter", "wedge", "lock_scratch", "displace", "strand", "fill", "sysv",
     "tree",
 )
 # Eleven characters each, so they pass the fetcher's ID check.
 BY_ID = {
-    "tooLong____": "too_long",
+    "tooLong____": "long",
+    "liveStream_": "live",
+    "rejected___": "rejected",
     "blocked____": "blocked",
     "notFound___": "not_found",
     "failing____": "fail",
@@ -114,9 +131,24 @@ BY_ID = {
     "hanging____": "hang",
     "grandchild_": "grandchild",
     "survivor___": "survivor",
+    # The IDs the window stub fails for (tests/stubs/window_stub.py's BY_ID)
+    # are long videos here, as any video with a window is: without a start
+    # time the runner answers "long", and the page asks for one.
+    "pastEnd____": "long",
+    "winBlocked_": "long",
+    "winTimeout_": "long",
+    "winFailing_": "long",
+    "winHanging_": "long",
 }
 AUDIO_MAGIC = b"STUB-M4A\n"
 DURATION = 215.5
+# The "long" mode's duration: an hour, six times the longest FETCH_MAX_SECONDS.
+LONG_DURATION = 3600
+# What a --skip-download run names as the chosen format's address and
+# headers. The host is one the window program would accept; nothing in the
+# tests ever connects to it, because they run tests/stubs/window_stub.py.
+WINDOW_URL = "https://rr1---sn-stub.googlevideo.com/videoplayback?id="
+WINDOW_HEADERS = {"User-Agent": "stub-agent", "Accept": "*/*", "Accept-Language": "en", "Sec-Fetch-Mode": "navigate"}
 HEATMAP_POINTS = 100
 URL_RE = re.compile(r"https://www\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})", re.ASCII)
 FILTER_RE = re.compile(r"duration <= [0-9]+ & !is_live", re.ASCII)
@@ -136,13 +168,26 @@ FILL_FILES = 512
 TREE_DIRECTORIES = 50
 TREE_FILES = 100
 
-# The pinned list, with None where the value depends on the run.
+# The two pinned lists, with None where the value depends on the run.
 EXPECTED = [
     "--ignore-config", "--no-playlist", "--use-extractors", "youtube",
     "--js-runtimes", "deno:/usr/local/bin/deno", "--no-cache-dir",
     "-f", "bestaudio[ext=m4a]",
     "--break-match-filters", None,
+    "--print-to-file", "pre_process:%(.{title,duration,heatmap,is_live})j", "%(id)s.pre.json",
     "--max-filesize", None,
+    "--write-info-json", "--quiet", "--no-warnings", "--no-progress",
+    "--socket-timeout", "20",
+    "-P", None,
+    "-o", "%(id)s.%(ext)s",
+    "--", None,
+]
+EXPECTED_WINDOW = [
+    "--ignore-config", "--no-playlist", "--use-extractors", "youtube",
+    "--js-runtimes", "deno:/usr/local/bin/deno", "--no-cache-dir",
+    "-f", "bestaudio[ext=m4a]",
+    "--break-match-filters", "!is_live",
+    "--skip-download",
     "--write-info-json", "--quiet", "--no-warnings", "--no-progress",
     "--socket-timeout", "20",
     "-P", None,
@@ -156,25 +201,39 @@ def refuse(message: str) -> None:
     sys.exit(2)
 
 
-def parse(argv: list[str]) -> tuple[str, int, Path]:
-    """(video ID, max bytes, output directory) from a valid argument list; exits 2 otherwise."""
-    if len(argv) != len(EXPECTED):
+def parse(argv: list[str]) -> tuple[str, int | None, Path]:
+    """(video ID, max bytes, output directory) from a valid argument list; exits 2 otherwise.
+
+    max bytes is None for the list with --skip-download, which downloads
+    nothing and so names no size.
+    """
+    window = "--skip-download" in argv
+    pinned = EXPECTED_WINDOW if window else EXPECTED
+    if len(argv) != len(pinned):
         refuse("wrong number of arguments")
-    for index, (expected, actual) in enumerate(zip(EXPECTED, argv, strict=True)):
-        if expected is not None and actual != expected:
+    free: list[str] = []
+    for index, (expected, actual) in enumerate(zip(pinned, argv, strict=True)):
+        if expected is None:
+            free.append(actual)
+        elif actual != expected:
             refuse(f"argument {index} must be {expected!r}")
-    if not FILTER_RE.fullmatch(argv[10]):
-        refuse("unexpected --break-match-filters value")
-    if not DIGITS_RE.fullmatch(argv[12]):
-        refuse("--max-filesize must be a number of bytes")
-    directory = Path(argv[20])
+    max_bytes: int | None = None
+    if not window:
+        # The values the run chose, in the list's order: the filter, the
+        # size, the directory, the URL.
+        if not FILTER_RE.fullmatch(free[0]):
+            refuse("unexpected --break-match-filters value")
+        if not DIGITS_RE.fullmatch(free[1]):
+            refuse("--max-filesize must be a number of bytes")
+        max_bytes = int(free[1])
+    directory = Path(free[-2])
     if not directory.is_dir() or not os.path.samefile(directory, os.getcwd()):
         refuse("-P must be the working directory")
-    match = URL_RE.fullmatch(argv[24])
+    match = URL_RE.fullmatch(free[-1])
     if match is None:
         refuse("the URL must be a plain watch URL")
         raise AssertionError  # unreachable; refuse() exits
-    return match[1], int(argv[12]), directory
+    return match[1], max_bytes, directory
 
 
 def log_run(argv: list[str]) -> None:
@@ -358,8 +417,10 @@ def main(argv: list[str]) -> int:
         os.replace("grandchild.pid.tmp", "grandchild.pid")
         time.sleep(60)
         return 0
-    if mode == "too_long":
+    if mode == "rejected" or (mode == "live" and max_bytes is None):
         return 101
+    if mode == "no_info":
+        return 0
     if mode == "blocked":
         sys.stderr.write(f"ERROR: [youtube] {video_id}: Sign in to confirm you're not a bot\n")
         return 1
@@ -380,7 +441,19 @@ def main(argv: list[str]) -> int:
             sys.stderr.buffer.flush()
             return 1
 
-    duration: float = float(os.environ.get(DURATION_VAR) or DURATION)
+    # A long video is long whatever the audio the development stack hands back.
+    duration: float = float(LONG_DURATION if mode == "long" else os.environ.get(DURATION_VAR) or DURATION)
+    if max_bytes is not None:
+        # What yt-dlp prints at its pre_process stage, before its filter looks:
+        # one JSON object and a line end, appended to the file.
+        pre: dict[str, object] = {"title": title, "duration": duration,
+                                  "heatmap": heatmap(duration, HEATMAP_POINTS), "is_live": False}
+        if mode == "live":
+            pre.update({"duration": None, "heatmap": None, "is_live": True})
+        write_bytes(directory / f"{video_id}.pre.json", json.dumps(pre).encode("utf-8") + os.linesep.encode("ascii"))
+        if mode in ("long", "live"):
+            # The filter's refusal: nothing else is written.
+            return 101
     info: object = {
         "id": video_id,
         "title": title,
@@ -403,9 +476,14 @@ def main(argv: list[str]) -> int:
         info = {"id": video_id}
     elif mode == "not_a_dict":
         info = [title]
+    if max_bytes is None and isinstance(info, dict):
+        # --skip-download: the chosen format's own fields at the top level,
+        # as yt-dlp merges them in. Nothing but the info JSON is written.
+        info.update({"url": WINDOW_URL + video_id, "http_headers": dict(WINDOW_HEADERS), "protocol": "https",
+                     "ext": "m4a", "format_id": "140"})
     info_path = directory / f"{video_id}.info.json"
     write_bytes(info_path, json.dumps(info).encode("utf-8"))
-    if mode == "no_audio":
+    if mode == "no_audio" or max_bytes is None:
         return 0
     audio = directory / f"{video_id}.m4a"
     if mode == "oversize":

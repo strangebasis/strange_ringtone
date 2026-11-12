@@ -6,9 +6,11 @@
 import { decodeFile, MAX_INPUT_BYTES, MAX_INPUT_SECONDS } from "./audio/decode.js";
 import { gainForTarget, integratedLufs } from "./audio/loudness.js";
 import { displayName, renderQuery, toneNameHeader } from "./audio/request.js";
-import { suggestionRule, suggestSelection } from "./audio/suggest.js";
+import { suggestionRule, suggestSelection, suggestWindowStart, windowHeatmap } from "./audio/suggest.js";
 import { clampSelection, encodeWav } from "./audio/wav.js";
-import { FetchError, fetchAudio, fetchErrorMessage, fetchJob, parseYouTubeLink, pollJob } from "./fetch.js";
+import {
+  FetchError, fetchAudio, fetchErrorMessage, fetchJob, formatStartTime, parseStartTime, parseYouTubeLink, pollJob,
+} from "./fetch.js";
 import { Player } from "./player.js";
 import { canShareFile, fetchResult, isCancel, render, resultUrl, shareFile, ShareError } from "./share.js";
 import { moveEdge, Waveform } from "./waveform.js";
@@ -70,6 +72,8 @@ const el = {
   youtube: byId("youtube"),
   ytLink: byId("yt-link"),
   ytFetch: byId("yt-fetch"),
+  ytStartRow: byId("yt-start-row"),
+  ytStart: byId("yt-start"),
   ytStatus: byId("yt-status"),
   file: byId("file"),
   fileStatus: byId("file-status"),
@@ -128,9 +132,21 @@ const state = {
   decodeToken: 0,
   // Stops the polling of a fetch that a newer pick or fetch replaced.
   fetchController: null,
-  // The video the fetch in flight is for, so a second tap on Fetch for the
-  // same link does not open a second job (and spend a second rate-limit slot).
-  fetchVideoId: null,
+  // The link the fetch in flight is for: its video, so a second tap on Fetch
+  // for the same video does not open a second job (and spend a second
+  // rate-limit slot), and the timestamp the link carries now. Such a tap
+  // may bring another timestamp, and the fetch reads this when its answer
+  // arrives, so the link in the box is the one that counts.
+  fetchLink: null,
+  // The second the window on its way starts at; null while the fetch in
+  // flight is a look-up or a whole download. A tap for another part of the
+  // same video replaces the fetch, a tap for the same part does not.
+  fetchStart: null,
+  // The video the server last called long (docs/PLAN.md 6.2): its ID, length,
+  // title and heatmap, the timestamp of the link the start field was filled
+  // for, what the page put in the field, and why. While it is set, Fetch for
+  // the same video fetches the window the field names.
+  longVideo: null,
 };
 
 let audioContext = null;
@@ -527,6 +543,8 @@ function fileHint() {
 // What placed the selection (docs/PLAN.md 7.2), in the status line's words.
 const RULE_WORDS = {
   timestamp: "The selection starts at the link's timestamp",
+  // Rule 1 again, for a start the user typed into the start field.
+  chosen: "The selection starts at the time you chose",
   heatmap: "The selection is on the most replayed stretch",
   loudness: "The selection starts on the loudest stretch",
   whole: "The whole clip is selected",
@@ -548,11 +566,18 @@ function supersede() {
  * file picker and the YouTube fetch, so both get the same checks.
  * @param {File} file
  * @param {number} token from supersede(); a newer one drops this result
- * @param {{status: object, label: string, name: string, heatmap?: unknown, timestamp?: number | null}} source
+ * @param {{status: object, label: string, name: string, heatmap?: unknown, timestamp?: number | null,
+ *   windowStart?: number | null, timestampWords?: string | null, after?: string}} source
  *   where to report, what to call the clip there, the name field's value,
- *   and the fetcher's hints for the suggestion
+ *   and the fetcher's hints for the suggestion. For a window of a longer
+ *   video, windowStart is where it begins in the video: the heatmap arrives
+ *   in the video's time and is moved to the window's before any rule reads
+ *   it. timestampWords replaces rule 1's words, and after is added to the
+ *   status line.
  */
-async function loadAudio(file, token, { status, label, name, heatmap = null, timestamp = null }) {
+async function loadAudio(file, token, {
+  status, label, name, heatmap = null, timestamp = null, windowStart = null, timestampWords = null, after = "",
+}) {
   let audio;
   try {
     audio = await decodeFile(file, SAMPLE_RATE);
@@ -569,7 +594,11 @@ async function loadAudio(file, token, { status, label, name, heatmap = null, tim
   state.fileName = file.name;
   el.name.value = name;
 
-  const options = { heatmap, timestamp };
+  const duration = audio.length / audio.sampleRate;
+  const options = {
+    heatmap: windowStart === null ? heatmap : windowHeatmap(heatmap, windowStart, duration),
+    timestamp,
+  };
   const suggestion = suggestSelection(audio.channels, audio.sampleRate, config.maxClipSeconds, options);
   state.selection = { start: -1, end: -1 };
   applySelection({
@@ -583,12 +612,11 @@ async function loadAudio(file, token, { status, label, name, heatmap = null, tim
   waveform.setAudio(audio.channels, audio.sampleRate, audio.length, { maxFrames: MAX_FRAMES, minFrames: MIN_FRAMES });
   waveform.setSelection(state.selection.start, state.selection.end);
   waveform.setFades(fadeSettings().fadeIn, fadeSettings().fadeOut);
-  const duration = audio.length / audio.sampleRate;
   // suggestSelection takes a clip no longer than the cap whole, from 0, before
   // any rule looks at it, so naming the t= or the heatmap there would be wrong.
   const rule = duration <= config.maxClipSeconds ? "whole" : suggestionRule(duration, options);
-  setStatus(status, label + ", " + formatTime(duration) + ". "
-    + RULE_WORDS[rule] + "; drag the handles to change it.");
+  const words = rule === "timestamp" && timestampWords !== null ? timestampWords : RULE_WORDS[rule];
+  setStatus(status, label + ", " + formatTime(duration) + ". " + words + "; drag the handles to change it." + after);
   setStatus(el.renderStatus, "");
   updateButtons();
   selectionChanged();
@@ -602,6 +630,9 @@ el.file.addEventListener("change", async () => {
   // pick while a fetch runs.
   const token = supersede();
   setStatus(el.ytStatus, "");
+  // The YouTube box starts over too: a long video it had asked about is no
+  // longer what the next Fetch is for.
+  hideStartRow();
   setStatus(el.fileStatus, "Reading the file…");
   await loadAudio(file, token, { status: el.fileStatus, label: file.name, name: displayName(file.name) });
 });
@@ -613,10 +644,84 @@ const FETCH_STATES = {
   running: "The server is downloading it…",
 };
 
+// The most of a longer video the server fetches in one go. FETCH_MAX_SECONDS
+// may be set lower, never higher; the default start is as good a place for a
+// shorter window.
+const WINDOW_SECONDS = MAX_INPUT_SECONDS;
+
+function hideStartRow() {
+  state.longVideo = null;
+  el.ytStartRow.hidden = true;
+  el.ytStart.value = "";
+}
+
+/**
+ * Show the start field for a video the server called long, filled in.
+ * @param {{videoId: string, duration: number, title: string | null, heatmap: unknown}} video
+ * @param {number | null} timestamp the timestamp of the link the field is filled for
+ * @param {number} start whole seconds
+ * @param {"link" | "replayed" | "zero"} source what the start is: the link's
+ *   own timestamp, the most replayed ten minutes, or the beginning
+ */
+function showStartRow(video, timestamp, start, source) {
+  state.longVideo = {
+    videoId: video.videoId, duration: video.duration, title: video.title, heatmap: video.heatmap,
+    timestamp, filled: formatStartTime(start), source,
+  };
+  el.ytStart.value = state.longVideo.filled;
+  el.ytStartRow.hidden = false;
+}
+
+/**
+ * Fill the start field for a long video and the link that names it, and say
+ * what to fetch next. A link with a timestamp inside the video is fetched
+ * from there at once. Otherwise the field gets the most replayed ten minutes
+ * (the beginning, without a heatmap), the status line asks, and nothing is
+ * downloaded until the user has seen the start and tapped Fetch again.
+ * @param {{videoId: string, duration: number, title: string | null, heatmap: unknown}} video
+ * @param {{videoId: string, timestamp: number | null}} link
+ * @returns {{start: number, source: string} | null} the window to fetch now;
+ *   null once the user has been asked
+ */
+function offerStart(video, link) {
+  if (link.timestamp !== null && link.timestamp < video.duration) {
+    showStartRow(video, link.timestamp, link.timestamp, "link");
+    return { start: link.timestamp, source: "link" };
+  }
+  const replayed = suggestWindowStart(video.heatmap, video.duration, WINDOW_SECONDS);
+  showStartRow(video, link.timestamp, replayed ?? 0, replayed === null ? "zero" : "replayed");
+  setStatus(el.ytStatus, "This video is " + formatStartTime(video.duration) + " long, and the server fetches"
+    + " up to 10 minutes of it at a time. The start time is set to "
+    + (replayed === null ? "the beginning" : "the most replayed part")
+    + ". Change it if you like, then tap Fetch.");
+  return null;
+}
+
+/**
+ * One job at the fetcher, from the request to its last status.
+ * @returns {Promise<object | null>} pollJob's result with the job's ID; null
+ *   when a newer pick or fetch replaced this one meanwhile
+ */
+async function runJob(videoId, start, controller, current) {
+  const jobId = await fetchJob(videoId, start);
+  if (!current()) return null;
+  const result = await pollJob(jobId, {
+    signal: controller.signal,
+    onStatus: (status) => {
+      if (current()) setStatus(el.ytStatus, FETCH_STATES[status]);
+    },
+  });
+  return current() ? { ...result, jobId } : null;
+}
+
 /**
  * Fetch a YouTube video's audio through the fetcher and load it like a picked
- * file. Only the ID parsed on this device is sent; the t= timestamp stays here
- * and only moves the selection.
+ * file. Only the ID parsed on this device is sent. The t= timestamp stays here
+ * and only moves the selection, unless the video is longer than the server
+ * fetches whole: then the server says so, and a second request carries the
+ * ID and a start time, the link's own or the one in the start field, which
+ * the user sees and may change before anything is downloaded
+ * (docs/PLAN.md 6.2).
  * @param {string} text a pasted or shared link
  */
 async function fetchFromYouTube(text) {
@@ -628,32 +733,111 @@ async function fetchFromYouTube(text) {
     setStatus(el.ytStatus, fetchErrorMessage("bad_link"), true);
     return;
   }
-  // The same video is already on its way: a second tap would only queue a
-  // second job that nobody collects. A different link still replaces it.
-  if (state.fetchController !== null && state.fetchVideoId === link.videoId) return;
+  // Whether a fetch for this very video is on its way.
+  const running = state.fetchController !== null && state.fetchLink !== null
+    && state.fetchLink.videoId === link.videoId;
+  const known = state.longVideo;
+  if (known === null || known.videoId !== link.videoId) {
+    if (running) {
+      // The same video is already on its way: a second tap would only queue
+      // a second job that nobody collects. Only the timestamp can differ,
+      // and the fetch on its way takes it from here when its answer
+      // arrives. A different video still replaces the fetch.
+      state.fetchLink = link;
+      return;
+    }
+    hideStartRow();
+    await runFetch(link, null);
+    return;
+  }
+  // The server has already called this video long, and the start field is
+  // showing: this tap fetches the part the field names.
+  const untouched = el.ytStart.value.trim() === known.filled;
+  let asked;
+  if (untouched && link.timestamp !== known.timestamp) {
+    // The same video under another link: a timestamp was added, changed or
+    // taken away since the field was filled, and nobody has typed in the
+    // field. So it is filled again for this link, as when the server first
+    // called the video long; fetching the old start again, as if this link
+    // had named it, would be wrong. A time the user typed stays (below).
+    asked = offerStart(known, link);
+    if (asked === null) {
+      // Asked first, so a part of this video that is on its way, or that
+      // has arrived and is still being decoded, is no longer wanted: it
+      // would only replace the question. Nothing else can be in flight
+      // here: picking a file takes the start field away.
+      supersede();
+      return;
+    }
+  } else {
+    const start = parseStartTime(el.ytStart.value);
+    if (start === null) {
+      setStatus(el.ytStatus, fetchErrorMessage("bad_time"), true);
+      return;
+    }
+    if (start >= known.duration) {
+      setStatus(el.ytStatus, fetchErrorMessage("past_end"), true);
+      return;
+    }
+    // The field as the page filled it keeps its reason; anything else in it
+    // is the user's own choice.
+    asked = { start, source: untouched ? known.source : "typed" };
+  }
+  // That very part is already on its way: a second tap would only queue a
+  // second job. Another part replaces it, as another link would.
+  if (running && state.fetchStart === asked.start) return;
+  await runFetch(link, asked);
+}
+
+/**
+ * @param {{videoId: string, timestamp: number | null}} link
+ * @param {{start: number, source: string} | null} asked the window to fetch
+ *   of a video already known to be long; null to find out first
+ */
+async function runFetch(link, asked) {
   resetForNewFile();
   const token = supersede();
   const controller = new AbortController();
   state.fetchController = controller;
-  state.fetchVideoId = link.videoId;
+  state.fetchLink = link;
+  state.fetchStart = asked === null ? null : asked.start;
   const current = () => token === state.decodeToken;
+  // The link as it is now: a tap on the same video may have changed its
+  // timestamp while this fetch waited (fetchFromYouTube). Read only while
+  // this fetch is the current one.
+  const latest = () => state.fetchLink;
   // The picker's line goes back to its hint; a file picked earlier is no
   // longer what the editor shows.
   setStatus(el.fileStatus, fileHint());
   el.file.value = "";
-  setStatus(el.ytStatus, "Fetching from YouTube…");
   try {
-    const jobId = await fetchJob(link.videoId);
-    if (!current()) return;
-    const done = await pollJob(jobId, {
-      signal: controller.signal,
-      onStatus: (status) => {
-        if (current()) setStatus(el.ytStatus, FETCH_STATES[status]);
-      },
-    });
-    if (!current()) return;
+    let chosen = asked;
+    let done;
+    if (chosen === null) {
+      setStatus(el.ytStatus, "Fetching from YouTube…");
+      done = await runJob(link.videoId, null, controller, current);
+      if (done === null) return;
+      if (done.status === "long") {
+        const video = { videoId: link.videoId, duration: done.duration, title: done.title, heatmap: done.heatmap };
+        // The link's own timestamp is fetched without asking, and shown in
+        // the field for the next part; without one the user is asked first.
+        chosen = offerStart(video, latest());
+        if (chosen === null) {
+          state.fetchController = null;
+          return;
+        }
+        state.fetchStart = chosen.start;
+      }
+    }
+    if (chosen !== null) {
+      setStatus(el.ytStatus, "Fetching up to 10 minutes from " + formatStartTime(chosen.start) + "…");
+      done = await runJob(link.videoId, chosen.start, controller, current);
+      if (done === null) return;
+      // A window is done and says where it begins; anything else is no answer to this request.
+      if (done.status !== "done" || done.windowStart === null) throw new FetchError("bad_response");
+    }
     setStatus(el.ytStatus, "Fetching the audio…");
-    const bytes = await fetchAudio(jobId);
+    const bytes = await fetchAudio(done.jobId);
     if (!current()) return;
     state.fetchController = null;
     const title = done.title;
@@ -661,15 +845,28 @@ async function fetchFromYouTube(text) {
     // name here and the name field's value; it never goes into a URL.
     const file = new File([bytes], (title ?? "youtube") + ".m4a", { type: "audio/mp4" });
     setStatus(el.ytStatus, "Reading the audio…");
-    await loadAudio(file, token, {
+    const source = {
       status: el.ytStatus,
       label: title ?? "The video",
       // The title itself: displayName would cut a last ".word" off it as if
       // it were a file extension. An empty name lets the server choose one.
       name: title ?? "",
       heatmap: done.heatmap,
-      timestamp: link.timestamp,
-    });
+      timestamp: latest().timestamp,
+    };
+    if (chosen !== null) {
+      // The window begins with the fragment that holds the start, so a
+      // little before it: the label says where, and a start the link or
+      // the user named is where the selection begins (rule 1), counted
+      // from the window's own beginning.
+      const named = chosen.source === "link" || chosen.source === "typed";
+      source.label = (title ?? "The video") + " from " + formatStartTime(done.windowStart);
+      source.windowStart = done.windowStart;
+      source.timestamp = named ? Math.max(0, chosen.start - done.windowStart) : null;
+      source.timestampWords = chosen.source === "typed" ? RULE_WORDS.chosen : null;
+      source.after = " For another part of the video, change the start time and tap Fetch.";
+    }
+    await loadAudio(file, token, source);
   } catch (error) {
     if (!current()) return;
     state.fetchController = null;
@@ -681,11 +878,13 @@ el.ytFetch.addEventListener("click", () => {
   void fetchFromYouTube(el.ytLink.value);
 });
 
-el.ytLink.addEventListener("keydown", (event) => {
-  if (event.key !== "Enter") return;
-  event.preventDefault();
-  void fetchFromYouTube(el.ytLink.value);
-});
+for (const field of [el.ytLink, el.ytStart]) {
+  field.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    void fetchFromYouTube(el.ytLink.value);
+  });
+}
 
 /**
  * The link a "Make Ringtone" Shortcut put in the address as #yt=<URL-encoded

@@ -32,7 +32,7 @@ from typing import Any
 from unittest import mock
 
 import helpers
-from strange_ringtone_fetch.metadata import FetchError
+from strange_ringtone_fetch.metadata import FetchError, LongVideo
 from strange_ringtone_fetch.routes import DefaultRoute
 from strange_ringtone_runner import __main__ as runner_entry
 from strange_ringtone_runner import config as runner_config
@@ -473,9 +473,14 @@ class YtDlpSweepTest(unittest.TestCase):
     def job(self) -> Path:
         return Path(tempfile.mkdtemp(prefix="job-", dir=self.temp))
 
-    def fetch(self, runner: YtDlp, video_id: str) -> str:
+    def fetch(self, runner: YtDlp, video_id: str, start: int | None = None) -> str:
         try:
-            runner.fetch(video_id, self.job())
+            if start is None:
+                runner.fetch(video_id, self.job())
+            else:
+                runner.fetch_window(video_id, self.job(), start)
+        except LongVideo:
+            return "long"
         except FetchError as error:
             return error.code
         return "done"
@@ -491,7 +496,8 @@ class YtDlpSweepTest(unittest.TestCase):
         self.assertEqual(fake.events, ["popen"] * 3)
 
     def test_on_it_sweeps_before_and_after_every_run_with_no_popen_in_flight(self) -> None:
-        cases = ((VIDEO_ID, "done"), ("failing____", "failed"), ("tooLong____", "too_long"), ("hanging____", "timeout"))
+        cases = ((VIDEO_ID, "done"), ("failing____", "failed"), ("tooLong____", "long"), ("liveStream_", "live"),
+                 ("hanging____", "timeout"))
         for video_id, outcome in cases:
             with self.subTest(video_id=video_id):
                 fake = Syscalls(pid=1)
@@ -501,6 +507,39 @@ class YtDlpSweepTest(unittest.TestCase):
                 self.assertEqual(fake.sweeps(), [("kill", -1, SIGKILL)] * 2)
                 self.assertFalse(fake.in_flight, "a sweep ran while yt-dlp's Popen was in flight")
                 self.assertTrue(all(proc.returncode is not None for proc in fake.popens))
+
+    def test_a_job_with_a_start_time_sweeps_around_each_of_its_two_children(self) -> None:
+        # docs/PLAN.md 6.2: the window program gets the same fence as yt-dlp.
+        # Nothing yt-dlp left runs beside it, and nothing it left stays.
+        fake = Syscalls(pid=1)
+        with fake.installed(record_popen=True):
+            self.assertEqual(self.fetch(StubYtDlp(600, MIB, 30, sweep_strays=True), "tooLong____", 1234), "done")
+        self.assertEqual(fake.events, ["sweep", "popen", "sweep", "sweep", "popen", "sweep"])
+        self.assertEqual(fake.sweeps(), [("kill", -1, SIGKILL)] * 4)
+        self.assertFalse(fake.in_flight, "a sweep ran while a child's Popen was in flight")
+        self.assertTrue(all(proc.returncode is not None for proc in fake.popens))
+
+    def test_a_window_job_whose_first_child_fails_starts_no_second_and_sweeps_twice(self) -> None:
+        for video_id, outcome in (("liveStream_", "live"), ("failing____", "failed"), ("hanging____", "timeout")):
+            with self.subTest(video_id=video_id):
+                fake = Syscalls(pid=1)
+                with fake.installed(record_popen=True):
+                    self.assertEqual(self.fetch(StubYtDlp(600, MIB, 1, sweep_strays=True), video_id, 1234), outcome)
+                self.assertEqual(fake.events, ["sweep", "popen", "sweep"])
+
+    def test_a_sweep_that_fails_between_the_two_children_fails_the_job(self) -> None:
+        # The sweep after yt-dlp could not run: a stray of yt-dlp's may still
+        # be there, so the window program is never started beside it.
+        fake = Syscalls(pid=1)
+        fake.kill_errors = [None, PermissionError()]
+        with fake.installed(record_popen=True):
+            self.assertEqual(self.fetch(StubYtDlp(600, MIB, 30, sweep_strays=True), "tooLong____", 1234), "failed")
+        self.assertEqual(fake.events, ["sweep", "popen", "sweep"])
+        fake = Syscalls(pid=1)
+        fake.kill_errors = [None, None, None, PermissionError()]
+        with fake.installed(record_popen=True):
+            self.assertEqual(self.fetch(StubYtDlp(600, MIB, 30, sweep_strays=True), "tooLong____", 1234), "failed")
+        self.assertEqual(fake.events, ["sweep", "popen", "sweep", "sweep", "popen", "sweep"])
 
     def test_a_run_that_cannot_start_was_still_swept_before(self) -> None:
         fake = Syscalls(pid=1)

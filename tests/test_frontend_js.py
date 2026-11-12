@@ -41,10 +41,11 @@ HTTP_GUARD = ROOT / "core" / "strange_ringtone" / "http_guard.py"
 NO_FETCHER = "fetcher/strange_ringtone_fetch/ is not in this checkout"
 # A job's outcome travels in the status JSON's "error" field rather than as a
 # refusal, so the source patterns below need not see it (docs/PLAN.md 6).
-FETCH_JOB_ERRORS = frozenset({"blocked", "too_long", "not_found", "timeout", "failed"})
+FETCH_JOB_ERRORS = frozenset({"blocked", "live", "not_found", "past_end", "timeout", "failed"})
 # The fetcher's request refusals, pinned with its API for milestone 5.
 FETCH_REFUSALS = frozenset({
-    "bad_json", "bad_video_id", "bad_origin", "too_large", "unsupported_media_type", "transfer_encoding",
+    "bad_json", "bad_video_id", "bad_start", "bad_origin", "too_large", "unsupported_media_type",
+    "transfer_encoding",
     "bad_length", "length_required", "rate_limited", "busy", "not_found", "method_not_allowed",
 })
 NODE = shutil.which("node")
@@ -313,7 +314,8 @@ class PageByteCapDocumentedTest(unittest.TestCase):
         with self.subTest(where="a picked file, How it works"):
             self.assertRegex(self.between(readme, "## How it works", "#"), self.FIGURE)
         with self.subTest(where="a fetched video"):
-            self.assertRegex(self.between(readme, "- Videos can be up to 10 minutes long", "- "), self.FIGURE)
+            self.assertRegex(self.between(readme, "- A video of up to 10 minutes is fetched whole", "- "),
+                             self.FIGURE)
 
     def test_plan_states_the_cap_where_the_browser_decodes(self) -> None:
         plan = self.read("docs", "PLAN.md")
