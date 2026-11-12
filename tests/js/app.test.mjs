@@ -1437,6 +1437,101 @@ test("a second tap on a link with a timestamp while its window is on its way ope
   assert.equal(jobPosts(page).length, 2);
 });
 
+test("a link that gets the very time of the window on its way opens no second job and places the selection", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const page = await askedWhereToStart({ windowPosts: [held] });
+  // The page's own suggestion, 20:00, is fetched as it stands.
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  // Before it arrives, the link is given that very second as its timestamp.
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m`;
+  page.el("yt-fetch").dispatch("click");
+  await settle();
+  assert.equal(jobPosts(page).length, 2);
+  assert.match(page.el("yt-status").textContent, /^Fetching up to 10 minutes from 20:00/);
+  release(json({ job_id: WINDOW_JOB_ID }, 202));
+  await until(() => !page.el("editor").hidden, "the editor");
+  // One window, and the link's word on it: rule 1, with 1200 s being 5 s into
+  // a window that begins at 1195 s. The heatmap's hot part begins at 0:11.
+  assert.equal(jobPosts(page).length, 2);
+  assert.equal(page.el("selection-readout").textContent, "0:05.0 to 0:20.0, 15.0 s (the maximum)");
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE} from 19:55, 1:00.0. The selection starts at the link's timestamp; drag the handles to change it.`
+    + WINDOW_AFTER);
+  assert.equal(page.el("yt-start").value, "20:00");
+});
+
+test("the time of the window on its way, typed, opens no second job and is the user's choice", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: longFetcher({ windowPosts: [held] }) });
+  // One tap: the look-up, then the window from the link's own second.
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m3s`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  // The same second, as the number pad writes it.
+  page.el("yt-start").value = "20.03";
+  page.el("yt-fetch").dispatch("click");
+  await settle();
+  assert.equal(jobPosts(page).length, 2);
+  release(json({ job_id: WINDOW_JOB_ID }, 202));
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.equal(jobPosts(page).length, 2);
+  // Where the link's time would have put it, in the words for a typed start.
+  assert.equal(page.el("selection-readout").textContent, "0:08.0 to 0:23.0, 15.0 s (the maximum)");
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE} from 19:55, 1:00.0. The selection starts at the time you chose; drag the handles to change it.`
+    + WINDOW_AFTER);
+  assert.equal(page.el("yt-start").value, "20.03");
+});
+
+test("the field put back as the page filled it gives the window on its way back to the heatmap", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const page = await askedWhereToStart({ windowPosts: [held] });
+  // 20:00 typed in another way is the user's own start.
+  page.el("yt-start").value = "20.00";
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  // Then the field is as the page filled it again: the last tap counts.
+  page.el("yt-start").value = "20:00";
+  page.el("yt-fetch").dispatch("click");
+  await settle();
+  assert.equal(jobPosts(page).length, 2);
+  release(json({ job_id: WINDOW_JOB_ID }, 202));
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.equal(jobPosts(page).length, 2);
+  assert.equal(page.el("selection-readout").textContent, "0:11.0 to 0:26.0, 15.0 s (the maximum)");
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE} from 19:55, 1:00.0. The selection is on the most replayed stretch; drag the handles to change it.`
+    + WINDOW_AFTER);
+});
+
+test("a video too long for its most replayed part to be asked for gets the latest start there is", async () => {
+  // 200 hours, hotter towards the end: the best ten minutes are the last,
+  // far past 99:59:59, the latest start the fetcher takes.
+  const heatmap = Array.from({ length: 200 }, (_, i) => ({ start: i * 3600, end: (i + 1) * 3600, value: (i + 1) / 200 }));
+  const page = await askedWhereToStart({
+    first: [{ ...LONG, duration: 720000, heatmap }],
+    second: [{ ...WINDOW_DONE, duration: 720000, heatmap, window_start: 359990 }],
+  });
+  assert.equal(page.el("yt-start").value, "99:59:59");
+  // A start the page can send: the next tap fetches it.
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  assert.equal(jobPosts(page)[1], `{"video_id":"${VIDEO_ID}","start":359999}`);
+  // Finished before the next test begins: what a page decodes is recorded in one place for them all.
+  await until(() => !page.el("editor").hidden, "the editor");
+});
+
 test("asking again also stops a window that has arrived and is still being decoded", async () => {
   setDecoded([LOUD_AT_30]);
   const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: longFetcher() });

@@ -1315,8 +1315,12 @@ the phone. On `long`:
   once, with no further tap;
 - any other link shows the video's length and the **Start at** field, filled
   with the start of the ten minutes with the most replays (rule 2's score
-  from 7.2, with candidates a second apart) or with 0:00, and nothing is
-  requested until the user taps **Fetch** again.
+  from 7.2, for a start in whole seconds, never later than 99:59:59) or
+  with 0:00, and nothing is requested until the user taps **Fetch** again.
+  The video's length is a number the fetcher sent, and its own checks put
+  no upper limit on it, so the search never walks along it: the best
+  window begins beside a heatmap point's start or ends beside a point's
+  end, and only those whole seconds, at most four a point, are scored.
 
 The field takes `1:23:45`, `83:45`, a bare number of seconds and YouTube's
 `1h23m45s`. A point, a comma or a space separates the parts as a colon does,
@@ -1334,11 +1338,15 @@ again for that link, as on the first `long`: a timestamp inside the video is
 fetched at once, anything else is asked about. It never fetches the old
 start again as if the new link had named it. A time the user typed stays,
 and is what the next tap fetches. A tap for the part that is already on its
-way does nothing; a tap for another part replaces it, as another link
-would, and asking again stops a part that is on its way or still being
-decoded. While the first look-up or a whole download is on its way, a tap
-on the same video opens no second job: the link in the box when the answer
-arrives is the one whose timestamp counts.
+way opens no second job, but what it says about the start counts when the
+audio arrives: the selection begins at the start when the link now carries
+it as its timestamp or the user has typed it, and is left to rules 2 and 3
+when the field holds the page's default again. A tap for another part
+replaces the one on its way, as another link would, and asking again stops
+a part that is on its way or still being decoded. While the first look-up
+or a whole download is on its way, a tap on the same video opens no second
+job: the link in the box when the answer arrives is the one whose
+timestamp counts.
 
 What this costs: a long video is looked up twice at YouTube (the first run
 ends at its filter after the look-up, and the window job looks the video up
@@ -1469,8 +1477,9 @@ yt-dlp's info JSON and the media server's bytes:
 | W11 | The window program is stdlib only, is not imported by the runner's process, and runs in the image as UID 10001 under `prlimit` | unit, in-image |
 | W12 | One request stays under the forwarder's download budget for a tunnel | unit |
 | W13 | What the window program holds in memory does not grow with the window: 18 MB through the real client into a file stay under 2 MiB | unit |
-| W14 | The same video under a link with another timestamp is never fetched from the old start in the new link's name, also when the link changes while a look-up is on its way; a typed start stays; another part replaces the one on its way; asking again stops a part on its way or being decoded | JS |
-| W15 | Every check of the window program, of the runner's and the client's handling of a window and of the page's flow was removed or weakened once (mutation run, 2026-11-12) and a test failed each time | unit, JS |
+| W14 | The same video under a link with another timestamp is never fetched from the old start in the new link's name, also when the link changes while a look-up is on its way; a typed start stays; another part replaces the one on its way; a tap for the part on its way opens no second job and says what named its start; asking again stops a part on its way or being decoded | JS |
+| W15 | Every check of the window program, of the runner's and the client's handling of a window and of the page's flow, its search for the default start included, was removed or weakened once (mutation run, 2026-11-12) and a test failed each time | unit, JS |
+| W16 | The search for a long video's default start scores at most four whole seconds a heatmap point, whatever length the fetcher reports, finds what a walk over every second finds, and never gives a start later than 99:59:59 | JS |
 
 ## 7. Web app
 

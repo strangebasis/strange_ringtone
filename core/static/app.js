@@ -9,7 +9,8 @@ import { displayName, renderQuery, toneNameHeader } from "./audio/request.js";
 import { suggestionRule, suggestSelection, suggestWindowStart, windowHeatmap } from "./audio/suggest.js";
 import { clampSelection, encodeWav } from "./audio/wav.js";
 import {
-  FetchError, fetchAudio, fetchErrorMessage, fetchJob, formatStartTime, parseStartTime, parseYouTubeLink, pollJob,
+  FetchError, fetchAudio, fetchErrorMessage, fetchJob, formatStartTime, MAX_START_SECONDS, parseStartTime,
+  parseYouTubeLink, pollJob,
 } from "./fetch.js";
 import { Player } from "./player.js";
 import { canShareFile, fetchResult, isCancel, render, resultUrl, shareFile, ShareError } from "./share.js";
@@ -138,10 +139,15 @@ const state = {
   // may bring another timestamp, and the fetch reads this when its answer
   // arrives, so the link in the box is the one that counts.
   fetchLink: null,
-  // The second the window on its way starts at; null while the fetch in
-  // flight is a look-up or a whole download. A tap for another part of the
-  // same video replaces the fetch, a tap for the same part does not.
-  fetchStart: null,
+  // The window on its way: the second it starts at, and what named that
+  // second (the link, the most replayed part, the beginning, or the user's
+  // typing); null while the fetch in flight is a look-up or a whole
+  // download. A tap for another part of the same video replaces the fetch.
+  // A tap for the same part does not, but it may name the start in another
+  // way (a link that now carries it as its timestamp, say), and the fetch
+  // reads this when its audio arrives, so the last tap is the one that
+  // counts.
+  fetchWindow: null,
   // The video the server last called long (docs/PLAN.md 6.2): its ID, length,
   // title and heatmap, the timestamp of the link the start field was filled
   // for, what the page put in the field, and why. While it is set, Fetch for
@@ -688,7 +694,9 @@ function offerStart(video, link) {
     showStartRow(video, link.timestamp, link.timestamp, "link");
     return { start: link.timestamp, source: "link" };
   }
-  const replayed = suggestWindowStart(video.heatmap, video.duration, WINDOW_SECONDS);
+  // Never a start later than the fetcher takes: the field would hold a time
+  // that Fetch then refuses.
+  const replayed = suggestWindowStart(video.heatmap, video.duration, WINDOW_SECONDS, MAX_START_SECONDS);
   showStartRow(video, link.timestamp, replayed ?? 0, replayed === null ? "zero" : "replayed");
   setStatus(el.ytStatus, "This video is " + formatStartTime(video.duration) + " long, and the server fetches"
     + " up to 10 minutes of it at a time. The start time is set to "
@@ -783,9 +791,15 @@ async function fetchFromYouTube(text) {
     // is the user's own choice.
     asked = { start, source: untouched ? known.source : "typed" };
   }
-  // That very part is already on its way: a second tap would only queue a
-  // second job. Another part replaces it, as another link would.
-  if (running && state.fetchStart === asked.start) return;
+  if (running && state.fetchWindow?.start === asked.start) {
+    // That very part is already on its way: a second tap would only queue a
+    // second job. What names its start may be new, though (the link now
+    // carries it as its timestamp, or the user typed it), and that decides
+    // where the selection goes, so the fetch on its way is told.
+    state.fetchWindow = asked;
+    return;
+  }
+  // Another part replaces the one on its way, as another link would.
   await runFetch(link, asked);
 }
 
@@ -800,7 +814,7 @@ async function runFetch(link, asked) {
   const controller = new AbortController();
   state.fetchController = controller;
   state.fetchLink = link;
-  state.fetchStart = asked === null ? null : asked.start;
+  state.fetchWindow = asked;
   const current = () => token === state.decodeToken;
   // The link as it is now: a tap on the same video may have changed its
   // timestamp while this fetch waited (fetchFromYouTube). Read only while
@@ -826,7 +840,7 @@ async function runFetch(link, asked) {
           state.fetchController = null;
           return;
         }
-        state.fetchStart = chosen.start;
+        state.fetchWindow = chosen;
       }
     }
     if (chosen !== null) {
@@ -855,6 +869,10 @@ async function runFetch(link, asked) {
       timestamp: latest().timestamp,
     };
     if (chosen !== null) {
+      // The same start, as the last tap for it named it: a tap for this
+      // very part while it was on its way opened no second job and left
+      // its word here (fetchFromYouTube).
+      chosen = state.fetchWindow;
       // The window begins with the fragment that holds the start, so a
       // little before it: the label says where, and a start the link or
       // the user named is where the selection begins (rule 1), counted
