@@ -262,9 +262,10 @@ yourself, and nothing here tests them.
 | `.dockerignore` | An allowlist: only `core/` and `fetcher/` reach the build context the two images share |
 | `tools/spike/phase0.py` | Generates the test tones that established the share sheet's rules |
 | `tools/dev_fetch_stack.py` | An offline development stack on loopback: the core, the fetcher, its runner with a stub yt-dlp and a stub window program, and one origin, for trying the YouTube flow without touching YouTube |
-| `scripts/` | Stdlib checks that CI runs: the PR title and contract checks on pull requests, and the weekly FFmpeg release watch |
+| `scripts/` | Stdlib checks that CI runs: the PR title and contract checks on pull requests, the weekly FFmpeg release watch, and the publish workflow's check of a release's tag |
+| `release-please-config.json`, `.release-please-manifest.json` | What release-please reads to keep the release pull request: one package, and the last released version |
 | `tests/` | Stdlib `unittest` tests (the in-image suites in `tests/image/` and `tests/image_fetcher/`, the compose topology tests in `tests/compose/`, the ffmpeg and yt-dlp stubs in `tests/stubs/`), plus `node:test` unit tests for the browser's code in `tests/js/` |
-| `.github/` | CI workflows, Dependabot, and hashed lockfiles for the CI tools |
+| `.github/` | The CI, release and publish workflows, Dependabot, hashed lockfiles for the CI tools, and in `.github/sbom/` the digest-pinned SBOM generator the publish workflow uses |
 
 ## Development
 
@@ -516,12 +517,92 @@ squash-merged, so their titles must be conventional-commit subjects (`feat:`,
 `fix:`, `docs:`, `ci:`, `chore:`, with `!` for a breaking change). release-please
 builds the changelog from them.
 
+**Releases:** release-please keeps one release pull request open, with the
+next version and the changelog (`release-please.yml`). It never tags. To
+release:
+
+1. On the release pull request, click **Approve workflows to run** (a
+   workflow's token opened it, so its checks wait for that), review it and
+   merge it.
+2. Create the GitHub release `vX.Y.Z` by hand on that merge commit, with
+   exactly the version the pull request named, and publish it.
+3. Publishing starts `publish.yml`: it refuses a tag that is not the
+   version the manifest records at that commit, builds both images with no
+   cache, pushes them by digest with no tag, has the organisation's Trivy
+   workflow scan those digests, attests provenance and an SBOM, and only
+   then tags the images with the version, adds the digests to the
+   release's notes and relabels the release pull request so that the next
+   one can open.
+
+Started by hand from `main`, `publish.yml` is a rehearsal: everything up to
+the attestations, under the version `rehearsal`, with no tag and no release
+touched. The scan pulls the images without logging in, so both packages
+must be public; the first push may create them private (docs/PLAN.md 9.3).
+
 ## Deployment contract
 
-Not defined yet. v0.1.0 will define it here: the image, UID/GID, port, writable
-paths, environment variables and limits. The draft is in
-[docs/PLAN.md](docs/PLAN.md), section 5.7. After the first release, CI refuses any
-change to this section unless the PR is marked as breaking.
+What a release promises the deployments that pin it: the images, the user,
+the ports, the writable paths, the environment variables and the limits.
+v0.1.0 is its first version. From then on CI refuses a change to this section
+unless the pull request is marked as breaking, so the CHANGELOG calls it out.
+The reasoning behind each figure is in [docs/PLAN.md](docs/PLAN.md), sections
+5.7, 6 and 6.1.
+
+### Images and verification
+
+| Image | Repository |
+| --- | --- |
+| Core | `ghcr.io/<owner>/strange_ringtone` |
+| Fetcher (opt-in) | `ghcr.io/<owner>/strange_ringtone-fetcher` |
+
+A release pushes both for linux/amd64 and tags each with its version only,
+`0.1.0` for v0.1.0. There is no `latest` tag, and a version tag is set once
+and never moved. Pin the digest, which the release's notes list, not the tag:
+`ghcr.io/<owner>/strange_ringtone@sha256:<digest>`.
+
+Before pinning a digest, check that this repository's publish workflow built
+it from that release's tag (`gh` is the GitHub CLI):
+
+```bash
+gh attestation verify oci://ghcr.io/<owner>/strange_ringtone@sha256:<digest> --repo <owner>/strange_ringtone --signer-workflow <owner>/strange_ringtone/.github/workflows/publish.yml --source-ref refs/tags/v<version>
+```
+
+The fetcher image is checked the same way, under its own name. Each image
+carries an SPDX SBOM, made from the built image and attested like the
+provenance. A release's images were scanned before they were tagged: a
+secret, or a HIGH or CRITICAL vulnerability with a fix, stops the release.
+The registry also holds untagged images from rehearsals of the publish
+workflow; they are not releases, and the `--source-ref` above refuses them.
+
+### Core image
+
+| Item | Value |
+| --- | --- |
+| Image | `ghcr.io/<owner>/strange_ringtone`, linux/amd64, pinned by digest ([Images and verification](#images-and-verification)) |
+| User | UID 10001, GID 10001 (fixed, non-root) |
+| Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
+| Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`, the `sysctls` `kernel.shmmni: 0`, `kernel.msgmni: 0` and `kernel.sem: "0 0 0 0"` (`ipc: none` leaves System V shared memory, message queues and semaphores open to create in the container's own IPC namespace; with these, `shmget`, `msgget` and `semget` fail), `pids_limit: 80`, `mem_limit: 160m` and `memswap_limit: 160m` (memory plus swap, the same figure: the container gets no swap, so `mem_limit` is its whole bound on a host with swap too). The image sets no process limit of its own (docs/PLAN.md 5.3), so `pids_limit` is the only bound on what ffmpeg starts: at least twice the worst case of 37 threads (the main thread, 16 request workers, the result sweeper, 6 per ffmpeg run for each of `RENDER_CONCURRENCY` renders, and 7 for the health check, which Docker starts through its runtime's init process inside the container's cgroup; 37 is also the highest count measured); each render added to `RENDER_CONCURRENCY` needs 12 more. `mem_limit` holds the tmpfs, whose pages count against it, plus twice the 47.6 MB measured with two renders at once and the health check running: 90.8 MiB, and 154.8 MiB with the example's 64 MiB tmpfs (`size=64m`). Raise it with the tmpfs: `MAX_CLIP_SECONDS=40` measured 48.2 MB, and with an 84 MiB tmpfs needs 175.9 MiB, so `176m` at the least. No egress needed (internal network). In `compose.example.yaml` that network is also isolated from the Docker host (`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`, both, so the host stays off it if IPv6 is ever turned on for it; they need Docker Engine 28.0 or newer, the release that added those modes), so the reverse proxy must be a container on it, not a process on the host, and the log rotates (json-file, `max-size: 10m`, `max-file: 3`). |
+| Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `(MAX_RESULTS + RENDER_CONCURRENCY) × MAX_CLIP_SECONDS × 33 kB + RENDER_CONCURRENCY × MAX_BODY_BYTES`: a result is 256 kbit/s AAC, at most 33 kB per second of clip with the MP4 overhead, and each running render also holds its upload. That is 63 MB with the defaults (use 64 MB) and 84 MB with `MAX_CLIP_SECONDS=40`. |
+| Health | `GET /healthz` returns 200 with an empty body |
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `PUBLIC_ORIGIN` | *(required)* | For example `https://ringtones.example.internal`. The server refuses to start without it. |
+| `TRUSTED_PROXIES` | empty | CIDRs whose `X-Forwarded-For` is honoured. The rightmost untrusted hop is the client. The walk from the right stops at the first malformed hop, and without an untrusted hop before it (or when the header is missing or lists only trusted proxies) the socket peer is the client. Behind a proxy with this empty, every client shares the proxy's address and the per-client rate limit becomes global. |
+| `MAX_CLIP_SECONDS` | 30 | 1 to 40 |
+| `DEFAULT_TARGET_LUFS` | −14 | −24 to −9 |
+| `RENDER_TIMEOUT_SECONDS` | 20 | Wall clock, per ffmpeg run |
+| `RENDER_CONCURRENCY` | 2 | |
+| `RATE_LIMIT_RENDERS_PER_MINUTE` | 10 | Per client IP |
+| `RESULT_TTL_SECONDS` | 600 | |
+| `MAX_RESULTS` | 50 | Results held at once; 503 when full |
+| `FETCH_ENABLED` | false | Only shows the YouTube box in the UI. The core never calls the fetcher. |
+| `SOURCE_URL` | baked at build | The AGPL source link. Forks override it. |
+| `VERSION` | baked at build, `dev` outside a release | The `/static/<version>/` path segment: 1 to 64 letters, digits, `.`, `_` or `-`, starting with a letter or digit |
+
+The core has no secrets, so `.env.example` holds only `PUBLIC_ORIGIN=` and
+commented optional settings. A later secret would arrive as a `*_FILE`
+variable with no usable default.
 
 ### Fetcher image (opt-in)
 
@@ -532,16 +613,15 @@ the trimmed WAV, as for a picked file. The image runs as three containers: the
 fetcher, on internal networks only; the runner, which runs yt-dlp and shares
 no network with the reverse proxy; and the forwarder, the runner's one way
 out.
-Draft, from [docs/PLAN.md](docs/PLAN.md) sections 6 and 6.1.
 
 | Item | Value |
 | --- | --- |
-| Image | `ghcr.io/<owner>/strange_ringtone-fetcher:<semver>`, consumed by digest, linux/amd64 |
+| Image | `ghcr.io/<owner>/strange_ringtone-fetcher`, linux/amd64, pinned by digest ([Images and verification](#images-and-verification)) |
 | User | UID 10001, GID 10001 (fixed, non-root), the same as the core, for all three commands |
 | Commands | The image's CMD, `python -I /app/fetcher`, is the fetcher. `python -I /app/fetcher/runner.py` is the runner and `python -I /app/fetcher/forwarder.py` the forwarder, each run from the same image as a container of its own (`command:` in `compose.example.yaml`). |
 | Port | 8080/tcp for the fetcher and 8080/tcp for the runner (each in its own container), plain HTTP; TLS is the proxy's job. 3128/tcp for the forwarder command, plain HTTP that answers only `CONNECT`. All fixed. |
 | Paths | The fetcher serves the `/fetch/` prefix itself: `GET /fetch/healthz`, `POST /fetch/api/jobs`, `GET /fetch/api/jobs/<id>` and `GET /fetch/api/jobs/<id>/audio`. The reverse proxy forwards every path under `/fetch/` to it unchanged, on the same origin as the core (no rewriting), and everything else to the core. The runner serves `GET /healthz`, `POST /jobs` and `GET /jobs/<token>/audio`, for the fetcher only; nothing forwards to it. The forwarder serves no path, and the reverse proxy never reaches it. |
-| Runs with | The fetcher: `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`, and a memory limit (`mem_limit`, 256 MB in `compose.example.yaml`; its `/tmp` pages count against it). The runner: the same flags and 512 MB: yt-dlp, and after it the runner's own window program when the job is a part of a longer video, runs under `prlimit` for CPU time, file size, open files and processes, but with no address-space limit, because Deno reserves a huge virtual range, so the cgroup limit is what bounds memory. The runner also sets `sysctls` `kernel.shmmni: "0"`, `kernel.msgmni: "0"` and `kernel.sem: "0 0 0 0"` (or `--sysctl kernel.shmmni=0` and so on): `ipc: none` gives the container an IPC namespace of its own but still lets a run create System V shared memory segments, message queues and semaphore sets there, which outlive the run and whose shared memory counts against the memory limit; with these at zero it can create none. They belong to the container's own IPC namespace, so they need no capability, and neither the runner nor yt-dlp or Deno uses System V IPC. The runner must be its container's PID 1, its command run directly, with no `init: true` and no wrapper: before and after every run of yt-dlp or of the window program it sends `kill(-1, SIGKILL)`, which ends every other process of UID 10001 in its container, and reaps them, so nothing a run started (a child that left yt-dlp's process group included) reaches the next job or stays a zombie that counts against `pids_limit`. A `docker exec` or health check running in that container at that moment is killed too, and so is any process of UID 10001 in a container that shares the runner's PID namespace (`pid: "container:…"`, a debug container attached to it). A run can time that on purpose, or fill `pids_limit`, so that the health check fails and the runner reads unhealthy; nothing in `compose.example.yaml` acts on the runner's health status, and nothing should: don't restart the runner, or route around it, on its health status alone. Started as anything but PID 1 (under an init, a daemon's default included, which the example's stated `init: false` overrides), the runner can't sweep and refuses to start (exit 4), unless `FETCH_ALLOW_NO_SWEEP=true` (see below), which is for a local run or a host that can't run the runner as PID 1, never for a deployment that can. As PID 1 it says so on stderr at startup; with the override and no sweep it serves without the sweep and says that on stderr instead. As PID 1 the runner also relies on a restart policy, as the example's `restart: unless-stopped`: when the clean-up after a run overruns its budget of 3 s, leaves something behind, or can't make its scratch directory usable again, it fails that job, writes one line to stderr and exits with code 5 once it has answered, so that a clean container starts in its place. On Linux the runner also makes itself non-dumpable before it serves, so no process of its UID, yt-dlp included, can ptrace it or read its `/proc/1/environ`, `maps` or `mem`, whatever the host's `kernel.yama.ptrace_scope`; code planted in the runner would otherwise outlive every sweep. A `docker exec` in that container can't read those entries either; `docker inspect` on the container still shows the environment the runner was started with. So does the inside of the container: Docker starts every health check, and every `docker exec`, with the container's environment and user, and yt-dlp, which runs as that user, can read such a process's `/proc/<pid>/environ` while it runs. The non-dumpable step keeps yt-dlp out of the runner, not out of what the container was given, so give the runner's container only the runner's own settings, as `compose.example.yaml` does (the variables below), and never a secret. The forwarder: the same flags with no `/tmp` and a smaller memory limit (128 MB in `compose.example.yaml`). All three: forwarding off on every interface, ICMP redirects refused, and a cap on processes and threads, set as [Kernel and process settings](#kernel-and-process-settings) below describes. None of these settings needs a capability. |
+| Runs with | The fetcher: `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`, and a memory limit (`mem_limit`, 256 MB in `compose.example.yaml`; its `/tmp` pages count against it). The runner: the same flags and 512 MB: yt-dlp, and after it the runner's own window program when the job is a part of a longer video, runs under `prlimit` for CPU time, file size, open files and processes, but with no address-space limit, because Deno reserves a huge virtual range, so the cgroup limit is what bounds memory. The runner also sets `sysctls` `kernel.shmmni: "0"`, `kernel.msgmni: "0"` and `kernel.sem: "0 0 0 0"` (or `--sysctl kernel.shmmni=0` and so on): `ipc: none` gives the container an IPC namespace of its own but still lets a run create System V shared memory segments, message queues and semaphore sets there, which outlive the run and whose shared memory counts against the memory limit; with these at zero it can create none. They belong to the container's own IPC namespace, so they need no capability, and neither the runner nor yt-dlp or Deno uses System V IPC. The runner must be its container's PID 1, its command run directly, with no `init: true` and no wrapper: before and after every run of yt-dlp or of the window program it sends `kill(-1, SIGKILL)`, which ends every other process of UID 10001 in its container, and reaps them, so nothing a run started (a child that left yt-dlp's process group included) reaches the next job or stays a zombie that counts against `pids_limit`. A `docker exec` or health check running in that container at that moment is killed too, and so is any process of UID 10001 in a container that shares the runner's PID namespace (`pid: "container:…"`, a debug container attached to it). A run can time that on purpose, or fill `pids_limit`, so that the health check fails and the runner reads unhealthy; nothing in `compose.example.yaml` acts on the runner's health status, and nothing should: don't restart the runner, or route around it, on its health status alone. Started as anything but PID 1 (under an init, a daemon's default included, which the example's stated `init: false` overrides), the runner can't sweep and refuses to start (exit 4), unless `FETCH_ALLOW_NO_SWEEP=true` (see below), which is for a local run or a host that can't run the runner as PID 1, never for a deployment that can. As PID 1 it says so on stderr at startup; with the override and no sweep it serves without the sweep and says that on stderr instead. As PID 1 the runner also relies on a restart policy, as the example's `restart: unless-stopped`: when the clean-up after a run overruns its budget of 3 s, leaves something behind, or can't make its scratch directory usable again, it fails that job, writes one line to stderr and exits with code 5 once it has answered, so that a clean container starts in its place. On Linux the runner also makes itself non-dumpable before it serves, so no process of its UID, yt-dlp included, can ptrace it or read its `/proc/1/environ`, `maps` or `mem`, whatever the host's `kernel.yama.ptrace_scope`; code planted in the runner would otherwise outlive every sweep. A `docker exec` in that container can't read those entries either; `docker inspect` on the container still shows the environment the runner was started with. So does the inside of the container: Docker starts every health check, and every `docker exec`, with the container's environment and user, and yt-dlp, which runs as that user, can read such a process's `/proc/<pid>/environ` while it runs. The non-dumpable step keeps yt-dlp out of the runner, not out of what the container was given, so give the runner's container only the runner's own settings, as `compose.example.yaml` does (the variables below), and never a secret. The runner's 512 MB leaves a thin margin on purpose: real fetches peaked at up to 476 MiB, reclaimable file cache included, and none reached the limit; if the kernel ever kills the runner for memory, that fetch fails, the restart policy starts it again, and the remedy is to raise its `mem_limit` and `memswap_limit` together. The forwarder: the same flags with no `/tmp` and a smaller memory limit (128 MB in `compose.example.yaml`). All three: `memswap_limit` equal to `mem_limit`, so no container gets swap on top of its limit (left unset, Docker allows as much swap again as the limit); forwarding off on every interface, ICMP redirects refused, and a cap on processes and threads, set as [Kernel and process settings](#kernel-and-process-settings) below describes. None of these settings needs a capability. |
 | Egress | The fetcher needs none: it talks only to the runner, over `jobs`, at `FETCH_RUNNER_URL`, and trusts nothing it answers (every response is capped in size and time and the metadata re-validated). The runner needs none of its own: it refuses to start (exit 3) when its container has a default route, IPv4 or IPv6, or when it can't read or parse its route tables (see `FETCH_ALLOW_DEFAULT_ROUTE` below), unless `FETCH_ALLOW_DEFAULT_ROUTE=true`, and it reaches YouTube only through `HTTPS_PROXY`, which points at the forwarder. The fetcher refuses to start under the same rule. Only `http://` proxies work: yt-dlp is installed without `requests`, so it reaches a proxy through urllib (`CONNECT` for HTTPS). The runner's window program, which fetches a part of a longer video by byte range, goes the same way, and takes an address only as https on a subdomain of `googlevideo.com`. The forwarder needs outbound TCP 443 to `youtube.com`, its subdomains and the subdomains of `googlevideo.com`, and DNS for those names. It connects only to IPv4 global unicast addresses it checked, and it resolves a name only after the allowlist and its budgets have passed, so a refused name never reaches DNS. It looks the name up as an absolute name (with a trailing dot), so the `search` domains in the container's `/etc/resolv.conf`, which Docker copies from the host, never turn an allowed name into one in your own zone. It is the only container with a route out. |
 | Networks | `fetcher`: the reverse proxy and the fetcher. `jobs`: the fetcher and the runner, and nothing else. `egress`: the runner and the forwarder, and nothing else. `outside`: the forwarder only, the one network with a route out. Every network but `outside` is `internal: true`, the core's `core` network included, and also sets `driver_opts: {com.docker.network.bridge.gateway_mode_ipv4: isolated, com.docker.network.bridge.gateway_mode_ipv6: isolated}`: `internal: true` alone still gives the Docker host an address on the bridge, through which a container reaches every service the host listens on. Set both modes: the IPv4 one covers IPv4 only, so if IPv6 is turned on for these networks (`enable_ipv6: true`, or the daemon's `default-network-opts`), the host gets an IPv6 address on the bridge again unless the IPv6 mode is set too. The IPv6 option is accepted, and does nothing, on a network without IPv6. The host then also has no route to these networks, so the reverse proxy must be a container attached to `core` (and `fetcher`): a proxy running on the host, or with `network_mode: host`, can't reach them. A proxy kept in another Compose project declares them as external networks under their real names, the project name plus the network name (`strange_ringtone_core` and `strange_ringtone_fetcher` with the example's `name:`), and addresses the fetcher as `fetcher:8080`, which resolves to its address on `fetcher`; a proxy that discovers backends from container labels must be told to use the `fetcher` network, because the fetcher also has an address on `jobs`, which the proxy can't reach. Docker Engine 28.0 or newer: older engines forward DNS from internal networks (CVE-2024-29018, fixed in 26.0), which would let the fetcher or the runner resolve names without the forwarder, and lack the `isolated` gateway modes, which Engine 28.0 added for internal networks (moby/moby#49262). With Compose, Docker Compose 2.27.1 or newer, for the per-network `driver_opts` that turn forwarding off and refuse ICMP redirects on each interface (see Runs with). The forwarder listens on all its interfaces, so the Docker host can reach port 3128 on its `outside` address, and the runner can reach it on `egress`: nothing but the forwarder may join `outside`. The runner listens on all its interfaces too, so the forwarder can reach its port 8080 over `egress`, where it answers its health path, a well-formed job request, which runs yt-dlp through the forwarder itself, and that job's audio request, and nothing else: a compromised forwarder could keep the runner's one job slot and its request workers busy that way, so that fetches fail, and it never sees a token the fetcher made. The fetcher listens on all its interfaces, so the runner, and anything a compromised yt-dlp runs in its container, can reach the fetcher's port 8080 over `jobs`: there the Origin check applies (`compose.example.yaml` gives the runner's container no copy of the public origin, but it is no secret, so count on the check to keep browsers on other origins out, not the runner), the per-client rate limit keys on the runner's address, and no job ID is ever sent to the runner, so it can read or collect no result but its own submissions'. `compose.example.yaml` therefore sets `TRUSTED_PROXIES: ""` in the fetcher's own `environment`, which wins over the shared `.env`: the fetcher trusts no proxy and keys its rate limit on the socket peer, so behind a reverse proxy every client shares one `RATE_LIMIT_FETCHES_PER_MINUTE`. If you override that, list only the reverse proxy's own addresses and never a range that covers `jobs`, or the rate limit would trust an `X-Forwarded-For` the runner wrote; and Docker picks the subnets of `fetcher` and `jobs` from its address pools when it creates them and may pick others when it recreates them (after `docker compose down`, say), so an address that is the proxy's today can be the runner's tomorrow. What a compromised runner gains there, submitting fetch jobs that come back to itself, adds nothing to what it can already do through the forwarder; binding the fetcher to its `fetcher` address alone would need a fixed subnet and address in the example (docs/PLAN.md 6.1, Accepted risks). |
 | Writable | The fetcher: `/tmp` (tmpfs) and nothing else, sized `2 × FETCH_MAX_BYTES`: one download arriving from the runner and one finished result waiting to be collected. 80 MB with the defaults. The runner: `/tmp` (tmpfs) and nothing else, sized `FETCH_MAX_BYTES + 16 MB`: one download in flight or one audio waiting to be collected (never both), the info JSON and Deno's cache. 56 MB with the defaults. After every run the runner empties its `/tmp` of everything but its scratch directory and the one audio file it holds there, so nothing else can be kept or mounted there: a mount inside it is never entered, so every run's clean-up would count as leaving something, fail that job and make the runner exit (code 5, see Runs with). The forwarder: nothing, not even `/tmp`. No volumes, and nothing survives a restart. |
@@ -634,9 +714,10 @@ above); `compose.example.yaml` shows them in place.
 
 #### Forwarder limits
 
-The forwarder reads no setting: its limits are fixed in the image,
-provisional values sized with headroom that a release may change. A test
-compares this table with the code.
+The forwarder reads no setting: its limits are fixed in the image, and they
+are part of this contract, so a release that changes one is a breaking
+change. They were sized with headroom from real fetches (docs/PLAN.md 6.1).
+A test compares this table with the code.
 
 | Limit | Value | Meaning |
 | --- | --- | --- |
