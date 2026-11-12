@@ -1,13 +1,17 @@
 """The fetcher's default Runner: a client for the runner container over `jobs` (docs/PLAN.md 6.1).
 
 The fetcher no longer runs yt-dlp. It sends the runner only the validated
-video ID and a token it mints itself, never its own job ID (a runner that
-learned one could collect the browser's download from the fetcher's port
-8080 on `jobs`), and treats everything that comes back as untrusted: the
-status, the headers, the JSON's size and shape, the audio's size, type and
-length, and how long each read and each exchange takes. The metadata is
-re-validated with the same whitelist the runner applied
-(strange_ringtone_fetch.metadata.parse_info). Anything off fails the job
+video ID, the validated start time when the job is a window of a longer
+video (docs/PLAN.md 6.2), and a token it mints itself, never its own job ID
+(a runner that learned one could collect the browser's download from the
+fetcher's port 8080 on `jobs`), and treats everything that comes back as
+untrusted: the status, the headers, the JSON's size and shape, the audio's
+size, type and length, and how long each read and each exchange takes. The
+metadata is re-validated with the same whitelist the runner applied
+(strange_ringtone_fetch.metadata.parse_info), and an answer must be one the
+request could have: "long" only for a job without a start time, a window's
+beginning only for one with, and then at or before the start asked for.
+Anything off fails the job
 closed, with nothing left in the job directory and no retry. No proxy
 variable is consulted (http.client reads none) and no redirect is followed
 (http.client follows none, so a 3xx is just "not 200").
@@ -50,7 +54,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from strange_ringtone_fetch.metadata import ERROR_CODES, VIDEO_ID_RE, Download, FetchError, Metadata, parse_info
+from strange_ringtone_fetch.config import MAX_SECONDS_LIMIT
+from strange_ringtone_fetch.metadata import (
+    ERROR_CODES,
+    VIDEO_ID_RE,
+    Download,
+    FetchError,
+    LongVideo,
+    Metadata,
+    clean_start,
+    clean_window_start,
+    parse_info,
+)
 
 CONNECT_TIMEOUT_SECONDS = 10.0
 # Socket timeout for each recv of a response head or body.
@@ -233,7 +248,25 @@ class RunnerClient:
         ValueError for an ID that does not fullmatch VIDEO_ID_RE, before any
         request. The audio file is created by this client itself
         (O_CREAT|O_EXCL|O_NOFOLLOW, 0o600) and removed again on any failure.
+        LongVideo, with the re-validated metadata, when the runner answers
+        that the video is longer than it fetches whole: nothing was
+        downloaded, and nothing is collected.
         """
+        return self._fetch(video_id, job_dir, None)
+
+    def fetch_window(self, video_id: str, job_dir: Path, start: int) -> Download:
+        """Have the runner fetch a window of video_id from second start, and collect it as fetch() does.
+
+        ValueError for a start that clean_start refuses, before any request.
+        The Download's window_start is where the audio really begins.
+        """
+        # Checked again, as the ID is: this value goes on the wire too, and
+        # ends up in the arguments of the runner's window program.
+        if clean_start(start) is None:
+            raise ValueError("not a start time")
+        return self._fetch(video_id, job_dir, start)
+
+    def _fetch(self, video_id: str, job_dir: Path, start: int | None) -> Download:
         # Checked again, as Jobs does: this value goes on the wire, and the
         # runner builds yt-dlp's URL from it.
         if not isinstance(video_id, str) or not VIDEO_ID_RE.fullmatch(video_id):
@@ -245,16 +278,16 @@ class RunnerClient:
         with self._lock:
             generation = self._cancels
         try:
-            metadata = self._post(video_id, job, generation)
+            metadata, window_start = self._post(video_id, job, generation, start)
             audio = self._collect(job, job_dir / f"{video_id}.m4a", generation)
-        except FetchError:
+        except (FetchError, LongVideo):
             raise
         except (OSError, http.client.HTTPException, ValueError, RecursionError):
             # A refused connection, a timeout, the deadline's or cancel()'s
             # shutdown, anything http.client could not parse: the job fails
             # closed, with no detail that could carry a path or a title.
             raise FetchError("failed") from None
-        return Download(audio=audio, metadata=metadata)
+        return Download(audio=audio, metadata=metadata, window_start=window_start)
 
     def cancel(self) -> None:
         """Shut down every open connection, so a blocked fetch fails; Jobs.stop() calls it."""
@@ -266,9 +299,16 @@ class RunnerClient:
 
     # --- the two exchanges --------------------------------------------------------
 
-    def _post(self, video_id: str, job: str, generation: int) -> Metadata:
-        """POST /jobs and return the re-validated metadata, or raise FetchError with the runner's code."""
-        body = json.dumps({"video_id": video_id, "job": job}).encode("ascii")
+    def _post(self, video_id: str, job: str, generation: int, start: int | None) -> tuple[Metadata, float | None]:
+        """POST /jobs: (the re-validated metadata, a window's beginning or None), or the runner's failure.
+
+        FetchError with the runner's code when it is a known one; LongVideo
+        for a video the runner did not download because it is long.
+        """
+        request: dict[str, Any] = {"video_id": video_id, "job": job}
+        if start is not None:
+            request["start"] = start
+        body = json.dumps(request).encode("ascii")
         # The status line arrives only when yt-dlp is done, so the head's
         # per-recv timeout is the whole deadline; the timer is the backstop.
         with self._exchange(self.post_deadline, self.post_deadline, generation) as (conn, exchange):
@@ -284,7 +324,7 @@ class RunnerClient:
                 self._expect_close(response, exchange)
             finally:
                 response.close()
-        return self._parse_answer(bytes(data))
+        return self._parse_answer(bytes(data), start)
 
     def _collect(self, job: str, path: Path, generation: int) -> Path:
         """GET the audio of job into path, a file this client creates, or raise."""
@@ -442,8 +482,14 @@ class RunnerClient:
                 with contextlib.suppress(OSError):
                     path.unlink()
 
-    def _parse_answer(self, body: bytes) -> Metadata:
-        """The runner's JSON answer: done with info, or failed with a known code; FetchError otherwise."""
+    def _parse_answer(self, body: bytes, start: int | None) -> tuple[Metadata, float | None]:
+        """The runner's JSON answer to a job asked with start (None without one).
+
+        done with info, and for a job with a start time also where the
+        window begins; long with info, for a job without one (raised as
+        LongVideo); or failed with a known code. Anything else, and any
+        answer that does not fit the request, is FetchError("failed").
+        """
         try:
             data = json.loads(body.decode("utf-8"), object_pairs_hook=_no_duplicates)
         except (UnicodeDecodeError, ValueError, RecursionError):
@@ -456,13 +502,34 @@ class RunnerClient:
             error = data["error"]
             # A known code passes through as the job's error; any other value
             # is "failed", never a code of the runner's choosing.
-            if isinstance(error, str) and error in ERROR_CODES:
+            # Only a window can start past the end: to a job without a start
+            # time that code is no answer.
+            if isinstance(error, str) and error in ERROR_CODES and (error != "past_end" or start is not None):
                 raise FetchError(error)
             raise FetchError("failed")
-        if status == "done" and set(data) == {"status", "info"} and isinstance(data["info"], dict):
+        info = data.get("info")
+        if not isinstance(info, dict):
+            raise FetchError("failed")
+        if status == "long" and start is None and set(data) == {"status", "info"}:
+            # A video the runner did not download because it is longer than
+            # it fetches whole. Only a job without a start time can be told
+            # so, and only with a length, which is all "long" means:
+            # LongVideo itself refuses metadata without one, with the
+            # ValueError that fails the job (_fetch).
+            raise LongVideo(parse_info(info))
+        if status == "done" and start is None and set(data) == {"status", "info"}:
             # The same whitelist the runner applied, applied again: nothing
             # in info is used except through parse_info.
-            return parse_info(data["info"])
+            return parse_info(info), None
+        if status == "done" and start is not None and set(data) == {"status", "info", "window_start"}:
+            # A window begins with the fragment that holds the start asked
+            # for: at or before it, and less than the longest window a
+            # runner can be set to fetch before it. A runner that says
+            # otherwise is not believed about the audio either.
+            begin = clean_window_start(data["window_start"], start, MAX_SECONDS_LIMIT)
+            if begin is None:
+                raise FetchError("failed")
+            return parse_info(info), begin
         raise FetchError("failed")
 
 

@@ -11,7 +11,7 @@ import { integratedLufs } from "../../core/static/audio/loudness.js";
 import { fetchErrorMessage } from "../../core/static/fetch.js";
 import { dbToGain } from "../../core/static/player.js";
 import { resultUrl, ShareError } from "../../core/static/share.js";
-import { loadApp, pickFile, setDecoded, settle, sleep, wavShape } from "./fake_dom.mjs";
+import { holdDecoding, loadApp, pickFile, setDecoded, settle, sleep, wavShape } from "./fake_dom.mjs";
 
 const RATE = 44100;
 const RESULT_ID = "0123456789abcdef0123456789abcdef";
@@ -743,7 +743,7 @@ test("a link that is not a YouTube video is refused on the device", async () => 
 
 test("a failed fetch shows plain words and leaves the page usable", async () => {
   const cases = [
-    [{ statuses: [{ status: "failed", error: "too_long" }] }, "too_long"],
+    [{ statuses: [{ status: "failed", error: "live" }] }, "live"],
     [{ statuses: [{ status: "failed", error: "blocked" }] }, "blocked"],
     [{ post: Promise.resolve(json({ error: "rate_limited" }, 429)) }, "rate_limited"],
     [{ post: Promise.resolve(json({ error: "busy" }, 503)) }, "busy"],
@@ -755,7 +755,7 @@ test("a failed fetch shows plain words and leaves the page usable", async () => 
     await until(() => page.el("yt-status").classes.has("error"), code);
     assert.equal(page.el("yt-status").textContent, fetchErrorMessage(code));
     assert.equal(page.el("editor").hidden, true);
-    if (code === "too_long") assert.match(page.el("yt-status").textContent, /10 minutes/);
+    if (code === "live") assert.match(page.el("yt-status").textContent, /live stream/);
     // A file can still be picked.
     await pickFile(page, "My Song.mp3", [SONG]);
     assert.equal(page.el("editor").hidden, false);
@@ -1004,4 +1004,617 @@ test("fetched audio over 64 MB is refused with its own words and never decoded",
   assert.equal(page.el("editor").hidden, true);
   assert.equal(page.el("yt-status").textContent, fetchErrorMessage("audio_too_large"));
   assert.notEqual(page.el("yt-status").textContent, fetchErrorMessage("zz_unknown"));
+});
+
+// --- long videos and windows of them (docs/PLAN.md 6.2) ------------------------------------
+
+const WINDOW_JOB_ID = "aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb";
+// An hour in 200 points of 18 s, hot from 1206 s to 1800 s: the ten minutes
+// with the most replays begin at 1200 s (20:00).
+const HOUR_MAP = Array.from({ length: 200 }, (_, i) => ({
+  start: i * 18, end: (i + 1) * 18, value: i >= 67 && i < 100 ? 1 : 0.1,
+}));
+const LONG = { status: "long", title: TITLE, duration: 3600, heatmap: HOUR_MAP };
+// The window the server cut begins a little before the start asked for.
+const WINDOW_DONE = { status: "done", title: TITLE, duration: 3600, heatmap: HOUR_MAP, window_start: 1195 };
+const ASK_WORDS = "This video is 1:00:00 long, and the server fetches up to 10 minutes of it at a time. "
+  + "The start time is set to the most replayed part. Change it if you like, then tap Fetch.";
+const WINDOW_AFTER = " For another part of the video, change the start time and tap Fetch.";
+
+// The fetcher for a long video: a job without a start answers from `first`
+// (in order, the last repeats); one with a start gets a job ID of its own,
+// answers from `second`, and is the only one with audio. `windowPosts`,
+// promises a test holds, answer the first requests for a window instead, in
+// order, and `lookUpPosts` the first requests without a start.
+function longFetcher({ first = [LONG], second = [WINDOW_DONE], windowPosts = [], lookUpPosts = [] } = {}) {
+  const polls = { [JOB_ID]: 0, [WINDOW_JOB_ID]: 0 };
+  const held = [...windowPosts];
+  const heldLookUps = [...lookUpPosts];
+  const core = server();
+  return (url, init) => {
+    if (url === "/fetch/api/jobs") {
+      if (!("start" in JSON.parse(init.body))) {
+        return heldLookUps.shift() ?? Promise.resolve(json({ job_id: JOB_ID }, 202));
+      }
+      return held.shift() ?? Promise.resolve(json({ job_id: WINDOW_JOB_ID }, 202));
+    }
+    for (const [id, statuses] of [[JOB_ID, first], [WINDOW_JOB_ID, second]]) {
+      if (url === `/fetch/api/jobs/${id}`) {
+        const status = statuses[Math.min(polls[id], statuses.length - 1)];
+        polls[id] += 1;
+        return Promise.resolve(json(status));
+      }
+    }
+    if (url === `/fetch/api/jobs/${WINDOW_JOB_ID}/audio`) return Promise.resolve(audioResponse());
+    return core(url, init);
+  };
+}
+
+const jobPosts = (page) => page.fetchCalls.filter((call) => call.url === "/fetch/api/jobs").map((call) => call.init.body);
+const LOOK_UP = `{"video_id":"${VIDEO_ID}"}`;
+
+// Loads the app and taps Fetch on a link to the long video; returns once the
+// page has asked where to start.
+async function askedWhereToStart(options = {}, link = `https://youtu.be/${VIDEO_ID}`) {
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: longFetcher(options) });
+  page.el("yt-link").value = link;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("yt-start-row").hidden, "the start field");
+  await settle();
+  return page;
+}
+
+test("the start field is hidden until a video turns out to be long", async () => {
+  const page = await loadApp({ fetchEnabled: "true", fetch: fetcher() });
+  assert.equal(page.el("yt-start-row").hidden, true);
+  setDecoded([LOUD_AT_30]);
+  page.el("yt-link").value = VIDEO_ID;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  // A video the server fetched whole never shows it.
+  assert.equal(page.el("yt-start-row").hidden, true);
+});
+
+test("a long video asks where to start before anything is downloaded", async () => {
+  const page = await askedWhereToStart();
+  // Asked once and answered long: no second request, no audio, no editor.
+  assert.deepEqual(fetchUrls(page), ["/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`]);
+  assert.deepEqual(jobPosts(page), [LOOK_UP]);
+  assert.deepEqual(page.decodedInputs(), []);
+  assert.equal(page.el("editor").hidden, true);
+  // The ten minutes with the most replays, as a time a person reads.
+  assert.equal(page.el("yt-start").value, "20:00");
+  assert.equal(page.el("yt-status").textContent, ASK_WORDS);
+  assert.equal(page.el("yt-status").classes.has("error"), false);
+  // Nothing more happens by itself.
+  await sleep(200);
+  assert.equal(page.fetchCalls.length, 2);
+});
+
+test("the next tap fetches the window the start field names, and rule 2 reads the heatmap in the window's time", async () => {
+  const page = await askedWhereToStart();
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  // Only now does a start time leave the device: one whole number.
+  assert.deepEqual(jobPosts(page), [LOOK_UP, `{"video_id":"${VIDEO_ID}","start":1200}`]);
+  assert.deepEqual(fetchUrls(page).slice(2),
+    ["/fetch/api/jobs", `/fetch/api/jobs/${WINDOW_JOB_ID}`, `/fetch/api/jobs/${WINDOW_JOB_ID}/audio`]);
+  assert.deepEqual(page.decodedInputs().map((bytes) => [...bytes]), [AUDIO_BYTES]);
+  // The window begins at 1195 s, so its hot part begins 11 s in.
+  assert.equal(page.el("selection-readout").textContent, "0:11.0 to 0:26.0, 15.0 s (the maximum)");
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE} from 19:55, 1:00.0. The selection is on the most replayed stretch; drag the handles to change it.`
+    + WINDOW_AFTER);
+  assert.equal(page.el("name").value, TITLE);
+  // The field stays, with the start that was fetched, for the next part.
+  assert.equal(page.el("yt-start-row").hidden, false);
+  assert.equal(page.el("yt-start").value, "20:00");
+});
+
+test("a link with a timestamp is fetched from there at once, and the selection starts at it", async () => {
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true",
+    fetch: longFetcher({ second: [{ ...WINDOW_DONE, heatmap: null }] }) });
+  page.el("yt-link").value = `https://www.youtube.com/watch?v=${VIDEO_ID}&t=20m3s&si=TrackingToken123`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  // One tap: the look-up, then the window from the link's own second.
+  assert.deepEqual(jobPosts(page), [LOOK_UP, `{"video_id":"${VIDEO_ID}","start":1203}`]);
+  assert.equal(page.fetchCalls.length, 5);
+  for (const { url, init } of page.fetchCalls) {
+    const sent = url + " " + JSON.stringify(init ?? {});
+    assert.ok(!sent.includes("TrackingToken123") && !sent.includes("20m3s") && !sent.includes("youtube"), sent);
+  }
+  // Rule 1: 1203 s is 8 s into a window that begins at 1195 s.
+  assert.equal(page.el("selection-readout").textContent, "0:08.0 to 0:23.0, 15.0 s (the maximum)");
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE} from 19:55, 1:00.0. The selection starts at the link's timestamp; drag the handles to change it.`
+    + WINDOW_AFTER);
+  // Shown, so the user sees what was fetched and can ask for another part.
+  assert.equal(page.el("yt-start-row").hidden, false);
+  assert.equal(page.el("yt-start").value, "20:03");
+});
+
+test("a timestamp at or past the end of a long video is not sent: the page asks instead", async () => {
+  for (const timestamp of ["1h", "2h", "3600"]) {
+    const page = await askedWhereToStart({}, `https://youtu.be/${VIDEO_ID}?t=${timestamp}`);
+    assert.deepEqual(jobPosts(page), [LOOK_UP]);
+    assert.equal(page.el("yt-start").value, "20:00");
+    assert.equal(page.el("yt-status").textContent, ASK_WORDS);
+  }
+});
+
+test("a start the user typed is where the selection begins", async () => {
+  const page = await askedWhereToStart();
+  // The iPhone's number pad has a point, no colon: 20.05 is 20:05.
+  page.el("yt-start").value = "20.05";
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.deepEqual(jobPosts(page), [LOOK_UP, `{"video_id":"${VIDEO_ID}","start":1205}`]);
+  // 1205 s is 10 s into the window, and the heatmap does not get a say.
+  assert.equal(page.el("selection-readout").textContent, "0:10.0 to 0:25.0, 15.0 s (the maximum)");
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE} from 19:55, 1:00.0. The selection starts at the time you chose; drag the handles to change it.`
+    + WINDOW_AFTER);
+  // What the user typed stays as typed.
+  assert.equal(page.el("yt-start").value, "20.05");
+});
+
+test("Enter in the start field fetches too", async () => {
+  const page = await askedWhereToStart();
+  page.el("yt-start").dispatch("keydown", { key: "a" });
+  await settle();
+  assert.equal(jobPosts(page).length, 1);
+  page.el("yt-start").dispatch("keydown", { key: "Enter" });
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.equal(jobPosts(page)[1], `{"video_id":"${VIDEO_ID}","start":1200}`);
+});
+
+test("a start that is no time, or lies at or past the end, is refused on the device", async () => {
+  const page = await askedWhereToStart();
+  for (const [value, code] of [["soon", "bad_time"], ["", "bad_time"], ["1:2:3:4", "bad_time"], ["-5", "bad_time"],
+    ["1:00:00", "past_end"], ["2:00:00", "past_end"], ["3600", "past_end"]]) {
+    page.el("yt-start").value = value;
+    page.el("yt-fetch").dispatch("click");
+    await settle();
+    assert.equal(page.el("yt-status").textContent, fetchErrorMessage(code), value);
+    assert.equal(page.el("yt-status").classes.has("error"), true);
+  }
+  // Nothing was asked of the server for any of them, and the field is still there.
+  assert.deepEqual(jobPosts(page), [LOOK_UP]);
+  assert.equal(page.el("yt-start-row").hidden, false);
+  // The last second of the video is a start.
+  page.el("yt-start").value = "59:59";
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  assert.equal(jobPosts(page)[1], `{"video_id":"${VIDEO_ID}","start":3599}`);
+});
+
+test("without a heatmap the start field begins at the beginning", async () => {
+  const page = await askedWhereToStart({ first: [{ ...LONG, heatmap: null }], second: [{ ...WINDOW_DONE, heatmap: null,
+    window_start: 0 }] });
+  assert.equal(page.el("yt-start").value, "0:00");
+  assert.equal(page.el("yt-status").textContent, ASK_WORDS.replace("the most replayed part", "the beginning"));
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.equal(jobPosts(page)[1], `{"video_id":"${VIDEO_ID}","start":0}`);
+  // The page's own guess, not the user's: rule 3 places the selection.
+  assert.match(page.el("yt-status").textContent, /^Never Gonna \(Live\)\.Remix from 0:00, 1:00\.0\. The selection starts on the loudest stretch;/);
+});
+
+test("another video starts over with a look-up of its own", async () => {
+  const page = await askedWhereToStart();
+  page.el("yt-start").value = "5:00";
+  page.el("yt-link").value = `https://youtu.be/${OTHER_VIDEO_ID}`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the second look-up");
+  await settle();
+  // Not a window of the first video from 5:00, and not a start for the second.
+  assert.equal(jobPosts(page)[1], `{"video_id":"${OTHER_VIDEO_ID}"}`);
+  // The fake fetcher calls every video long: the field is filled afresh.
+  assert.equal(page.el("yt-start").value, "20:00");
+});
+
+test("picking a file puts the YouTube box back as it was", async () => {
+  const page = await askedWhereToStart();
+  await pickFile(page, "My Song.mp3", [SONG]);
+  assert.equal(page.el("yt-start-row").hidden, true);
+  assert.equal(page.el("yt-start").value, "");
+  assert.equal(page.el("yt-status").textContent, "");
+  // The same link again is looked up again: nothing remembers the old answer.
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the second look-up");
+  assert.equal(jobPosts(page)[1], LOOK_UP);
+});
+
+test("an answer to a window request that is no window is refused", async () => {
+  for (const second of [[LONG], [{ ...WINDOW_DONE, window_start: undefined }], [{ ...WINDOW_DONE, window_start: -5 }],
+    [{ ...WINDOW_DONE, window_start: "1195" }]]) {
+    const page = await askedWhereToStart({ second });
+    page.el("yt-fetch").dispatch("click");
+    await until(() => page.el("yt-status").classes.has("error"), "the refusal");
+    assert.equal(page.el("yt-status").textContent, fetchErrorMessage("bad_response"));
+    assert.equal(page.el("editor").hidden, true);
+    // The audio of such an answer is never asked for.
+    assert.ok(!fetchUrls(page).some((url) => url.endsWith("/audio")));
+    assert.equal(page.el("yt-start-row").hidden, false);
+  }
+});
+
+test("the server's refusal of a window is shown, and the field stays for another try", async () => {
+  for (const code of ["past_end", "live", "blocked", "timeout"]) {
+    const page = await askedWhereToStart({ second: [{ status: "failed", error: code }] });
+    page.el("yt-fetch").dispatch("click");
+    await until(() => page.el("yt-status").classes.has("error"), code);
+    assert.equal(page.el("yt-status").textContent, fetchErrorMessage(code));
+    assert.equal(page.el("yt-start-row").hidden, false);
+    assert.equal(page.el("yt-start").value, "20:00");
+    // Another start is another request for a window, not a new look-up.
+    page.el("yt-start").value = "10:00";
+    page.el("yt-fetch").dispatch("click");
+    await until(() => jobPosts(page).length === 3, "the next window request");
+    assert.equal(jobPosts(page)[2], `{"video_id":"${VIDEO_ID}","start":600}`);
+  }
+});
+
+test("a second tap while a window is on its way opens no second job", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const page = await askedWhereToStart({ windowPosts: [held] });
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  page.el("yt-fetch").dispatch("click");
+  page.el("yt-start").dispatch("keydown", { key: "Enter" });
+  await settle();
+  assert.equal(jobPosts(page).length, 2);
+  assert.match(page.el("yt-status").textContent, /^Fetching up to 10 minutes from 20:00/);
+  release(json({ job_id: WINDOW_JOB_ID }, 202));
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.equal(jobPosts(page).length, 2);
+});
+
+test("after a window, the next tap fetches the part the field now names", async () => {
+  const page = await askedWhereToStart();
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  page.el("yt-start").value = "45:00";
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 3, "the second window request");
+  // No new look-up: the video is known to be long.
+  assert.equal(jobPosts(page)[2], `{"video_id":"${VIDEO_ID}","start":2700}`);
+  // Finished before the next test begins: what a page decodes is recorded in one place for them all.
+  await until(() => !page.el("editor").hidden, "the editor");
+});
+
+test("a tap for another part while a window is on its way replaces it", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const page = await askedWhereToStart({ windowPosts: [held], second: [{ ...WINDOW_DONE, window_start: 2695 }] });
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the first window request");
+  // Not ignored: the field names another part now.
+  page.el("yt-start").value = "45:00";
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.deepEqual(jobPosts(page).slice(1),
+    [`{"video_id":"${VIDEO_ID}","start":1200}`, `{"video_id":"${VIDEO_ID}","start":2700}`]);
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE} from 44:55, 1:00.0. The selection starts at the time you chose; drag the handles to change it.`
+    + WINDOW_AFTER);
+  // The first request's answer arrives late and changes nothing.
+  const calls = page.fetchCalls.length;
+  release(json({ job_id: WINDOW_JOB_ID }, 202));
+  await sleep(100);
+  assert.equal(page.fetchCalls.length, calls);
+  assert.equal(page.decodedInputs().length, 1);
+});
+
+test("the same video under a link with another timestamp is fetched from that timestamp", async () => {
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true",
+    fetch: longFetcher({ second: [{ ...WINDOW_DONE, heatmap: null }] }) });
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m3s`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.equal(page.el("yt-start").value, "20:03");
+  // The same video again, pasted with another time and the field untouched.
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m10s`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 3 && !page.el("editor").hidden, "the second window");
+  // No new look-up, and not 20:03 again in the new link's name.
+  assert.equal(jobPosts(page)[2], `{"video_id":"${VIDEO_ID}","start":1210}`);
+  assert.equal(page.el("yt-start").value, "20:10");
+  // Rule 1 at the new time: 1210 s is 15 s into a window that begins at 1195 s.
+  assert.equal(page.el("selection-readout").textContent, "0:15.0 to 0:30.0, 15.0 s (the maximum)");
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE} from 19:55, 1:00.0. The selection starts at the link's timestamp; drag the handles to change it.`
+    + WINDOW_AFTER);
+  // The same link once more is the same part once more: the field's own start.
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 4, "the third window request");
+  assert.equal(jobPosts(page)[3], `{"video_id":"${VIDEO_ID}","start":1210}`);
+  // Finished before the next test begins: what a page decodes is recorded in one place for them all.
+  await until(() => !page.el("editor").hidden, "the editor");
+});
+
+test("a link that names no time any more is asked about again, with nothing fetched", async () => {
+  // Without its time, and with one that lies past the video's end.
+  for (const link of [`https://youtu.be/${VIDEO_ID}`, `https://youtu.be/${VIDEO_ID}?t=2h`]) {
+    setDecoded([LOUD_AT_30]);
+    const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: longFetcher() });
+    page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m3s`;
+    page.el("yt-fetch").dispatch("click");
+    await until(() => !page.el("editor").hidden, "the editor");
+    assert.equal(page.el("yt-start").value, "20:03");
+    page.el("yt-link").value = link;
+    page.el("yt-fetch").dispatch("click");
+    await settle();
+    // Not 20:03 again: that was the other link's time.
+    assert.equal(jobPosts(page).length, 2, link);
+    assert.equal(page.el("yt-start").value, "20:00");
+    assert.equal(page.el("yt-status").textContent, ASK_WORDS);
+  }
+});
+
+test("a start the user typed is kept when the same video's link changes", async () => {
+  const page = await askedWhereToStart();
+  page.el("yt-start").value = "5:00";
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=30m`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  // The field is what the user sees and typed in: it is what is fetched.
+  assert.equal(jobPosts(page)[1], `{"video_id":"${VIDEO_ID}","start":300}`);
+  assert.equal(page.el("yt-start").value, "5:00");
+  // Finished before the next test begins: what a page decodes is recorded in one place for them all.
+  await until(() => !page.el("editor").hidden, "the editor");
+});
+
+test("a shared link to the same video with another timestamp is fetched from that timestamp", async () => {
+  const page = await askedWhereToStart();
+  assert.equal(page.el("yt-start").value, "20:00");
+  page.location.hash = fragment(`https://youtu.be/${VIDEO_ID}?t=30m`);
+  page.fireWindow("hashchange");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  assert.equal(jobPosts(page)[1], `{"video_id":"${VIDEO_ID}","start":1800}`);
+  assert.equal(page.el("yt-start").value, "30:00");
+  // Finished before the next test begins: what a page decodes is recorded in one place for them all.
+  await until(() => !page.el("editor").hidden, "the editor");
+});
+
+test("asking again stops a window that is on its way", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: longFetcher({ windowPosts: [held] }) });
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m3s`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  // The link loses its time while that window is still on its way.
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}`;
+  page.el("yt-fetch").dispatch("click");
+  await settle();
+  assert.equal(page.el("yt-start").value, "20:00");
+  assert.equal(page.el("yt-status").textContent, ASK_WORDS);
+  // The window's answer arrives after the question and does not replace it.
+  release(json({ job_id: WINDOW_JOB_ID }, 202));
+  await sleep(100);
+  assert.equal(jobPosts(page).length, 2);
+  assert.deepEqual(page.decodedInputs(), []);
+  assert.equal(page.el("editor").hidden, true);
+  assert.equal(page.el("yt-status").textContent, ASK_WORDS);
+  // And the next tap is not held back by the fetch that was stopped.
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 3, "the next window request");
+  assert.equal(jobPosts(page)[2], `{"video_id":"${VIDEO_ID}","start":1200}`);
+  // Finished before the next test begins: what a page decodes is recorded in one place for them all.
+  await until(() => !page.el("editor").hidden, "the editor");
+});
+
+test("a second tap on a link with a timestamp while its window is on its way opens no second job", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: longFetcher({ windowPosts: [held] }) });
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m3s`;
+  page.el("yt-fetch").dispatch("click");
+  // One tap made both requests: the look-up, then the window from the link's time.
+  await until(() => jobPosts(page).length === 2, "the window request");
+  page.el("yt-fetch").dispatch("click");
+  page.el("yt-link").dispatch("keydown", { key: "Enter" });
+  await settle();
+  assert.equal(jobPosts(page).length, 2);
+  release(json({ job_id: WINDOW_JOB_ID }, 202));
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.equal(jobPosts(page).length, 2);
+});
+
+test("a link that gets the very time of the window on its way opens no second job and places the selection", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const page = await askedWhereToStart({ windowPosts: [held] });
+  // The page's own suggestion, 20:00, is fetched as it stands.
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  // Before it arrives, the link is given that very second as its timestamp.
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m`;
+  page.el("yt-fetch").dispatch("click");
+  await settle();
+  assert.equal(jobPosts(page).length, 2);
+  assert.match(page.el("yt-status").textContent, /^Fetching up to 10 minutes from 20:00/);
+  release(json({ job_id: WINDOW_JOB_ID }, 202));
+  await until(() => !page.el("editor").hidden, "the editor");
+  // One window, and the link's word on it: rule 1, with 1200 s being 5 s into
+  // a window that begins at 1195 s. The heatmap's hot part begins at 0:11.
+  assert.equal(jobPosts(page).length, 2);
+  assert.equal(page.el("selection-readout").textContent, "0:05.0 to 0:20.0, 15.0 s (the maximum)");
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE} from 19:55, 1:00.0. The selection starts at the link's timestamp; drag the handles to change it.`
+    + WINDOW_AFTER);
+  assert.equal(page.el("yt-start").value, "20:00");
+});
+
+test("the time of the window on its way, typed, opens no second job and is the user's choice", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: longFetcher({ windowPosts: [held] }) });
+  // One tap: the look-up, then the window from the link's own second.
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m3s`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  // The same second, as the number pad writes it.
+  page.el("yt-start").value = "20.03";
+  page.el("yt-fetch").dispatch("click");
+  await settle();
+  assert.equal(jobPosts(page).length, 2);
+  release(json({ job_id: WINDOW_JOB_ID }, 202));
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.equal(jobPosts(page).length, 2);
+  // Where the link's time would have put it, in the words for a typed start.
+  assert.equal(page.el("selection-readout").textContent, "0:08.0 to 0:23.0, 15.0 s (the maximum)");
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE} from 19:55, 1:00.0. The selection starts at the time you chose; drag the handles to change it.`
+    + WINDOW_AFTER);
+  assert.equal(page.el("yt-start").value, "20.03");
+});
+
+test("the field put back as the page filled it gives the window on its way back to the heatmap", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const page = await askedWhereToStart({ windowPosts: [held] });
+  // 20:00 typed in another way is the user's own start.
+  page.el("yt-start").value = "20.00";
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  // Then the field is as the page filled it again: the last tap counts.
+  page.el("yt-start").value = "20:00";
+  page.el("yt-fetch").dispatch("click");
+  await settle();
+  assert.equal(jobPosts(page).length, 2);
+  release(json({ job_id: WINDOW_JOB_ID }, 202));
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.equal(jobPosts(page).length, 2);
+  assert.equal(page.el("selection-readout").textContent, "0:11.0 to 0:26.0, 15.0 s (the maximum)");
+  assert.equal(page.el("yt-status").textContent,
+    `${TITLE} from 19:55, 1:00.0. The selection is on the most replayed stretch; drag the handles to change it.`
+    + WINDOW_AFTER);
+});
+
+test("a video too long for its most replayed part to be asked for gets the latest start there is", async () => {
+  // 200 hours, hotter towards the end: the best ten minutes are the last,
+  // far past 99:59:59, the latest start the fetcher takes.
+  const heatmap = Array.from({ length: 200 }, (_, i) => ({ start: i * 3600, end: (i + 1) * 3600, value: (i + 1) / 200 }));
+  const page = await askedWhereToStart({
+    first: [{ ...LONG, duration: 720000, heatmap }],
+    second: [{ ...WINDOW_DONE, duration: 720000, heatmap, window_start: 359990 }],
+  });
+  assert.equal(page.el("yt-start").value, "99:59:59");
+  // A start the page can send: the next tap fetches it.
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 2, "the window request");
+  assert.equal(jobPosts(page)[1], `{"video_id":"${VIDEO_ID}","start":359999}`);
+  // Finished before the next test begins: what a page decodes is recorded in one place for them all.
+  await until(() => !page.el("editor").hidden, "the editor");
+});
+
+test("asking again also stops a window that has arrived and is still being decoded", async () => {
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: longFetcher() });
+  const release = holdDecoding();
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m3s`;
+  page.el("yt-fetch").dispatch("click");
+  // The window's audio is here and with the decoder: no request is on its way any more.
+  await until(() => page.decodedInputs().length === 1, "the decode");
+  assert.equal(page.el("yt-status").textContent, "Reading the audio…");
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}`;
+  page.el("yt-fetch").dispatch("click");
+  await settle();
+  assert.equal(page.el("yt-status").textContent, ASK_WORDS);
+  release();
+  await sleep(100);
+  // The decoded window does not take the question's place.
+  assert.equal(page.el("yt-status").textContent, ASK_WORDS);
+  assert.equal(page.el("editor").hidden, true);
+  assert.equal(page.el("yt-start").value, "20:00");
+  assert.equal(jobPosts(page).length, 2);
+});
+
+test("a timestamp that changes while the look-up is on its way is the one that is fetched", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true",
+    fetch: longFetcher({ lookUpPosts: [held], second: [{ ...WINDOW_DONE, heatmap: null }] }) });
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m3s`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 1, "the look-up");
+  // Before the server has answered, the link in the box gets another time.
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m10s`;
+  page.el("yt-fetch").dispatch("click");
+  await settle();
+  // No second look-up for the same video.
+  assert.equal(jobPosts(page).length, 1);
+  release(json({ job_id: JOB_ID }, 202));
+  await until(() => !page.el("editor").hidden, "the editor");
+  // Not 20:03, which the link no longer says.
+  assert.deepEqual(jobPosts(page), [LOOK_UP, `{"video_id":"${VIDEO_ID}","start":1210}`]);
+  assert.equal(page.el("yt-start").value, "20:10");
+  assert.equal(page.el("selection-readout").textContent, "0:15.0 to 0:30.0, 15.0 s (the maximum)");
+});
+
+test("a timestamp taken away while the look-up is on its way leaves the page asking", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: longFetcher({ lookUpPosts: [held] }) });
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20m3s`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => jobPosts(page).length === 1, "the look-up");
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}`;
+  page.el("yt-fetch").dispatch("click");
+  release(json({ job_id: JOB_ID }, 202));
+  await until(() => !page.el("yt-start-row").hidden, "the start field");
+  await sleep(100);
+  // Nothing is fetched from 20:03 in the name of a link that names no time.
+  assert.deepEqual(jobPosts(page), [LOOK_UP]);
+  assert.equal(page.el("yt-start").value, "20:00");
+  assert.equal(page.el("yt-status").textContent, ASK_WORDS);
+});
+
+test("a timestamp that changes while a short video is on its way moves the selection, with one job", async () => {
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  setDecoded([LOUD_AT_30]);
+  const page = await loadApp({ maxClipSeconds: "15", fetchEnabled: "true", fetch: fetcher({ post: held }) });
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=10`;
+  page.el("yt-fetch").dispatch("click");
+  await until(() => page.fetchCalls.length === 1, "the job request");
+  page.el("yt-link").value = `https://youtu.be/${VIDEO_ID}?t=20`;
+  page.el("yt-fetch").dispatch("click");
+  release(json({ job_id: JOB_ID }, 202));
+  await until(() => !page.el("editor").hidden, "the editor");
+  assert.deepEqual(fetchUrls(page), ["/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}/audio`]);
+  // Rule 1 with the time the link has now.
+  assert.equal(page.el("selection-readout").textContent, "0:20.0 to 0:35.0, 15.0 s (the maximum)");
 });

@@ -28,7 +28,7 @@ import helpers  # noqa: F401  (puts core/ and fetcher/ on sys.path)
 from strange_ringtone_fetch import server as server_module
 from strange_ringtone_fetch.config import DEFAULT_RUNNER_URL, Settings
 from strange_ringtone_fetch.jobs import Jobs, QueueFull
-from strange_ringtone_fetch.metadata import FetchError
+from strange_ringtone_fetch.metadata import FetchError, Metadata
 from strange_ringtone_fetch.runner_client import RunnerClient
 from strange_ringtone_fetch.server import FetchServer, Handler, parse_job_request, prepare_scratch
 from strange_ringtone_runner import server as runner_server_module
@@ -114,8 +114,11 @@ def build_request(method: str, path: str, headers: list[tuple[str, str]] | None 
     return ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1") + body
 
 
-def job_body(video_id: str = VIDEO_ID) -> bytes:
-    return json.dumps({"video_id": video_id}).encode("utf-8")
+def job_body(video_id: str = VIDEO_ID, start: int | None = None) -> bytes:
+    body: dict[str, Any] = {"video_id": video_id}
+    if start is not None:
+        body["start"] = start
+    return json.dumps(body).encode("utf-8")
 
 
 def wait_for(predicate: Callable[[], bool], what: str) -> None:
@@ -184,12 +187,14 @@ class ServerTestCase(unittest.TestCase):
     def job_headers(self, length: int, origin: str = ORIGIN) -> list[tuple[str, str]]:
         return [("Origin", origin), ("Content-Type", "application/json"), ("Content-Length", str(length))]
 
-    def post_job(self, video_id: str = VIDEO_ID, extra: list[tuple[str, str]] | None = None) -> Response:
-        body = job_body(video_id)
+    def post_job(self, video_id: str = VIDEO_ID, extra: list[tuple[str, str]] | None = None,
+                 start: int | None = None) -> Response:
+        body = job_body(video_id, start)
         return self.request("POST", JOBS, self.job_headers(len(body)) + (extra or []), body)
 
-    def create_job(self, video_id: str = VIDEO_ID, extra: list[tuple[str, str]] | None = None) -> str:
-        response = self.post_job(video_id, extra)
+    def create_job(self, video_id: str = VIDEO_ID, extra: list[tuple[str, str]] | None = None,
+                   start: int | None = None) -> str:
+        response = self.post_job(video_id, extra, start)
         self.assertEqual(response.status, 202, response.body)
         job_id = response.json()["job_id"]
         return job_id
@@ -205,7 +210,7 @@ class ServerTestCase(unittest.TestCase):
             if response.status != 200:
                 return False
             answers.append(response.json())
-            return answers[-1]["status"] in ("done", "failed")
+            return answers[-1]["status"] in ("done", "failed", "long")
 
         wait_for(finished, "the job to finish")
         return answers[-1]
@@ -550,7 +555,54 @@ class BodyTest(ServerTestCase):
         self.assertScratchEmpty()
 
     def test_parse_job_request(self) -> None:
-        self.assertEqual(parse_job_request(b'  {"video_id" : "-_-_-_-_-_-"}\n'), "-_-_-_-_-_-")
+        self.assertEqual(parse_job_request(b'  {"video_id" : "-_-_-_-_-_-"}\n'), ("-_-_-_-_-_-", None))
+        self.assertEqual(parse_job_request(b'{"video_id": "-_-_-_-_-_-", "start": 0}'), ("-_-_-_-_-_-", 0))
+        self.assertEqual(parse_job_request(b'{"start":359999,"video_id":"-_-_-_-_-_-"}'), ("-_-_-_-_-_-", 359_999))
+
+    def test_a_start_time_is_a_whole_number_of_seconds_or_the_request_is_refused(self) -> None:
+        # The start ends up in the arguments of the runner's window program:
+        # a JSON integer within the bound, and nothing else, gets that far.
+        for start in ("-1", "360000", "1e3", "90.0", "90.5", '"90"', "true", "false", "null", "[90]", '{"s": 90}',
+                      "1" + "0" * 30, '""'):
+            with self.subTest(start=start):
+                body = b'{"video_id": "dQw4w9WgXcQ", "start": %s}' % start.encode("ascii")
+                data = build_request("POST", JOBS, self.job_headers(len(body)), body)
+                self.assertJsonError(exchange(self.port, data), 400, "bad_start")
+        for label, body in {
+            "another key beside the start": b'{"video_id": "dQw4w9WgXcQ", "start": 5, "end": 9}',
+            "a renamed start": b'{"video_id": "dQw4w9WgXcQ", "Start": 5}',
+            "a start twice": b'{"video_id": "dQw4w9WgXcQ", "start": 5, "start": 6}',
+            "a start alone": b'{"start": 5}',
+        }.items():
+            with self.subTest(label):
+                data = build_request("POST", JOBS, self.job_headers(len(body)), body)
+                self.assertJsonError(exchange(self.port, data), 400, "bad_json")
+        # The ID is judged before the start.
+        body = b'{"video_id": "x", "start": "soon"}'
+        self.assertJsonError(exchange(self.port, build_request("POST", JOBS, self.job_headers(len(body)), body)),
+                             400, "bad_video_id")
+        self.assertEqual(len(self.server.jobs), 0)
+        self.assertEqual(self.runner.calls, [])
+        self.assertScratchEmpty()
+
+    def test_a_job_with_a_start_time_is_a_window_job(self) -> None:
+        job_id = self.create_job(VIDEO_ID, start=1234)
+        status = self.wait_done(job_id)
+        self.assertEqual(status["status"], "done")
+        self.assertEqual(status["window_start"], 1230.0)
+        self.assertEqual(self.runner.windows, [(VIDEO_ID, 1234)])
+        response = self.request("GET", f"{JOBS}/{job_id}/audio")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.body, b"AUDIO " + VIDEO_ID.encode("ascii"))
+
+    def test_a_long_video_s_status_is_long_with_its_length_and_no_audio(self) -> None:
+        self.runner.long[VIDEO_ID] = Metadata(title="A long one", duration=3600, heatmap=None)
+        job_id = self.create_job()
+        self.assertEqual(self.wait_done(job_id), {"status": "long", "title": "A long one", "duration": 3600})
+        self.assertJsonError(self.request("GET", f"{JOBS}/{job_id}/audio"), 404, "not_found")
+        # Asking for the audio took nothing away: the status still answers.
+        self.assertEqual(self.status(job_id).json()["status"], "long")
+        self.assertScratchEmpty()
 
     def test_body_shorter_than_length(self) -> None:
         data = build_request("POST", JOBS, self.job_headers(100), job_body())
@@ -746,7 +798,7 @@ class RateLimitTest(ServerTestCase):
                 changed.notify_all()
             return answer
 
-        def held_submit(video_id: str) -> str:
+        def held_submit(video_id: str, start: int | None = None) -> str:
             nonlocal submits
             with changed:
                 submits += 1
@@ -754,7 +806,7 @@ class RateLimitTest(ServerTestCase):
                     # This request's two looks and the other's first.
                     self.assertTrue(changed.wait_for(lambda: looks >= 3, DEADLINE))
                     changed.wait_for(lambda: looks >= 4, 0.5)
-            return real_submit(video_id)
+            return real_submit(video_id, start)
 
         statuses: list[int] = []
         lock = threading.Lock()
@@ -843,7 +895,7 @@ class _RacingJobs(Jobs):
     def is_full(self) -> bool:
         return False
 
-    def submit(self, video_id: str) -> str:
+    def submit(self, video_id: str, start: int | None = None) -> str:
         raise QueueFull()
 
 
@@ -874,9 +926,9 @@ class StatusTest(ServerTestCase):
         self.assertEqual(response.headers.get("Content-Type"), "application/json")
 
     def test_failed(self) -> None:
-        self.runner.failures[VIDEO_ID] = FetchError("too_long")
+        self.runner.failures[VIDEO_ID] = FetchError("blocked")
         job_id = self.create_job()
-        self.assertEqual(self.wait_done(job_id), {"status": "failed", "error": "too_long"})
+        self.assertEqual(self.wait_done(job_id), {"status": "failed", "error": "blocked"})
 
     def test_unknown_ids(self) -> None:
         for job_id in ("0" * 32, "f" * 32):
@@ -1029,6 +1081,52 @@ class FlowTest(ServerTestCase):
         # The runner handed its copy over once and deleted it.
         self.assertRunnerScratchEmpty()
 
+    def test_a_long_video_then_a_window_of_it(self) -> None:
+        # docs/PLAN.md 6.2, the whole chain with both stubs: the first job
+        # says the video is long and downloads nothing; the second, with a
+        # start time, brings ten minutes of it.
+        first = self.create_job("tooLong____")
+        status = self.wait_done(first)
+        self.assertEqual(sorted(status), ["duration", "heatmap", "status", "title"])
+        self.assertEqual((status["status"], status["duration"]), ("long", 3600))
+        self.assertEqual(status["title"], stub_title("tooLong____"))
+        self.assertJsonError(self.request("GET", f"{JOBS}/{first}/audio"), 404, "not_found")
+        self.assertScratchEmpty()
+        self.assertRunnerScratchEmpty()
+        second = self.create_job("tooLong____", start=1234)
+        status = self.wait_done(second)
+        self.assertEqual(sorted(status), ["duration", "heatmap", "status", "title", "window_start"])
+        self.assertEqual((status["status"], status["duration"], status["window_start"]), ("done", 3600, 1230.0))
+        response = self.request("GET", f"{JOBS}/{second}/audio")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.body, b"STUB-WINDOW\n" + b"tooLong____@1234")
+        self.assertScratchEmpty()
+        self.assertRunnerScratchEmpty()
+
+    def test_every_failure_of_a_window_job_leaves_both_scratch_directories_empty(self) -> None:
+        cases = {
+            "liveStream_": "live", "blocked____": "blocked", "notFound___": "not_found", "failing____": "failed",
+            "pastEnd____": "past_end", "winBlocked_": "blocked", "winTimeout_": "timeout", "winFailing_": "failed",
+            "winHanging_": "timeout",
+        }
+        self.start_runner(timeout=2)
+        with mock.patch("strange_ringtone_runner.ytdlp.DRAIN_SECONDS", 0.5):
+            for video_id, code in cases.items():
+                with self.subTest(video_id=video_id):
+                    job_id = self.create_job(video_id, start=1234)
+                    self.assertEqual(self.wait_done(job_id), {"status": "failed", "error": code})
+                    self.assertScratchEmpty()
+                    self.assertRunnerScratchEmpty()
+
+    def test_the_start_never_reaches_a_log(self) -> None:
+        job_id = self.create_job("tooLong____", start=3137)
+        self.assertEqual(self.wait_done(job_id)["window_start"], 3130.0)
+        self.assertEqual(self.request("GET", f"{JOBS}/{job_id}/audio").status, 200)
+        self.wait_for_log("GET /fetch/api/jobs/<id>/audio 200")
+        # Neither the start asked for nor where the window began.
+        self.assertNotIn("3137", self.log.getvalue())
+        self.assertNotIn("3130", self.log.getvalue())
+
     def test_the_log_never_holds_a_title_an_id_or_an_address(self) -> None:
         job_id = self.create_job("ctrlTitle__")
         self.wait_done(job_id)
@@ -1046,7 +1144,7 @@ class FlowTest(ServerTestCase):
         # S1: each failure the runner reports reaches the job as its code,
         # and neither the fetcher's scratch nor the runner's keeps anything.
         cases = {
-            "tooLong____": "too_long", "blocked____": "blocked", "notFound___": "not_found",
+            "liveStream_": "live", "rejected___": "failed", "blocked____": "blocked", "notFound___": "not_found",
             "failing____": "failed", "noAudio____": "failed", "notADict___": "failed", "hanging____": "timeout",
             "oversize___": "failed", "symlinked__": "failed",
         }
@@ -1071,10 +1169,10 @@ class FlowTest(ServerTestCase):
         # S1: the runner can reach the fetcher's port 8080 over `jobs`; a job
         # ID would let it collect the browser's download there. The runner
         # sees only the client's own token, which has the same shape.
-        seen: list[tuple[str, str]] = []
+        seen: list[tuple[str, str, int | None]] = []
         real = runner_server_module.parse_job_request
 
-        def recording(body: bytes) -> tuple[str, str]:
+        def recording(body: bytes) -> tuple[str, str, int | None]:
             result = real(body)
             seen.append(result)
             return result
@@ -1086,8 +1184,8 @@ class FlowTest(ServerTestCase):
                 self.assertEqual(self.wait_done(job_id)["status"], "done")
                 self.assertEqual(self.request("GET", f"{JOBS}/{job_id}/audio").status, 200)
                 job_ids.append(job_id)
-        self.assertEqual([video_id for video_id, _ in seen], [VIDEO_ID, OTHER_ID])
-        tokens = [token for _, token in seen]
+        self.assertEqual([video_id for video_id, _token, _start in seen], [VIDEO_ID, OTHER_ID])
+        tokens = [token for _video_id, token, _start in seen]
         for token in tokens:
             self.assertRegex(token, r"\A[0-9a-f]{32}\Z")
         self.assertEqual(len(set(tokens)), 2)

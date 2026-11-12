@@ -81,6 +81,22 @@ class DevStackWiringTest(unittest.TestCase):
         stack = load_stack()
         self.assertTrue(issubclass(stack.StubYtDlp, RunnerYtDlp))
 
+    def test_the_stack_never_runs_the_real_window_program(self) -> None:
+        # docs/PLAN.md 6.2: the runner's own window program would try to
+        # reach the address the stub yt-dlp made up. Offline means the stub
+        # for the second child too, given by name where the runner is built.
+        source = STACK.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(STACK))
+        runners = _calls(tree, "StubYtDlp")
+        self.assertEqual(len(runners), 1)
+        keywords = {keyword.arg: keyword.value for keyword in runners[0].keywords}
+        self.assertIn("window_command", keywords)
+        self.assertIn("WINDOW_STUB", ast.dump(keywords["window_command"]))
+        self.assertNotIn("WINDOW_COMMAND", source)
+        stack = load_stack()
+        self.assertEqual(stack.WINDOW_STUB, helpers.ROOT / "tests" / "stubs" / "window_stub.py")
+        self.assertTrue(stack.WINDOW_STUB.is_file())
+
     def test_the_stack_calls_no_entry_point(self) -> None:
         # No entry point's main() runs, so no route check runs and the stack
         # needs no setting (docs/PLAN.md 6.1): the override is never set here.

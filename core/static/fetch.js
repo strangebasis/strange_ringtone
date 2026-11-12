@@ -1,7 +1,10 @@
-// Fetching a clip from a YouTube link (docs/PLAN.md 6 and 7.4). The link is
-// parsed on this device and only its 11-character video ID is sent: the
+// Fetching a clip from a YouTube link (docs/PLAN.md 6, 6.2 and 7.4). The link
+// is parsed on this device and only its 11-character video ID is sent: the
 // fetcher builds the YouTube address itself, so nothing a user typed or
-// shared ever reaches it. Every URL here is a same-origin /fetch/ path, which
+// shared ever reaches it. A video longer than the server fetches whole comes
+// back as "long", with its length; the second request then carries the ID
+// and one whole number, the second to start at, and brings a window of the
+// audio from there. Every URL here is a same-origin /fetch/ path, which
 // the deployment's proxy forwards to the fetcher, so connect-src 'self'
 // covers them and the CSP stays exactly as it is.
 
@@ -12,6 +15,9 @@ export const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 // The fetcher's job IDs: 128 random bits as lower-case hex. Checked before an
 // ID from the server is built into a path, as share.js does for results.
 const JOB_ID_RE = /^[0-9a-f]{32}$/;
+
+/** The latest second a window may start at: 99:59:59, as the fetcher's MAX_START_SECONDS. */
+export const MAX_START_SECONDS = 359999;
 
 /** How often the job's status is asked for. */
 export const POLL_INTERVAL_MS = 2000;
@@ -40,28 +46,33 @@ const MAX_LINK_TEXT = 2048;
 // of a second is allowed and dropped. The digit counts keep the number small.
 const TIMESTAMP_RE = /^(?:(\d{1,3})h)?(?:(\d{1,5})m)?(?:(\d{1,6})(?:\.\d{0,6})?s?)?$/i;
 
-const STATUSES = new Set(["queued", "running", "done", "failed"]);
-// The fetcher's fixed job errors (docs/PLAN.md 6).
-const JOB_ERRORS = new Set(["blocked", "too_long", "not_found", "timeout", "failed"]);
+// A time as a person types it into the start field: up to three numbers with
+// ':', '.', ',' or spaces between them. The iPhone's number pad has a decimal
+// point and no colon, so a point separates the parts as a colon does.
+const START_PARTS_RE = /^\d{1,6}(?:[:.,\s]+\d{1,6}){0,2}$/;
+
+const STATUSES = new Set(["queued", "running", "done", "failed", "long"]);
+// The fetcher's fixed job errors (docs/PLAN.md 6 and 6.2).
+const JOB_ERRORS = new Set(["blocked", "live", "not_found", "past_end", "timeout", "failed"]);
 const MAX_TITLE_CHARACTERS = 200;
 
 // Plain words for every code the fetcher answers with, and for the few this
-// module adds itself (bad_link, network, bad_response, unavailable, expired,
-// gave_up, cancelled, audio_too_large). tests/test_frontend_js.py fails when
-// the fetcher gains a code that is missing here.
+// module adds itself (bad_link, bad_time, network, bad_response, unavailable,
+// expired, gave_up, cancelled, audio_too_large). tests/test_frontend_js.py
+// fails when the fetcher gains a code that is missing here.
 const MESSAGES = {
   // The job's own outcome.
   blocked: "YouTube would not hand this video to the server. Try again later, or save the audio another way and pick the file.",
-  // FETCH_MAX_SECONDS may be set lower, never above the page's 10-minute
-  // decode limit, so "at most" stays true either way.
-  too_long: "This video is longer than the server will fetch (at most 10 minutes). Pick a shorter video, or trim the audio first and pick the file.",
+  live: "This is a live stream. The server can fetch it once the stream has ended.",
   not_found: "This video could not be found. It may be private, removed or not available where the server is.",
+  past_end: "That start time is at or after the end of the video. Choose an earlier one.",
   timeout: "Fetching this video took too long. Try again in a moment.",
   failed: "The server could not fetch this video's audio. Try again, or try another video.",
   // Refusals of the request itself.
   rate_limited: "Too many fetches in the last minute. Wait a moment, then try again.",
   busy: "The server is busy with other fetches. Try again in a moment.",
   bad_video_id: "The server did not accept this video's ID. Check the link and try again.",
+  bad_start: "The server did not accept the start time. Enter it as minutes:seconds, for example 12:30, and try again.",
   bad_json: "The fetch request was refused. Reload the page and try again.",
   bad_origin: "The server refused this page's address. Open the app at the address it was set up for.",
   too_large: "The fetch request was larger than the server accepts. Reload the page and try again.",
@@ -75,6 +86,7 @@ const MESSAGES = {
   internal_error: "Something went wrong on the server. Try again.",
   // This page's own.
   bad_link: "That doesn't look like a link to a YouTube video. Copy the link from YouTube's Share button and paste it here.",
+  bad_time: "That doesn't look like a time. Enter minutes:seconds or hours:minutes:seconds, for example 12:30 or 1:23:45.",
   network: "The server could not be reached. Check the connection and try again.",
   bad_response: "The server sent an answer this page does not understand. Reload the page and try again.",
   unavailable: "YouTube fetching is not available on this server right now.",
@@ -123,6 +135,42 @@ export function parseTimestamp(value) {
   if (match === null) return null;
   const [, hours = "0", minutes = "0", seconds = "0"] = match;
   return Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds);
+}
+
+/**
+ * Seconds from a start time as a person types it, or null when it is not one.
+ * 1:23:45, 83:45 and a bare number of seconds, with ':', '.', ',' or spaces
+ * between the parts, and YouTube's own 1h23m45s.
+ * @param {string} text
+ * @returns {number | null} whole seconds, at most MAX_START_SECONDS
+ */
+export function parseStartTime(text) {
+  if (typeof text !== "string") return null;
+  const trimmed = text.trim();
+  if (trimmed === "") return null;
+  let seconds;
+  if (START_PARTS_RE.test(trimmed)) {
+    seconds = 0;
+    // 83:45 is 83 minutes: a part past 59 is taken as it is, not refused.
+    for (const part of trimmed.split(/[:.,\s]+/)) seconds = seconds * 60 + Number(part);
+  } else {
+    seconds = parseTimestamp(trimmed);
+    if (seconds === null) return null;
+  }
+  return Number.isSafeInteger(seconds) && seconds <= MAX_START_SECONDS ? seconds : null;
+}
+
+/**
+ * A number of seconds as the start field shows it: 0:00, 12:30, 1:23:45.
+ * @param {number} seconds
+ * @returns {string}
+ */
+export function formatStartTime(seconds) {
+  const whole = Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds)) : 0;
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const rest = String(whole % 60).padStart(2, "0");
+  return hours > 0 ? hours + ":" + String(minutes).padStart(2, "0") + ":" + rest : minutes + ":" + rest;
 }
 
 function parseWebAddress(text) {
@@ -205,14 +253,22 @@ function checkJobId(jobId) {
 }
 
 /**
- * Ask the fetcher for a video's audio. Only the ID is sent, as JSON with a
- * fixed Content-Type, which the fetcher requires exactly; the browser adds
- * the Origin header the fetcher checks.
+ * Ask the fetcher for a video's audio. Only the ID is sent, and with a start
+ * that one whole number, as JSON with a fixed Content-Type, which the fetcher
+ * requires exactly; the browser adds the Origin header the fetcher checks.
  * @param {string} videoId an 11-character ID (VIDEO_ID_RE)
+ * @param {number | null} [start] the second a window of a longer video
+ *   starts at (0 to MAX_START_SECONDS); null asks for the whole audio
  * @returns {Promise<string>} the job's 32-hex ID
  */
-export async function fetchJob(videoId) {
+export async function fetchJob(videoId, start = null) {
   if (typeof videoId !== "string" || !VIDEO_ID_RE.test(videoId)) throw new FetchError("bad_link");
+  const request = { video_id: videoId };
+  if (start !== null) {
+    // A whole number in the fetcher's range, or nothing is sent at all.
+    if (!Number.isInteger(start) || start < 0 || start > MAX_START_SECONDS) throw new FetchError("bad_time");
+    request.start = start;
+  }
   let response;
   try {
     response = await fetch("/fetch/api/jobs", {
@@ -220,7 +276,7 @@ export async function fetchJob(videoId) {
       credentials: "same-origin",
       cache: "no-store",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ video_id: videoId }),
+      body: JSON.stringify(request),
     });
   } catch {
     throw new FetchError("network");
@@ -243,15 +299,26 @@ function readStatus(payload) {
     if (!JOB_ERRORS.has(payload.error)) throw new FetchError("bad_response");
     throw new FetchError(payload.error);
   }
-  if (payload.status !== "done") return { status: payload.status };
+  if (payload.status !== "done" && payload.status !== "long") return { status: payload.status };
   const title = typeof payload.title === "string" ? [...payload.title.trim()].slice(0, MAX_TITLE_CHARACTERS).join("") : "";
   const duration = payload.duration;
-  return {
-    status: "done",
+  const metadata = {
     title: title === "" ? null : title,
     duration: typeof duration === "number" && Number.isFinite(duration) && duration > 0 ? duration : null,
     // suggestSelection checks every point and ignores a bad list.
     heatmap: Array.isArray(payload.heatmap) ? payload.heatmap : null,
+  };
+  if (payload.status === "long") {
+    // "Long" is a statement about the length: without one it says nothing.
+    if (metadata.duration === null) throw new FetchError("bad_response");
+    return { status: "long", ...metadata };
+  }
+  const windowStart = payload.window_start;
+  return {
+    status: "done",
+    ...metadata,
+    // Where a window's audio begins in the video; null for a whole download.
+    windowStart: typeof windowStart === "number" && Number.isFinite(windowStart) && windowStart >= 0 ? windowStart : null,
   };
 }
 
@@ -262,15 +329,17 @@ function delay(ms) {
 }
 
 /**
- * Poll a job until it is done.
+ * Poll a job until it is done, or until the fetcher says the video is long.
  * @param {string} jobId from fetchJob
  * @param {{intervalMs?: number, maxPolls?: number, onStatus?: (status: string) => void,
  *   signal?: AbortSignal}} [options] onStatus hears "queued" and "running";
  *   an aborted signal stops the polling with the code "cancelled"
- * @returns {Promise<{status: "done", title: string | null, duration: number | null, heatmap: unknown[] | null}>}
- *   rejects with a FetchError: the job's error when it failed, "expired"
- *   when the fetcher no longer knows it, "bad_response" for an answer that
- *   is not one, "gave_up" after maxPolls
+ * @returns {Promise<{status: "done" | "long", title: string | null, duration: number | null,
+ *   heatmap: unknown[] | null, windowStart?: number | null}>} "long" (always
+ *   with a duration) has no audio to fetch; "done" has windowStart, null
+ *   unless the audio is a window. Rejects with a FetchError: the job's error
+ *   when it failed, "expired" when the fetcher no longer knows it,
+ *   "bad_response" for an answer that is not one, "gave_up" after maxPolls
  */
 export async function pollJob(jobId, { intervalMs = POLL_INTERVAL_MS, maxPolls = MAX_POLLS, onStatus = null,
   signal = null } = {}) {
@@ -287,7 +356,7 @@ export async function pollJob(jobId, { intervalMs = POLL_INTERVAL_MS, maxPolls =
     }
     if (!response.ok) throw await refusal(response, "expired");
     const status = readStatus(await readJson(response));
-    if (status.status === "done") return status;
+    if (status.status === "done" || status.status === "long") return status;
     if (onStatus !== null) onStatus(status.status);
   }
   throw new FetchError("gave_up");

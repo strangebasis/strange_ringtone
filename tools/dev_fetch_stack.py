@@ -9,8 +9,10 @@ link>) in a browser on this machine. Four servers run in this one process:
   free port. It renders with the stub ffmpeg (tests/stubs/ffmpeg_stub.py)
   unless --ffmpeg names a local one, so the downloaded tone is a placeholder;
 - the runner from the checkout, on 127.0.0.1 and a free port, running the
-  stub yt-dlp (tests/stubs/ytdlp_stub.py) instead of yt-dlp. Nothing ever
-  talks to YouTube. The stub hands back --audio, or a generated 60-second
+  stub yt-dlp (tests/stubs/ytdlp_stub.py) instead of yt-dlp, and for a job
+  with a start time the stub window program (tests/stubs/window_stub.py)
+  instead of the runner's own, which would open a connection. Nothing ever
+  talks to YouTube. The stubs hand back --audio, or a generated 60-second
   WAV, as the "m4a" (the browser's decoder goes by content, not by name), with
   a heatmap that peaks about 60 % of the way in;
 - the fetcher from the checkout, on 127.0.0.1 and a free port. It talks to
@@ -21,10 +23,15 @@ link>) in a browser on this machine. Four servers run in this one process:
   the fetcher and everything else to the core, unchanged, as the
   deployment's reverse proxy does. PUBLIC_ORIGIN is http://127.0.0.1:<port>.
 
-Any 11-character video ID fetches the audio. The stub's fixed IDs show each
-failure instead: tooLong____, blocked____, notFound___, failing____,
-oversize___, noAudio____, hanging____ (a timeout after --timeout seconds),
-ctrlTitle__, hugeHeatmap and badHeatmap_ (see the stub's docstring).
+Any 11-character video ID fetches the audio. tooLong____ is a video of an
+hour: the page asks where to start, and the "window" it then fetches is the
+same audio again, whatever the start. The stubs' other fixed IDs show each
+failure: liveStream_, blocked____, notFound___, failing____, oversize___,
+noAudio____, hanging____ (a timeout after --timeout seconds), ctrlTitle__,
+hugeHeatmap and badHeatmap_ for a job without a start time, and pastEnd____,
+winBlocked_, winTimeout_, winFailing_ and winHanging_ for one with (paste a
+link with a timestamp, such as ...?v=pastEnd____&t=90; see the stubs'
+docstrings).
 
 No entry point's main() runs (the servers are built here directly), so
 neither the fetcher's nor the runner's default-route check runs, and the
@@ -68,6 +75,7 @@ from strange_ringtone_runner.ytdlp import YtDlp  # noqa: E402
 LOOPBACK = "127.0.0.1"
 FFMPEG_STUB = ROOT / "tests" / "stubs" / "ffmpeg_stub.py"
 YTDLP_STUB = ROOT / "tests" / "stubs" / "ytdlp_stub.py"
+WINDOW_STUB = ROOT / "tests" / "stubs" / "window_stub.py"
 RATE = 44100
 SECONDS = 60
 MAX_HEAD_BYTES = 65536
@@ -211,6 +219,9 @@ def main(argv: list[str] | None = None) -> int:
                 max_bytes=runner_settings.fetch_max_bytes,
                 timeout_seconds=runner_settings.fetch_timeout_seconds,
                 command=(sys.executable, "-I", str(YTDLP_STUB)),
+                # Never the runner's own window program: it would try to
+                # reach the address the stub yt-dlp made up.
+                window_command=(sys.executable, "-I", str(WINDOW_STUB)),
             ),
         )
         runner_port = runner.server_address[1]

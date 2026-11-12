@@ -4,9 +4,12 @@ Plain http.server, one request per connection, like the fetcher's. The
 wire protocol is three routes and nothing else:
 
 - GET /healthz: 200 "ok", revealing nothing, never waiting for a job;
-- POST /jobs with {"video_id", "job"}: the run itself, synchronously, under
-  one lock; the answer is {"status": "done", "info": {...}} with only the
-  whitelisted metadata (strange_ringtone_fetch.metadata) or
+- POST /jobs with {"video_id", "job"} and, for a window of a longer video,
+  "start" (docs/PLAN.md 6.2): the run itself, synchronously, under one lock;
+  the answer is {"status": "done", "info": {...}} with only the whitelisted
+  metadata (strange_ringtone_fetch.metadata), plus "window_start" for a job
+  with a start time; {"status": "long", "info": {...}} for a video longer
+  than the runner fetches whole, of which nothing was downloaded; or
   {"status": "failed", "error": code};
 - GET /jobs/<job>/audio: the audio, streamed once and deleted.
 
@@ -40,7 +43,7 @@ from typing import Any
 # shared metadata whitelist (docs/PLAN.md 6.1): reused, so the runner refuses
 # exactly what the fetcher refuses and answers exactly what it would keep.
 from strange_ringtone.http_guard import GuardError, body_length, require_content_type
-from strange_ringtone_fetch.metadata import VIDEO_ID_RE, FetchError, metadata_to_info
+from strange_ringtone_fetch.metadata import VIDEO_ID_RE, FetchError, LongVideo, clean_start, metadata_to_info
 
 from strange_ringtone_runner.config import SCRATCH_DIR, Settings
 from strange_ringtone_runner.ytdlp import YtDlp, default_prlimit
@@ -55,8 +58,9 @@ JOB_RE = re.compile(r"[0-9a-f]{32}")
 AUDIO_PATH_RE = re.compile(r"/jobs/([0-9a-f]{32})/audio")
 JSON_TYPE = "application/json"
 AUDIO_TYPE = "audio/mp4"
-# {"video_id": "<11>", "job": "<32>"} is about 60 bytes; 1 KiB leaves room
-# for whitespace and nothing that could cost anything to parse.
+# {"video_id": "<11>", "job": "<32>", "start": 359999} is about 80 bytes;
+# 1 KiB leaves room for whitespace and nothing that could cost anything to
+# parse.
 MAX_BODY_BYTES = 1024
 BUSY_RETRY_SECONDS = 5
 # An uncollected audio file is deleted this long after its run, so a fetcher
@@ -85,14 +89,17 @@ _LOG_METHOD_MAX = 16
 _LOG_ID_RE = re.compile(r"[0-9A-Fa-f]{32,}")
 
 
-def parse_job_request(body: bytes) -> tuple[str, str]:
-    """(video_id, job) from a POST body, or GuardError 400 with a code.
+def parse_job_request(body: bytes) -> tuple[str, str, int | None]:
+    """(video_id, job, start) from a POST body, or GuardError 400 with a code; start is None without one.
 
     Only a UTF-8 JSON object with exactly the keys video_id and job, both
-    strings, no key repeated, is a request (bad_json otherwise); the ID must
-    fullmatch VIDEO_ID_RE (bad_video_id) and the token JOB_RE (bad_job). The
-    ID is checked again here, although the fetcher checked it, because it
-    goes into the URL yt-dlp is given.
+    strings, and at most the key start beside them, no key repeated, is a
+    request (bad_json otherwise); the ID must fullmatch VIDEO_ID_RE
+    (bad_video_id), the token JOB_RE (bad_job), and a start must be a whole
+    number of seconds within the bound (bad_start, clean_start). The ID and
+    the start are checked again here, although the fetcher checked them,
+    because one goes into the URL yt-dlp is given and the other into the
+    window program's arguments.
     """
     try:
         text = body.decode("utf-8")
@@ -101,7 +108,7 @@ def parse_job_request(body: bytes) -> tuple[str, str]:
         # RecursionError: deep nesting, which a 1 KiB body can't reach in
         # CPython 3.12's decoder but another build's might.
         raise GuardError(400, "bad_json") from None
-    if not isinstance(data, dict) or set(data) != {"video_id", "job"}:
+    if not isinstance(data, dict) or set(data) not in ({"video_id", "job"}, {"video_id", "job", "start"}):
         raise GuardError(400, "bad_json")
     video_id, job = data["video_id"], data["job"]
     # A value that is not a string is not a request at all (SPEC 3.4).
@@ -113,7 +120,13 @@ def parse_job_request(body: bytes) -> tuple[str, str]:
     # exact: lowercase hex only, no '/', '.', or other script's digits.
     if not JOB_RE.fullmatch(job):
         raise GuardError(400, "bad_job")
-    return video_id, job
+    start: int | None = None
+    if "start" in data:
+        # A key that is there must hold a start: null is not "no start".
+        start = clean_start(data["start"])
+        if start is None:
+            raise GuardError(400, "bad_start")
+    return video_id, job, start
 
 
 def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -1086,14 +1099,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = body_length(
             headers.get_all("Content-Length") or [], headers.get_all("Transfer-Encoding") or [], MAX_BODY_BYTES
         )
-        video_id, job = parse_job_request(self._receive_body(length))
+        video_id, job, start = parse_job_request(self._receive_body(length))
         server = self.server
         # One job at a time (R1): a second request is refused, never queued,
         # so the runner holds one run's files at most.
         if not server.busy.acquire(blocking=False):
             raise GuardError(503, "busy", retry_after=BUSY_RETRY_SECONDS)
         try:
-            payload = server._run(video_id, job)
+            payload = server._run(video_id, job, start)
             self.send_json(200, payload)
         finally:
             if server.exit_after_answer:
@@ -1196,8 +1209,13 @@ class RunnerServer(http.server.ThreadingHTTPServer):
             self.server_close()
             raise
 
-    def _run(self, video_id: str, job: str) -> dict[str, Any]:
+    def _run(self, video_id: str, job: str, start: int | None = None) -> dict[str, Any]:
         """One run under the caller's hold of busy: the answer's payload, given after the clean-up (_clean_up).
+
+        Without start, yt-dlp downloads the audio, or the video turns out
+        longer than the runner fetches whole and the payload is "long" with
+        nothing held. With start, the job is a window of the audio from that
+        second (docs/PLAN.md 6.2).
 
         Only the job's own result, when the run produced one, is still in
         the scratch directory once this returns, as far as the clean-up
@@ -1217,11 +1235,19 @@ class RunnerServer(http.server.ThreadingHTTPServer):
         held: str | None = None
         try:
             try:
-                download = self.ytdlp.fetch(video_id, job_dir)
+                if start is None:
+                    download = self.ytdlp.fetch(video_id, job_dir)
+                else:
+                    download = self.ytdlp.fetch_window(video_id, job_dir, start)
                 results.hold(job, download.audio)
                 held = job
+            except LongVideo as long:
+                # Not a failure and not a result: nothing was downloaded, so
+                # nothing is held, and the same whitelist applies to what is
+                # said about the video.
+                payload: dict[str, Any] = {"status": "long", "info": metadata_to_info(long.metadata)}
             except FetchError as error:
-                payload: dict[str, Any] = {"status": "failed", "error": error.code}
+                payload = {"status": "failed", "error": error.code}
             except Exception:
                 # Anything else is "failed" with nothing of its text: an
                 # exception could quote a title or a path.
@@ -1230,6 +1256,10 @@ class RunnerServer(http.server.ThreadingHTTPServer):
                 # The whitelist on the runner's side: only the three cleaned
                 # values, in yt-dlp's names, ever leave this container.
                 payload = {"status": "done", "info": metadata_to_info(download.metadata)}
+                if download.window_start is not None:
+                    # Where the audio begins in the video: one number, checked
+                    # by read_window_result, beside the three cleaned values.
+                    payload["window_start"] = download.window_start
         finally:
             # Every path, success included (the audio was moved out above),
             # after the run and its sweep and before the answer, so no other

@@ -32,7 +32,7 @@ from unittest import mock
 
 import helpers  # noqa: F401  (puts core/ and fetcher/ on sys.path)
 from strange_ringtone_fetch import runner_client
-from strange_ringtone_fetch.metadata import ERROR_CODES, Download, FetchError, Metadata, parse_info
+from strange_ringtone_fetch.metadata import ERROR_CODES, Download, FetchError, LongVideo, Metadata, parse_info
 from strange_ringtone_fetch.runner_client import JOB_RE, RunnerClient
 
 MIB = 1024 * 1024
@@ -507,7 +507,9 @@ class ClientHappyPathTest(ClientTestCase):
         for code in ERROR_CODES:
             with self.subTest(code=code):
                 runner = self.use(json_response({"status": "failed", "error": code}), audio_response(AUDIO))
-                self.assertFailed(self.client(), code)
+                # Only a window can start past the end: a job without a
+                # start time is never told so.
+                self.assertFailed(self.client(), "failed" if code == "past_end" else code)
                 self.assertRequests(runner, ["POST"])
                 self.assertJobDirEmpty()
 
@@ -562,6 +564,146 @@ class ClientHappyPathTest(ClientTestCase):
         self.assertFailed(self.client())
         self.assertRequests(runner, ["POST", "GET"])
         self.assertJobDirEmpty()
+
+
+class ClientWindowTest(ClientTestCase):
+    """Long videos and windows of them (docs/PLAN.md 6.2): what is sent, and which answer fits which request."""
+
+    LONG: dict[str, Any] = {"status": "long", "info": dict(INFO, duration=3600)}
+
+    def window_done(self, begin: Any = 1230.0, **extra: Any) -> dict[str, Any]:
+        return {"status": "done", "info": INFO, "window_start": begin, **extra}
+
+    def assertWindowFailed(self, client: RunnerClient, code: str = "failed", start: int = 1234) -> None:
+        with self.assertRaises(FetchError) as raised:
+            client.fetch_window(VIDEO_ID, self.job_dir, start)
+        self.assertEqual(raised.exception.code, code)
+
+    def test_a_window_s_post_carries_the_start_beside_the_id_and_the_token(self) -> None:
+        runner = self.use(json_response(self.window_done()), audio_response(AUDIO))
+        download = self.client().fetch_window(VIDEO_ID, self.job_dir, 1234)
+        self.assertRequests(runner, ["POST", "GET"])
+        sent = json.loads(runner.requests[0].body.decode("utf-8"), object_pairs_hook=no_duplicates)
+        self.assertEqual(sorted(sent), ["job", "start", "video_id"])
+        self.assertEqual(sent["video_id"], VIDEO_ID)
+        self.assertEqual(sent["start"], 1234)
+        self.assertIs(type(sent["start"]), int)
+        self.assertTrue(JOB_RE.fullmatch(sent["job"]), sent["job"])
+        # The audio is collected exactly as a whole download's is.
+        self.assertEqual(runner.requests[1].path, f"/jobs/{sent['job']}/audio")
+        self.assertEqual(download.audio, self.job_dir / f"{VIDEO_ID}.m4a")
+        self.assertEqual(download.audio.read_bytes(), AUDIO)
+        self.assertEqual(download.metadata, parse_info(INFO))
+        self.assertEqual(download.window_start, 1230.0)
+
+    def test_a_download_has_no_window_start(self) -> None:
+        self.assertIsNone(self.accept(json_response(DONE), audio_response(AUDIO)).window_start)
+
+    def test_a_value_that_is_no_start_sends_nothing(self) -> None:
+        client = self.client()
+        for bad in (-1, 360_000, True, False, 1.5, 90.0, "90", None, [90], 10**30):
+            with self.subTest(start=bad), self.assertRaises(ValueError):
+                client.fetch_window(VIDEO_ID, self.job_dir, bad)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            client.fetch_window("../../etc/p", self.job_dir, 5)
+        self.assertEqual(self.runner.connections, 0)
+        self.assertJobDirEmpty()
+
+    def test_a_long_answer_is_not_a_failure_and_nothing_is_collected(self) -> None:
+        runner = self.use(json_response(self.LONG), audio_response(AUDIO))
+        with self.assertRaises(LongVideo) as raised:
+            self.client().fetch(VIDEO_ID, self.job_dir)
+        # The same whitelist as for a finished job: the title is cleaned again.
+        self.assertEqual(raised.exception.metadata, parse_info(self.LONG["info"]))
+        self.assertEqual(raised.exception.metadata.duration, 3600)
+        self.assertNotEqual(raised.exception.metadata.title, DIRTY_TITLE)
+        # No GET: there is no audio to ask for.
+        self.assertRequests(runner, ["POST"])
+        self.assertJobDirEmpty()
+
+    def test_a_long_answer_must_name_a_length_and_fit_a_job_without_a_start(self) -> None:
+        cases: dict[str, Any] = {
+            "no length": {"status": "long", "info": {"title": "T"}},
+            "a length that is no number": {"status": "long", "info": {"duration": "3600"}},
+            "a length of zero": {"status": "long", "info": {"duration": 0}},
+            "no info": {"status": "long"},
+            "info that is no object": {"status": "long", "info": [3600]},
+            "an extra key": dict(self.LONG, error="failed"),
+            "a window's beginning": dict(self.LONG, window_start=0.0),
+        }
+        for label, answer in cases.items():
+            with self.subTest(label):
+                runner = self.use(json_response(answer), audio_response(AUDIO))
+                self.assertFailed(self.client())
+                self.assertRequests(runner, ["POST"])
+                self.assertJobDirEmpty()
+        # A job with a start time asked for a window; "long" is no answer to it.
+        runner = self.use(json_response(self.LONG), audio_response(AUDIO))
+        self.assertWindowFailed(self.client())
+        self.assertRequests(runner, ["POST"])
+        self.assertJobDirEmpty()
+
+    def test_a_window_begins_at_or_before_the_start_asked_for(self) -> None:
+        # From ten minutes before the start, the longest a window can be, to a second after it.
+        for begin in (1230.0, 1234, 1235.0, 634, 634.0, 1229.875):
+            with self.subTest(begin=begin):
+                self.use(json_response(self.window_done(begin)), audio_response(AUDIO))
+                download = self.client().fetch_window(VIDEO_ID, self.job_dir, 1234)
+                self.assertEqual(download.window_start, float(begin))
+                download.audio.unlink()
+        # A start in the first ten minutes: the window may begin at second zero.
+        self.use(json_response(self.window_done(0)), audio_response(AUDIO))
+        self.assertEqual(self.client().fetch_window(VIDEO_ID, self.job_dir, 600).window_start, 0.0)
+
+    def test_a_window_s_answer_that_does_not_fit_the_request_is_failed(self) -> None:
+        cases: dict[str, ScriptEntry] = {
+            "no beginning": json_response(DONE),
+            "a beginning after the start": json_response(self.window_done(1235.5)),
+            "a beginning far after the start": json_response(self.window_done(9000)),
+            "a beginning before zero": json_response(self.window_done(-0.5)),
+            "a beginning more than the longest window before the start": json_response(self.window_done(633.5)),
+            "a beginning at zero for a start far into the video": json_response(self.window_done(0)),
+            "a beginning that is a string": json_response(self.window_done("1230")),
+            "a beginning that is true": json_response(self.window_done(True)),
+            "a beginning that is null": json_response(self.window_done(None)),
+            "a beginning that is a list": json_response(self.window_done([1230])),
+            "a beginning that is no number":
+                json_response(None, body=b'{"status": "done", "info": {}, "window_start": NaN}'),
+            "a beginning that is infinite":
+                json_response(None, body=b'{"status": "done", "info": {}, "window_start": Infinity}'),
+            "an extra key": json_response(self.window_done(1230.0, address="https://example.invalid/")),
+            "no info": json_response({"status": "done", "window_start": 1230.0}),
+            "info that is no object": json_response({"status": "done", "info": "x", "window_start": 1230.0}),
+        }
+        for label, answer in cases.items():
+            with self.subTest(label):
+                runner = self.use(answer, audio_response(AUDIO))
+                self.assertWindowFailed(self.client())
+                # Refused from the answer alone: the audio is never asked for.
+                self.assertRequests(runner, ["POST"])
+                self.assertJobDirEmpty()
+        # And the other way round: a job without a start time is not told
+        # where a window begins.
+        runner = self.use(json_response(self.window_done()), audio_response(AUDIO))
+        self.assertFailed(self.client())
+        self.assertRequests(runner, ["POST"])
+        self.assertJobDirEmpty()
+
+    def test_failed_codes_pass_through_for_a_window_too(self) -> None:
+        for code in ERROR_CODES:
+            with self.subTest(code=code):
+                runner = self.use(json_response({"status": "failed", "error": code}), audio_response(AUDIO))
+                self.assertWindowFailed(self.client(), code)
+                self.assertRequests(runner, ["POST"])
+                self.assertJobDirEmpty()
+
+    def test_the_codes_a_window_can_fail_with_are_known(self) -> None:
+        self.assertEqual(ERROR_CODES, ("blocked", "live", "not_found", "past_end", "timeout", "failed"))
+        for unknown in ("too_long", "long", "bad_start", "Past_End", ""):
+            with self.subTest(code=unknown):
+                runner = self.use(json_response({"status": "failed", "error": unknown}), audio_response(AUDIO))
+                self.assertWindowFailed(self.client(), "failed")
+                self.assertRequests(runner, ["POST"])
 
 
 class ClientRefusalTest(ClientTestCase):

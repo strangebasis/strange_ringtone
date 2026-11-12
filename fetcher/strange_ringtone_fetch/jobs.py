@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from strange_ringtone_fetch.metadata import VIDEO_ID_RE, Download, FetchError, Metadata
+from strange_ringtone_fetch.metadata import VIDEO_ID_RE, Download, FetchError, LongVideo, Metadata, clean_start
 
 # Exactly what secrets.token_hex(16) produces, checked before any lookup.
 JOB_ID_RE = re.compile(r"[0-9a-f]{32}")
@@ -64,6 +64,10 @@ QUEUED = "queued"
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
+# The video is longer than the runner fetches whole (docs/PLAN.md 6.2): the
+# job ended with the video's length and nothing to collect, and the page
+# asks where to start.
+LONG = "long"
 # Internal only: an audio download being streamed, or a file whose deletion
 # failed and is retried by the sweep. Neither has a status a client can see.
 COLLECTING = "collecting"
@@ -77,6 +81,8 @@ class QueueFull(Exception):
 class Runner(Protocol):
     def fetch(self, video_id: str, job_dir: Path) -> Download: ...
 
+    def fetch_window(self, video_id: str, job_dir: Path, start: int) -> Download: ...
+
     def cancel(self) -> None: ...
 
 
@@ -87,10 +93,15 @@ class Job:
     created: float
     # Kept only until the worker starts the job.
     video_id: str | None
+    # The start time of a job that asks for a window of a longer video; kept
+    # only until the worker starts the job, like the ID.
+    start: int | None = None
     finished: float | None = None
     error: str | None = None
     metadata: Metadata | None = None
     audio: Path | None = None
+    # For a finished window: where its audio begins in the video, in seconds.
+    window_start: float | None = None
     # Set on a download being streamed when the worker needs its space; the
     # stream stops at its next chunk.
     abort: bool = False
@@ -134,12 +145,20 @@ class Jobs:
         """Whether submit() would refuse now; asked before the request body is read."""
         return self._queue.full()
 
-    def submit(self, video_id: str) -> str:
-        """Queue a fetch of video_id and return its job ID, or raise QueueFull."""
+    def submit(self, video_id: str, start: int | None = None) -> str:
+        """Queue a fetch of video_id and return its job ID, or raise QueueFull.
+
+        With start, the job is a window of the video's audio from that
+        second; without, the whole audio, or the answer that the video is
+        long.
+        """
         # The server has checked the ID already; checked again, because this
         # value goes to the runner, which puts it in yt-dlp's argument list.
         if not isinstance(video_id, str) or not VIDEO_ID_RE.fullmatch(video_id):
             raise ValueError("not a video ID")
+        # And the start, which ends up in the window program's.
+        if start is not None and clean_start(start) is None:
+            raise ValueError("not a start time")
         with self._lock:
             job_id = secrets.token_hex(16)
             # 128 random bits never repeat in practice; checked anyway, because
@@ -150,7 +169,9 @@ class Jobs:
                 self._queue.put_nowait(job_id)
             except queue.Full:
                 raise QueueFull() from None
-            self._jobs[job_id] = Job(job_id=job_id, status=QUEUED, created=self._clock(), video_id=video_id)
+            self._jobs[job_id] = Job(
+                job_id=job_id, status=QUEUED, created=self._clock(), video_id=video_id, start=start
+            )
         return job_id
 
     def status(self, job_id: str) -> dict[str, Any] | None:
@@ -164,7 +185,7 @@ class Jobs:
             answer: dict[str, Any] = {"status": job.status}
             if job.status == FAILED:
                 answer["error"] = job.error
-            elif job.status == DONE and job.metadata is not None:
+            elif job.status in (DONE, LONG) and job.metadata is not None:
                 metadata = job.metadata
                 if metadata.title is not None:
                     answer["title"] = metadata.title
@@ -172,6 +193,8 @@ class Jobs:
                     answer["duration"] = metadata.duration
                 if metadata.heatmap is not None:
                     answer["heatmap"] = [dict(point) for point in metadata.heatmap]
+                if job.status == DONE and job.window_start is not None:
+                    answer["window_start"] = job.window_start
             return answer
 
     def claim(self, job_id: str) -> Path | None:
@@ -221,21 +244,44 @@ class Jobs:
                 return False
             job.status = RUNNING
             video_id, job.video_id = job.video_id, None
+            start, job.start = job.start, None
         error: str | None = None
         metadata: Metadata | None = None
         held: Path | None = None
         job_dir: Path | None = None
+        window_start: float | None = None
+        long = False
         try:
             if not self._make_room():
                 raise FetchError("failed")
             # A fresh directory per job, named by the server, owner-only
             # (mkdtemp creates it 0o700).
             job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=self.scratch))
-            download = self.runner.fetch(video_id, job_dir)
+            if start is None:
+                download = self.runner.fetch(video_id, job_dir)
+            else:
+                download = self.runner.fetch_window(video_id, job_dir, start)
+                # A window without a beginning is no window: the page could
+                # not place the heatmap or the link's timestamp in it.
+                if download.window_start is None:
+                    raise FetchError("failed")
+                window_start = download.window_start
             held = self.results / f"{job_id}.m4a"
             # A rename within the tmpfs, so the job directory can go now.
             os.replace(download.audio, held)
             metadata = download.metadata
+        except LongVideo as found:
+            if start is None:
+                # Not a failure: nothing was downloaded, and the job ends
+                # with the video's length for the page to ask where to start.
+                long = True
+                metadata = found.metadata
+            else:
+                # A job with a start time asked for a window, and "long" is
+                # no answer to that: the page would only ask for a start
+                # time again.
+                error = "failed"
+            held = None
         except FetchError as failure:
             error = failure.code
             held = None
@@ -255,8 +301,10 @@ class Jobs:
                 shutil.rmtree(job_dir, ignore_errors=True)
         with self._lock:
             job.finished = self._clock()
-            if error is None:
-                job.status, job.metadata, job.audio = DONE, metadata, held
+            if long:
+                job.status, job.metadata = LONG, metadata
+            elif error is None:
+                job.status, job.metadata, job.audio, job.window_start = DONE, metadata, held, window_start
                 # At most one uncollected download: this one. One still
                 # being streamed stays until the next job needs its space.
                 for other in list(self._jobs.values()):
@@ -272,7 +320,7 @@ class Jobs:
         with self._lock:
             for job in list(self._jobs.values()):
                 # Queued and running jobs never expire: the timeout bounds them.
-                if job.status == GONE or (job.status in (DONE, FAILED) and self._expired(job)):
+                if job.status == GONE or (job.status in (DONE, FAILED, LONG) and self._expired(job)):
                     if self._delete(job):
                         removed += 1
         return removed

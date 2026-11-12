@@ -38,7 +38,7 @@ from strange_ringtone.http_guard import (
 
 from strange_ringtone_fetch.config import Settings
 from strange_ringtone_fetch.jobs import Jobs, QueueFull, Runner
-from strange_ringtone_fetch.metadata import VIDEO_ID_RE
+from strange_ringtone_fetch.metadata import VIDEO_ID_RE, clean_start
 from strange_ringtone_fetch.runner_client import RunnerClient
 
 SERVER_NAME = "strange_ringtone"
@@ -49,8 +49,8 @@ JOBS_PATH = "/fetch/api/jobs"
 JOB_PATH_RE = re.compile(r"/fetch/api/jobs/([0-9a-f]{32})")
 AUDIO_PATH_RE = re.compile(r"/fetch/api/jobs/([0-9a-f]{32})/audio")
 JSON_TYPE = "application/json"
-# {"video_id": "<11 characters>"} is 27 bytes; 1 KiB leaves room for
-# whitespace and nothing that could cost anything to parse.
+# {"video_id": "<11 characters>", "start": 359999} is under 50 bytes; 1 KiB
+# leaves room for whitespace and nothing that could cost anything to parse.
 MAX_BODY_BYTES = 1024
 # Wall-clock budget for receiving the body, as in the core.
 BODY_DEADLINE_SECONDS = 60
@@ -64,12 +64,16 @@ _LOG_METHOD_MAX = 16
 _LOG_ID_RE = re.compile(r"[0-9A-Fa-f]{32,}")
 
 
-def parse_job_request(body: bytes) -> str:
-    """The video ID from a POST body, or GuardError 400.
+def parse_job_request(body: bytes) -> tuple[str, int | None]:
+    """(the video ID, the start time or None) from a POST body, or GuardError 400.
 
-    Only a JSON object with exactly the key video_id, holding a string, is a
-    request; anything else, duplicate keys included, is bad_json. The ID must
-    then be exactly 11 characters of A-Z, a-z, 0-9, '_' and '-'.
+    Only a JSON object with the key video_id, holding a string, and at most
+    the key start beside it is a request; anything else, duplicate keys
+    included, is bad_json. The ID must then be exactly 11 characters of A-Z,
+    a-z, 0-9, '_' and '-' (bad_video_id), and a start a whole number of
+    seconds from 0 to MAX_START_SECONDS, as a JSON integer (bad_start): the
+    start of the window to fetch from a video longer than the runner fetches
+    whole (docs/PLAN.md 6.2).
     """
     try:
         text = body.decode("utf-8")
@@ -78,12 +82,19 @@ def parse_job_request(body: bytes) -> str:
         # RecursionError: deep nesting, which a 1 KiB body can't reach in
         # CPython 3.12's decoder but another build's might.
         raise GuardError(400, "bad_json") from None
-    if not isinstance(data, dict) or set(data) != {"video_id"} or not isinstance(data["video_id"], str):
+    if not isinstance(data, dict) or set(data) not in ({"video_id"}, {"video_id", "start"}) \
+            or not isinstance(data["video_id"], str):
         raise GuardError(400, "bad_json")
     video_id = data["video_id"]
     if not VIDEO_ID_RE.fullmatch(video_id):
         raise GuardError(400, "bad_video_id")
-    return video_id
+    start: int | None = None
+    if "start" in data:
+        # A key that is there must hold a start: null is not "no start".
+        start = clean_start(data["start"])
+        if start is None:
+            raise GuardError(400, "bad_start")
+    return video_id, start
 
 
 def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -395,7 +406,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise GuardError(429, "rate_limited", retry_after=retry_after)
         if server.jobs.is_full():
             raise GuardError(503, "busy", retry_after=BUSY_RETRY_SECONDS)
-        video_id = parse_job_request(self._receive_body(length))
+        video_id, start = parse_job_request(self._receive_body(length))
         # One lock around the second look at the limit, the enqueue and the
         # count, so parallel requests from one client can't all take the last
         # slot, and a job is counted only once it is really queued: a refusal
@@ -405,7 +416,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not allowed:
                 raise GuardError(429, "rate_limited", retry_after=retry_after)
             try:
-                job_id = server.jobs.submit(video_id)
+                job_id = server.jobs.submit(video_id, start)
             except QueueFull:
                 raise GuardError(503, "busy", retry_after=BUSY_RETRY_SECONDS) from None
             server.limiter.allow(client)

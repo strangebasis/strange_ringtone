@@ -13,7 +13,11 @@
 // energy per 10 ms (loudness.js), after which every 3 s window and every 50 ms
 // RMS is a subtraction, and a second prefix sum over the curve scores every
 // candidate window in O(1). A 10-minute file stays fast on a phone. The
-// heatmap's score is O(points x candidates), with at most 200 points.
+// heatmap's score is O(points x candidates), with at most 200 points. Rule
+// 2's candidates are bounded by the audio this page decoded. A longer video's
+// length is only a number the fetcher sent, so the search for its default
+// window (suggestWindowStart) never walks along it: it scores at most four
+// starts a point and two more.
 
 import { GRANULES_PER_SECOND, SHORT_TERM_SECONDS, energyPrefix, windowCurve } from "./loudness.js";
 
@@ -138,6 +142,18 @@ function validHeatmap(points, duration) {
     && point.value >= 0 && point.value <= 1);
 }
 
+/** A window's score: over the points, value x the seconds of the point between from and to. */
+function coveredValue(points, from, to) {
+  let score = 0;
+  for (const point of points) {
+    const overlap = Math.min(to, point.end) - Math.max(from, point.start);
+    if (overlap > 0) {
+      score += point.value * overlap;
+    }
+  }
+  return score;
+}
+
 /**
  * Rule 2's choice: of the windows [s, s + maxSeconds] that start every
  * hopSeconds and end within the input, the one with the highest sum over the
@@ -157,14 +173,7 @@ export function scoreHeatmap(points, maxSeconds, duration, hopSeconds) {
   let bestScore = -Infinity;
   for (let k = 0; k < candidates; k += 1) {
     const from = k * hopSeconds;
-    const to = from + maxSeconds;
-    let score = 0;
-    for (const point of points) {
-      const overlap = Math.min(to, point.end) - Math.max(from, point.start);
-      if (overlap > 0) {
-        score += point.value * overlap;
-      }
-    }
+    const score = coveredValue(points, from, from + maxSeconds);
     // Clearly greater only: of equal windows the earliest wins.
     if (score > bestScore + SCORE_EPSILON) {
       bestScore = score;
@@ -172,6 +181,102 @@ export function scoreHeatmap(points, maxSeconds, duration, hopSeconds) {
     }
   }
   return best;
+}
+
+function usablePoints(points) {
+  return Array.isArray(points) && points.length > 0 && points.length <= MAX_HEATMAP_POINTS
+    && points.every((point) => point !== null && typeof point === "object"
+      && isFiniteNumber(point.start) && isFiniteNumber(point.end) && isFiniteNumber(point.value)
+      && point.start >= 0 && point.start < point.end && point.value >= 0 && point.value <= 1);
+}
+
+/**
+ * The whole seconds at which the best window of a longer video can start,
+ * in order. As a window moves later, its score changes at a steady rate
+ * between the places where one of its ends meets an edge of a point. The
+ * rate drops only where the window's start reaches a point's start (it
+ * begins to leave that point) or its end reaches a point's end (it stops
+ * gaining from that point), so only there can the score stop rising or
+ * begin to fall. The best whole second is therefore the one just before or
+ * just after such a place, or the first or last start there is: at most
+ * four starts a point and two more, however long the video is said to be.
+ * Exported for the tests.
+ * @param {{start: number, end: number, value: number}[]} points
+ * @param {number} windowSeconds the window's length
+ * @param {number} lastStart the latest start, a whole second
+ * @returns {number[]} whole seconds from 0 to lastStart, ascending
+ */
+export function windowStartCandidates(points, windowSeconds, lastStart) {
+  const starts = new Set([0, lastStart]);
+  for (const point of points) {
+    for (const edge of [point.start, point.end - windowSeconds]) {
+      for (const second of [Math.floor(edge), Math.ceil(edge)]) {
+        if (second >= 0 && second <= lastStart) starts.add(second);
+      }
+    }
+  }
+  // In order, so that of equal windows the earliest wins.
+  return [...starts].sort((a, b) => a - b);
+}
+
+/**
+ * Where a window of a video longer than the server fetches whole should start
+ * unless the user says otherwise (docs/PLAN.md 6.2): the start, in whole
+ * seconds, of the windowSeconds with the highest summed heatmap value, scored
+ * as rule 2 scores the selection. The start is sent to the fetcher as a
+ * whole number of seconds, so only whole seconds are looked at, and none
+ * later than maxStart: a start the fetcher refuses is no suggestion. The
+ * video's length comes from the fetcher and may be any number, so the work
+ * here depends on the number of points alone (windowStartCandidates).
+ * @param {unknown} heatmap the fetcher's points for the whole video
+ * @param {number} duration the video's length in seconds
+ * @param {number} windowSeconds the window's length
+ * @param {number} maxStart the latest whole second a window may start at
+ * @returns {number | null} null when there is no usable heatmap; 0 when the
+ *   video is no longer than the window
+ */
+export function suggestWindowStart(heatmap, duration, windowSeconds, maxStart) {
+  if (!(isFiniteNumber(duration) && duration > 0 && isFiniteNumber(windowSeconds) && windowSeconds > 0)) return null;
+  if (!(Number.isInteger(maxStart) && maxStart >= 0)) return null;
+  if (!validHeatmap(heatmap, duration)) return null;
+  if (duration <= windowSeconds) return 0;
+  // The last window that ends within the video, or the last one that may be asked for.
+  const lastStart = Math.min(Math.floor(duration - windowSeconds), maxStart);
+  let best = 0;
+  let bestScore = -Infinity;
+  for (const from of windowStartCandidates(heatmap, windowSeconds, lastStart)) {
+    const score = coveredValue(heatmap, from, from + windowSeconds);
+    // Clearly greater only, as in scoreHeatmap: of equal windows the earliest wins.
+    if (score > bestScore + SCORE_EPSILON) {
+      bestScore = score;
+      best = from;
+    }
+  }
+  return best;
+}
+
+/**
+ * A whole video's heatmap as the heatmap of one window of it: each point
+ * moved windowStart earlier and cut to the window, so that rule 2 can read
+ * it against the window's own audio.
+ * @param {unknown} heatmap the fetcher's points, in the video's time
+ * @param {number} windowStart where the window begins in the video, in seconds
+ * @param {number} windowSeconds the window's length
+ * @returns {{start: number, end: number, value: number}[] | null} null when
+ *   the list is not usable or no point reaches into the window
+ */
+export function windowHeatmap(heatmap, windowStart, windowSeconds) {
+  if (!(isFiniteNumber(windowStart) && windowStart >= 0 && isFiniteNumber(windowSeconds) && windowSeconds > 0)) {
+    return null;
+  }
+  if (!usablePoints(heatmap)) return null;
+  const moved = [];
+  for (const point of heatmap) {
+    const start = Math.max(point.start - windowStart, 0);
+    const end = Math.min(point.end - windowStart, windowSeconds);
+    if (end > start) moved.push({ start, end, value: point.value });
+  }
+  return moved.length > 0 ? moved : null;
 }
 
 /**
