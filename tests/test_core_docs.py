@@ -136,7 +136,7 @@ class PlanTest(unittest.TestCase):
         self.assertIn("setpgid()", section)
         self.assertNotIn("doesn't outlive it (unless", section)
 
-    def test_the_contract_draft_names_the_core_caps(self) -> None:
+    def test_the_plans_contract_record_names_the_core_caps(self) -> None:
         section = _section(self.plan, "5.7 ")
         rows = [line for line in section.splitlines() if line.startswith("| Runs with |")]
         self.assertEqual(len(rows), 1, rows)
@@ -151,7 +151,7 @@ class PlanTest(unittest.TestCase):
         assert match is not None
         self.assertRegex(row, rf"\b{match[1]} ?(?:MB|MiB|m)\b")
 
-    def test_the_contract_draft_names_the_core_sysctls(self) -> None:
+    def test_the_plans_contract_record_names_the_core_sysctls(self) -> None:
         # `ipc: none` leaves System V IPC open, so the contract names the
         # three sysctls that close it, each as the example sets it.
         section = _section(self.plan, "5.7 ")

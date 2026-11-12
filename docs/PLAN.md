@@ -3,9 +3,10 @@
 Status: design agreed on 2026-10-24 (decisions in section 3). Milestones 0
 to 5 are merged, and so is the fetcher's egress confinement (section 6.1,
 decided on 2026-11-03), built in two PRs. Milestone 6, the release flow and
-the contract, is built (section 12). v0.1.0 itself waits for the owner: a
-rehearsal of the publish workflow, the phone tests of the share sheet and
-the Shortcut, and the release they make by hand.
+the contract, is built (section 12). v0.1.0 itself waits for the owner, and
+section 12 has the list: a repository setting and two labels, a rehearsal
+of the publish workflow, the phone tests of the share sheet and the
+Shortcut, and the release they make by hand.
 This file is the design record; the README's "Deployment contract" is the
 source of truth for operators from v0.1.0 on.
 
@@ -397,16 +398,17 @@ the user types becomes the filename. Decision 9 keeps it readable:
 
 Kept as the record of how the figures were reached. Milestone 6 wrote these
 tables into the README's "Deployment contract", which is what a deployment
-reads and what CI protects; tests compare both with the code and with
-`compose.example.yaml`.
+reads and what CI protects. Tests compare the README's core tables with the
+code and with `compose.example.yaml` (`tests/test_contract_docs.py`), and
+this section's caps with the example (`tests/test_core_docs.py`).
 
 | Item | Value |
 | --- | --- |
-| Image | `ghcr.io/<owner>/strange_ringtone:<semver>`, consumed by digest, linux/amd64 |
+| Image | `ghcr.io/<owner>/strange_ringtone`, linux/amd64, pinned by digest (README, "Images and verification") |
 | User | UID 10001, GID 10001 (fixed, non-root) |
 | Port | 8080/tcp, plain HTTP. TLS is the proxy's job. |
 | Runs with | `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges`, `ipc: none`, `ulimits: msgqueue: 0`, the `sysctls` `kernel.shmmni: 0`, `kernel.msgmni: 0` and `kernel.sem: "0 0 0 0"` (`ipc: none` leaves System V shared memory, message queues and semaphores open to create in the container's own IPC namespace; with these, `shmget`, `msgget` and `semget` fail), `pids_limit: 80`, `mem_limit: 160m` and `memswap_limit: 160m` (memory plus swap, the same figure: the container gets no swap, so `mem_limit` is its whole bound on a host with swap too). The image sets no process limit of its own (5.3), so `pids_limit` is the only bound on what ffmpeg starts: at least twice the worst case of 37 threads (the main thread, 16 request workers, the result sweeper, 6 per ffmpeg run for each of `RENDER_CONCURRENCY` renders, and 7 for the health check, which Docker starts through its runtime's init process inside the container's cgroup; 37 is also the highest count measured); each render added to `RENDER_CONCURRENCY` needs 12 more. `mem_limit` holds the tmpfs, whose pages count against it, plus twice the 47.6 MB measured with two renders at once and the health check running: 90.8 MiB, and 154.8 MiB with the example's 64 MiB tmpfs (`size=64m`). Raise it with the tmpfs: `MAX_CLIP_SECONDS=40` measured 48.2 MB, and with an 84 MiB tmpfs needs 175.9 MiB, so `176m` at the least. No egress needed (internal network). In `compose.example.yaml` (from 6.1's PR A) that network is also isolated from the Docker host (`gateway_mode_ipv4: isolated` and `gateway_mode_ipv6: isolated`, both, so the host stays off it if IPv6 is ever turned on for it; they need Docker Engine 28.0 or newer, the release that added those modes), so the reverse proxy must be a container on it, not a process on the host, and the log rotates (json-file, `max-size: 10m`, `max-file: 3`). |
-| Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `(MAX_RESULTS + RENDER_CONCURRENCY) × MAX_CLIP_SECONDS × 33 kB + RENDER_CONCURRENCY × MAX_BODY_BYTES`: a result is 256 kbit/s AAC, at most 33 kB per second of clip with the MP4 overhead, and each running render also holds its upload. That is 63 MB with the defaults (use 64 MB) and 84 MB with `MAX_CLIP_SECONDS=40`. |
+| Writable | `/tmp` (tmpfs) and nothing else. Docker would also give the container a writable `/dev/shm` tmpfs and POSIX message queues in `/dev/mqueue`; `ipc: none` and a zero `msgqueue` limit remove both. No volumes, and nothing survives a restart. Size it at `(MAX_RESULTS + RENDER_CONCURRENCY) × MAX_CLIP_SECONDS × 33 kB + RENDER_CONCURRENCY × MAX_BODY_BYTES`: a result is 256 kbit/s AAC, at most 33 kB per second of clip with the MP4 overhead, and each running render also holds its upload, of at most `MAX_BODY_BYTES`. That is not a setting: it is `MAX_CLIP_SECONDS × 192,000 + 4,096` bytes, the selection as 48 kHz stereo 16-bit WAV. That is 63 MB with the defaults (use 64 MB) and 84 MB with `MAX_CLIP_SECONDS=40`. |
 | Health | `GET /healthz` returns 200 with an empty body |
 
 | Variable | Default | Notes |
@@ -615,7 +617,7 @@ where it changes a bullet below, the bullet says so.
   `HTTPS_PROXY` on its service; it gets no `env_file` (6.1). The
   forwarder reads no setting.
 - **Fetcher contract (the README gets a second table):** image
-  `ghcr.io/<owner>/strange_ringtone-fetcher:<semver>`, linux/amd64, UID/GID
+  `ghcr.io/<owner>/strange_ringtone-fetcher`, pinned by digest, linux/amd64, UID/GID
   10001, three commands: the CMD `python -I /app/fetcher`, the fetcher on
   port 8080/tcp plain HTTP; `python -I /app/fetcher/runner.py`, the runner
   on port 8080/tcp in its own container; and
@@ -1771,8 +1773,9 @@ risks".
   and for the SBOM generator's pin (9.3), with a 7-day cooldown. A bump that
   changes a published image (the fetcher's yt-dlp lock, and either
   Dockerfile's base images) is titled `fix(deps):`, and every other one
-  `chore(deps):`. release-please proposes a release for `feat`, `fix` and
-  `deps` commits only, so a `chore` bump of yt-dlp or of a base image would
+  `chore(deps):`. release-please proposes a release once a `feat`, `fix` or
+  `deps` commit has landed (its "releasable units") and never for a
+  `chore`, so a `chore` bump of yt-dlp or of a base image would
   never reach a published image on its own (owner, 2026-11-12). The cost: a
   release PR whenever such a bump lands.
 - `ffmpeg-watch.yml` runs weekly with `contents: read` and **fails** when a newer
@@ -1831,7 +1834,9 @@ Local jobs run with `permissions: contents: read`:
 
 The **organisation security gate** (`security_gate.yml`) calls
 `strangebasisdevs/strange_security`'s `semgrep.yml`, `trivy.yml` and
-`gitleaks.yml`, each pinned as described in 9.1. They are this repository's only security scans:
+`gitleaks.yml`, each pinned as described in 9.1. They are the only security
+scans on a pull request (a release's images are scanned by `trivy-images.yml`,
+9.3, and GitHub's CodeQL default setup also analyses the repository, 9.4):
 
 - Semgrep `p/default` fails on any finding.
 - Trivy fails on any secret at any severity, and on HIGH or CRITICAL fixable
@@ -1877,8 +1882,8 @@ change.
 
 The repository squash-merges with the PR title as the commit subject, which is
 what release-please reads. A **tag ruleset** on `v*` restricts creating,
-moving and deleting release tags. Phase 6 must add the release workflow's
-identity to that ruleset before release-please can tag.
+moving and deleting release tags. It stays admin-only: release-please never
+tags, and the owner makes each release by hand (9.3).
 
 No workflow uses `pull_request_target` or `workflow_run`.
 
@@ -1893,9 +1898,12 @@ As built in milestone 6, from the owner's decisions of 2026-10-25 and
   `skip-github-release: true`: it keeps the release PR (the next version
   and the CHANGELOG) and never tags. `release-please-config.json` is one
   package of `release-type: simple` with `bump-minor-pre-major: true`, and
-  `.release-please-manifest.json` starts at `0.0.0`, so the first release
-  PR proposes 0.1.0. No `release-as`: in the config it is sticky and would
-  have to be removed again after the release.
+  `.release-please-manifest.json` starts at `0.0.0`. With no earlier
+  release, release-please proposes 1.0.0 whatever `bump-minor-pre-major`
+  says (`initialReleaseVersion` in its `strategies/base.ts`, read on
+  2026-11-12), so the package sets `initial-version: 0.1.0`, which is read
+  only while no release exists. No `release-as`: in the config it is
+  sticky and would have to be removed again after the release.
 - **The owner releases by hand.** The tag ruleset stays admin-only (owner,
   2026-10-25). After merging the release PR, the owner creates the release
   `vX.Y.Z` on its merge commit and publishes it.
@@ -1903,8 +1911,11 @@ As built in milestone 6, from the owner's decisions of 2026-10-25 and
   rehearsal. Top-level `permissions: {}`, and six jobs, each with only its
   own scopes:
   1. `check` (`contents: read`): the commit must be on `main`, and
-     `scripts/check_release_tag.py` refuses any tag that is not exactly
-     `v` and the version the manifest records at that commit. A run
+     `scripts/check_release_tag.py` refuses a release unless its tag is
+     exactly `v` and the version the manifest records at that commit, the
+     commit is the one that last changed the manifest (the release PR's
+     merge commit: GitHub's release form offers the tip of `main`, which
+     may already hold later changes), and it is not a pre-release. A run
      started by hand is a rehearsal under the version `rehearsal`, from
      `main` only.
   2. `build` (`packages: write`): both images, with no cache and with
@@ -1912,20 +1923,28 @@ As built in milestone 6, from the owner's decisions of 2026-10-25 and
      `SOURCE_URL`. BuildKit attaches an SPDX SBOM made by its syft
      scanner, which is pinned by digest in `.github/sbom/Dockerfile`, a
      file that is never built and exists so that Dependabot can bump the
-     digest.
+     digest. On a release the job first refuses a version whose tag
+     already exists, so that a second full run can't build and attest
+     another digest for the same tag.
   3. `scan`: strange_security's `trivy-images.yml` at the pinned release,
      on exactly the two digests. Any secret, or a HIGH or CRITICAL
-     vulnerability with a fix, fails it, and nothing in this repository
-     can suppress a finding (the one-stop rule, owner, 2026-10-25).
+     vulnerability with a fix, fails it. The shared workflow would honour
+     an expiring entry bound to one digest in
+     `.github/image-exceptions.json` or
+     `.github/image-secret-allowlist.json`; neither file exists here, and
+     a test fails if one appears (the one-stop rule, owner, 2026-10-25).
   4. `attest` (`id-token: write`, `attestations: write`,
-     `packages: write`): `actions/attest-build-provenance` and
-     `actions/attest-sbom` for each digest, with the SBOM read back from
-     the registry by digest. It checks out nothing.
+     `packages: write`): `actions/attest-build-provenance`, and
+     `actions/attest` with the SBOM (`actions/attest-sbom` is deprecated),
+     for each digest, with the SBOM read back from the registry by digest.
+     It checks out nothing.
   5. `tag` (a release only; `packages: write`, `contents: write`): the
      version tag on each scanned digest, set once and never moved, and
      the digests appended to the release's notes. There is no `latest`.
-  6. `relabel` (a release only; `pull-requests: write`): swaps the merged
-     release PR's `autorelease: pending` for `autorelease: tagged`.
+  6. `relabel` (a release only; `pull-requests: write`): finds the merged
+     release PR by this commit and swaps its `autorelease: pending` for
+     `autorelease: tagged`, the new label first, so that a run which
+     stops halfway can run again.
      release-please opens no new release PR while a merged one is still
      pending, and with `skip-github-release` nothing else swaps the label
      (read in release-please's `manifest.ts` on 2026-11-12; the owner
@@ -1952,13 +1971,16 @@ As built in milestone 6, from the owner's decisions of 2026-10-25 and
   settings, once, and run it again. Rehearsals leave untagged versions in
   the registry; delete them there when they are no longer wanted.
 - **Labels.** release-please's README also asks for `issues: write`, to
-  create its two labels. The job goes without it. If its first run can't
-  label the PR, create `autorelease: pending` and `autorelease: tagged`
-  once by hand.
-- **When a publish run fails.** Tagging and the notes are idempotent, so a
-  failure after the scan is finished by re-running the failed jobs. A
-  failure before the tag leaves a release without images: fix forward with
-  the next patch release, never by moving the tag.
+  create its two labels, and no job here has it: a token with
+  `pull-requests: write` may add a label that exists but not create one.
+  So `autorelease: pending` and `autorelease: tagged` must exist in the
+  repository before release-please first runs.
+- **When a publish run fails.** A scan that finds something stops the
+  release, which then has no images: fix forward with the next patch
+  release, never by moving the tag. Any other failure is finished by
+  re-running the failed jobs, not all of them: tagging, the notes and the
+  relabelling can each run again, and a full second run of a published
+  version is refused before it builds.
 - A consumer verifies a digest with `gh attestation verify` before pinning
   it (README, "Images and verification").
 - The repository also has `LICENSE` (AGPL-3.0), `SECURITY.md` (private
@@ -2041,6 +2063,13 @@ which `names.py` and its tests rule out.
   route check against a fake `/proc`, the image's interpreter isolation, and
   the compose layout in its own CI job. The table in 6.1 maps each check to
   its test.
+- **Release flow (9.3):** `scripts/check_release_tag.py` with every tag,
+  commit and event it must refuse; the two workflows read as text (every
+  write scope by job, what each step is given, the order of the jobs, the
+  pins); and, on POSIX, the publish workflow's own shell scripts run against
+  a fake `docker`, `gh` and `git`, so that a refusal which no longer stops
+  the job fails a test. The README's core contract is compared with the
+  code and the compose example.
 - **Every security check has a test that fails when the check is removed.**
 
 ## 11. Repository layout (proposed)
@@ -2067,10 +2096,10 @@ fetcher/
   strange_ringtone_forwarder/{__init__,__main__,policy,server}.py   # the CONNECT gate: stdlib only, imports nothing from core or the fetcher
 tests/  tests/corpus/  tests/image/  tests/image_fetcher/  tests/compose/  tests/stubs/{ffmpeg_stub,ytdlp_stub,window_stub}.py  tests/js/
 tests/fmp4_fixture.py       # a fragmented MP4 in YouTube's layout, with no audio, for the window program's tests
-scripts/{check_pr_title.py,check_contract_change.py,check_ffmpeg_release.py}   # stdlib checks CI runs
+scripts/{check_pr_title.py,check_contract_change.py,check_ffmpeg_release.py,check_release_tag.py}   # stdlib checks CI runs
 tools/spike/phase0.py       # regenerates the iOS test tones into spike-out/
 tools/dev_fetch_stack.py    # loopback dev stack: core, runner with the two stubs, fetcher, one origin, for the offline product check
-.github/{dependabot.yml,workflows/{ci,pr-checks,security_gate,release-please,ffmpeg-watch}.yml}
+.github/{dependabot.yml,sbom/Dockerfile,workflows/{ci,pr-checks,security_gate,release-please,publish,ffmpeg-watch}.yml}
 release-please-config.json  .release-please-manifest.json
 docs/PLAN.md
 ```
@@ -2253,13 +2282,18 @@ docs/PLAN.md
    - the forwarder's limits fixed as shipped, after a real ten-minute
      window through the fetcher, the runner and the forwarder (6.1)
    - `memswap_limit` equal to `mem_limit` on every service, and the
-     runner's limit kept at 512 MB: that fetch peaked at 476 MiB there,
-     reclaimable file cache included, with no swap and without reaching
-     the limit
+     runner's limit kept at 512 MiB: that fetch peaked at 476 MiB there,
+     file cache included, with no swap and without reaching the limit
    - the five open code-scanning alerts traced and dismissed (9.4)
+   - two independent reviews that tried to refute the result, and their
+     findings fixed: the first version (0.1.0, where release-please would
+     have proposed 1.0.0), a release only from the release PR's merge
+     commit, and tests that run the publish workflow's scripts against a
+     fake `docker`, `gh` and `git`
 
    Still the owner's before v0.1.0: turn on "Allow GitHub Actions to
-   create and approve pull requests"; run one rehearsal of `publish.yml`,
+   create and approve pull requests"; see that the labels `autorelease:
+   pending` and `autorelease: tagged` exist; run one rehearsal of `publish.yml`,
    and set the two packages public if its scan can't pull them; the phone
    tests of the share sheet and the Shortcut; then merge the release PR
    and publish the release.

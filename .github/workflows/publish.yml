@@ -52,17 +52,24 @@ jobs:
             exit 1
           fi
 
-      # The tag is typed by a person. It must be exactly the version the
-      # release PR recorded in the manifest at this commit; a run started by
-      # hand is a rehearsal and releases nothing (scripts/check_release_tag.py).
-      # The event's values reach the script through the environment only.
+      # The tag and its commit are chosen by a person. The tag must be exactly
+      # the version the release PR recorded in the manifest, on the commit that
+      # recorded it (the release form offers the tip of main, which may hold
+      # later changes), and not a pre-release; a run started by hand is a
+      # rehearsal and releases nothing (scripts/check_release_tag.py). The
+      # event's values reach the script through the environment only.
       - name: Plan the run
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
-        run: python -I scripts/check_release_tag.py .release-please-manifest.json >> "$GITHUB_OUTPUT"
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          COMMIT="$GITHUB_SHA"
+          MANIFEST_COMMIT="$(git log -1 --format=%H "$GITHUB_SHA" -- .release-please-manifest.json)"
+          export COMMIT MANIFEST_COMMIT
+          python -I scripts/check_release_tag.py .release-please-manifest.json >> "$GITHUB_OUTPUT"
 
   build:
     name: Build and push by digest
@@ -119,6 +126,32 @@ jobs:
         env:
           REGISTRY_TOKEN: ${{ github.token }}
         run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      # A release publishes its version once. Run again in full, this workflow
+      # would build and attest a second digest for the same tag before the tag
+      # job refused to move it, so it stops here instead. A release whose run
+      # failed after the scan is finished by re-running its failed jobs only.
+      - name: Refuse a version that is already published
+        env:
+          RELEASE: ${{ needs.check.outputs.release }}
+          VERSION: ${{ needs.check.outputs.version }}
+          CORE_IMAGE: ${{ steps.names.outputs.core }}
+          FETCHER_IMAGE: ${{ steps.names.outputs.fetcher }}
+        run: |
+          if [ "$RELEASE" != "true" ]; then
+            echo "A rehearsal publishes no version."
+            exit 0
+          fi
+          for image in "$CORE_IMAGE" "$FETCHER_IMAGE"; do
+            if docker buildx imagetools inspect "$image:$VERSION" > /dev/null 2> "$RUNNER_TEMP/inspect.err"; then
+              echo "::error::$image:$VERSION is already published. To finish a release whose run failed, re-run its failed jobs, not all of them."
+              exit 1
+            elif ! grep -q -i -E 'not found|manifest unknown|name unknown' "$RUNNER_TEMP/inspect.err"; then
+              cat "$RUNNER_TEMP/inspect.err"
+              echo "::error::Could not tell whether $image:$VERSION exists, so nothing was built"
+              exit 1
+            fi
+          done
 
       # no-cache and pull: every layer is built in this run from the pinned
       # sources, and none comes from a cache another run wrote.
@@ -253,20 +286,27 @@ jobs:
           PY
           done
 
+      # push-to-registry stores a copy of each attestation beside its image.
+      # create-storage-record is off: that record is an organisation's
+      # artifact inventory, which needs a scope of its own and which nothing
+      # here reads. The SBOM goes through actions/attest, which replaced the
+      # deprecated actions/attest-sbom.
       - name: Attest the core image's provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ needs.build.outputs.core-image }}
           subject-digest: ${{ needs.build.outputs.core-digest }}
           push-to-registry: true
+          create-storage-record: false
 
       - name: Attest the core image's SBOM
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ needs.build.outputs.core-image }}
           subject-digest: ${{ needs.build.outputs.core-digest }}
           sbom-path: ${{ runner.temp }}/core.spdx.json
           push-to-registry: true
+          create-storage-record: false
 
       - name: Attest the fetcher image's provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -274,14 +314,16 @@ jobs:
           subject-name: ${{ needs.build.outputs.fetcher-image }}
           subject-digest: ${{ needs.build.outputs.fetcher-digest }}
           push-to-registry: true
+          create-storage-record: false
 
       - name: Attest the fetcher image's SBOM
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ needs.build.outputs.fetcher-image }}
           subject-digest: ${{ needs.build.outputs.fetcher-digest }}
           sbom-path: ${{ runner.temp }}/fetcher.spdx.json
           push-to-registry: true
+          create-storage-record: false
 
   tag:
     name: Tag the images and finish the release
@@ -320,7 +362,7 @@ jobs:
                 echo "::error::$image:$VERSION already names $existing: refusing to move a version tag to $digest"
                 exit 1
               fi
-            elif grep -q -i -E 'not found|manifest unknown' "$RUNNER_TEMP/inspect.err"; then
+            elif grep -q -i -E 'not found|manifest unknown|name unknown' "$RUNNER_TEMP/inspect.err"; then
               docker buildx imagetools create --tag "$image:$VERSION" "$image@$digest"
             else
               cat "$RUNNER_TEMP/inspect.err"
@@ -370,20 +412,37 @@ jobs:
     # release-please opens no new release PR while a merged one is still
     # labelled "autorelease: pending", and with skip-github-release nothing
     # else swaps the label. This job holds that one scope, checks out
-    # nothing and runs no action.
+    # nothing and runs no action. Both labels must exist in the repository:
+    # this token may add a label to a pull request but not create one.
     permissions:
       pull-requests: write
     steps:
+      # The pull request is found by this commit, not by its label, and the
+      # new label goes on before the old one comes off, so a run that stops
+      # halfway can simply run again.
       - name: Swap the label on this commit's release pull request
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          number="$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged --label "autorelease: pending" \
-            --json number,mergeCommit --jq "map(select(.mergeCommit.oid == \"$GITHUB_SHA\")) | .[0].number // empty")"
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq '.[] | [.number, .merge_commit_sha, .head.ref, (.merged_at != null), ([.labels[].name] | join("|"))] | @tsv' \
+            > "$RUNNER_TEMP/pulls.tsv"
+          number=""
+          labels=""
+          while IFS="$(printf '\t')" read -r pull sha ref merged names; do
+            if [ "$sha" = "$GITHUB_SHA" ] && [ "$merged" = "true" ] && [[ "$ref" == release-please--* ]]; then
+              number="$pull"
+              labels="|$names|"
+            fi
+          done < "$RUNNER_TEMP/pulls.tsv"
           if [[ ! "$number" =~ ^[0-9]+$ ]]; then
-            echo "::error::No merged pull request labelled 'autorelease: pending' has this commit as its merge commit. The images are published; swap the label on the release pull request by hand to 'autorelease: tagged', or release-please opens no further release PR."
+            echo "::error::No merged release-please pull request has this commit as its merge commit. The images are published; relabel the release pull request by hand from 'autorelease: pending' to 'autorelease: tagged', or release-please opens no further release PR."
             exit 1
           fi
-          gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/$number/labels/autorelease:%20pending" > /dev/null
+          if [[ "$labels" != *"|autorelease: pending|"* ]]; then
+            echo "Pull request $number is not labelled 'autorelease: pending': nothing to swap."
+            exit 0
+          fi
           gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$number/labels" -f "labels[]=autorelease: tagged" > /dev/null
-          echo "Pull request #$number is now labelled 'autorelease: tagged'."
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/$number/labels/autorelease:%20pending" > /dev/null
+          echo "Pull request $number is now labelled 'autorelease: tagged'."
