@@ -85,7 +85,9 @@ is authoritative.
   `net.ipv4.ip_forward`, which resets the redirect setting), and each has a
   `pids_limit` of at least twice its worst case (docs/PLAN.md 6.1).
 - **Container contract:** a fixed non-root UID/GID, `read_only`, `cap_drop: [ALL]`,
-  `no-new-privileges`, and one plain-HTTP port per container (8080 for the
+  `no-new-privileges`, a memory limit with no swap on top of it
+  (`memswap_limit` equal to `mem_limit`), and one plain-HTTP port per
+  container (8080 for the
   core, the fetcher and the runner, 3128 for the forwarder command).
   **Stateless:** it writes only to `/tmp` (tmpfs), and the forwarder writes
   nothing; results expire after a short TTL, and the runner keeps an audio
@@ -157,8 +159,12 @@ starts enforcing once `.release-please-manifest.json` records a release.
 ## Supply chain and CI
 
 - Pin Actions by full commit SHA with a `# vX.Y.Z` comment, and base images by
-  digest. No `curl | sh`. Dependabot covers pip, github-actions and docker,
-  with a 7-day cooldown.
+  digest. No `curl | sh`, and no action that downloads and runs an
+  installer at run time, which is the same thing. Dependabot covers pip,
+  github-actions and docker, with a 7-day cooldown. Its bumps of what goes
+  into an image (the fetcher's lock, a Dockerfile's base images) are titled
+  `fix(deps):`, because release-please opens no release for a `chore`
+  commit; the others stay `chore(deps):`.
 - Reusable workflows owned by the `strangebasisdevs` organisation, such as
   `strangebasisdevs/strange_security/.github/workflows/semgrep.yml`, are pinned
   by full commit SHA with a `# vX.Y.Z` comment like any other action, and
@@ -167,7 +173,9 @@ starts enforcing once `.release-please-manifest.json` records a release.
   organisation's one-stop security repository. `security_gate.yml` calls its
   Semgrep, Trivy and Gitleaks workflows, and this repository runs no security
   scans of its own. Fix gaps in those scans in strange_security, never with a
-  local copy here (`docs/PLAN.md`, section 9.4).
+  local copy here (`docs/PLAN.md`, section 9.4). GitHub's CodeQL default
+  setup also analyses the repository: a repository setting, not a workflow
+  here and not a required check.
 - **Semgrep suppressions are allowed, narrowly** (owner's decision, 2026-10-25):
   policy stays central in strange_security (its `docs/SUPPRESSIONS.md` is the
   source of truth, and its check runs in the security gate); this is
@@ -190,14 +198,25 @@ starts enforcing once `.release-please-manifest.json` records a release.
   (`docs/PLAN.md`, section 9.2). Renaming a job means updating the ruleset in
   the same change. A tag ruleset restricts `v*` tags: never create, move or
   delete one.
-- Workflows default to `contents: read`. Never use `pull_request_target` or
+- Workflows default to `contents: read`, or to no permission at all. Never use `pull_request_target` or
   `workflow_run` with secrets. Write scopes exist only in the release-please and
   publish jobs, plus `security-events: write` in the security gate, which the
-  shared workflows need to upload SARIF.
+  shared workflows need to upload SARIF. `tests/test_release_workflows.py`
+  lists every write scope by job: a new one is added there on purpose.
 - Every PR runs ruff, the tests (including in-image runs of the core and the
   fetcher images with `--network none`), the compose topology tests, the
   organisation security gate, the PR-title check and the contract-change check.
-  Releases also scan the image and publish provenance and an SBOM.
+  Releases also scan the images and publish provenance and an SBOM.
+- **Releases** (`docs/PLAN.md`, section 9.3): release-please keeps the
+  release PR and never tags. The owner makes each `vX.Y.Z` release by hand
+  on the merged release PR's commit, and `publish.yml` then builds with no
+  cache, pushes by digest, scans with strange_security's `trivy-images.yml`,
+  attests, and only then tags. Never tag an image before its scan passed,
+  never add a `latest` tag and never move a version tag. The job that runs
+  the Dockerfiles holds `packages: write` and nothing more, and the jobs
+  that sign, tag and relabel check out no code. The first version comes
+  from `initial-version` in `release-please-config.json`: without it
+  release-please would have proposed 1.0.0.
 
 ## Local machine
 

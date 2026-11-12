@@ -2,7 +2,8 @@
 
 ## Supported versions
 
-Only the latest release receives security fixes. There is no release yet.
+Only the latest release receives security fixes. Releases are listed on this
+repository's Releases page; v0.1.0 is the first.
 
 ## Reporting a vulnerability
 
@@ -35,10 +36,8 @@ Out of scope:
 
 ## Verifying an image
 
-There is no release yet, so there is nothing to verify today. Release images
-will be published with build provenance and an SBOM (docs/PLAN.md, section
-9.3). Once one is, verify its digest before you pin it:
-
-```bash
-gh attestation verify oci://ghcr.io/<owner>/strange_ringtone@sha256:<digest> --repo <owner>/strange_ringtone
-```
+Release images are published with build provenance and an SBOM. Verify a
+digest before you pin it, with the command in the README's
+[Images and verification](README.md#images-and-verification): it names the
+workflow that must have built the image and the release tag it must have
+been built from.

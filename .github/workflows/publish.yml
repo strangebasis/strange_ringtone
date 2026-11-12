@@ -1,0 +1,448 @@
+name: Publish
+
+# Builds and publishes the two images of a release (docs/PLAN.md 9.3).
+#
+# It starts when the owner publishes the vX.Y.Z release they made by hand from
+# the merged release PR's commit. The order is the point: build, push by
+# digest with no tag, scan that digest with the organisation's Trivy workflow,
+# attest it, and only then give it its version tag and write the digests into
+# the release notes. An image that fails its scan never gets a tag.
+#
+# Started by hand it is a rehearsal: everything up to and including the
+# attestations, on main, under the version "rehearsal". A rehearsal never
+# tags an image, never touches a release and never relabels a pull request.
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+# No token by default; each job below names what it needs.
+permissions: {}
+
+# One run per release or rehearsal, and none cancelled between push and tag.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check the release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole history, to tell whether this commit is on main.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A release is cut from main: a tag on a branch's commit, or a rehearsal
+      # of a commit that was never merged, builds nothing.
+      - name: Check the commit is on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::This commit is not on main: a release is made from the merged release PR's commit"
+            exit 1
+          fi
+
+      # The tag and its commit are chosen by a person. The tag must be exactly
+      # the version the release PR recorded in the manifest, on the commit that
+      # recorded it (the release form offers the tip of main, which may hold
+      # later changes), and not a pre-release; a run started by hand is a
+      # rehearsal and releases nothing (scripts/check_release_tag.py). The
+      # event's values reach the script through the environment only.
+      - name: Plan the run
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          COMMIT="$GITHUB_SHA"
+          MANIFEST_COMMIT="$(git log -1 --format=%H "$GITHUB_SHA" -- .release-please-manifest.json)"
+          export COMMIT MANIFEST_COMMIT
+          python -I scripts/check_release_tag.py .release-please-manifest.json >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and push by digest
+    needs: check
+    runs-on: ubuntu-24.04
+    # Two builds with no cache; the core's compiles ffmpeg.
+    timeout-minutes: 60
+    # packages: write pushes the images. This is the only job that runs the
+    # Dockerfiles, and it can neither sign, tag a release nor write to the
+    # repository.
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      core-image: ${{ steps.pushed.outputs.core-image }}
+      core-digest: ${{ steps.pushed.outputs.core-digest }}
+      fetcher-image: ${{ steps.pushed.outputs.fetcher-image }}
+      fetcher-digest: ${{ steps.pushed.outputs.fetcher-digest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The image names follow the repository, so a fork publishes under its
+      # own owner. The SBOM generator is read from the one file Dependabot
+      # bumps, and refused unless it is that image pinned by digest.
+      - name: Name the images and the SBOM generator
+        id: names
+        run: |
+          repository="${GITHUB_REPOSITORY,,}"
+          if [[ ! "$repository" =~ ^[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::The repository name can't be used as an image name"
+            exit 1
+          fi
+          generator="$(sed -n 's/^FROM //p' .github/sbom/Dockerfile)"
+          if [[ ! "$generator" =~ ^docker/buildkit-syft-scanner:[a-z0-9.-]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::.github/sbom/Dockerfile must hold one FROM line: docker/buildkit-syft-scanner pinned by a sha256 digest"
+            exit 1
+          fi
+          {
+            echo "core=ghcr.io/$repository"
+            echo "fetcher=ghcr.io/$repository-fetcher"
+            echo "generator=$generator"
+            echo "source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The docker CLI, not a login action: the token goes in on stdin, never
+      # on a command line.
+      - name: Log in to the container registry
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      # A release publishes its version once. Run again in full, this workflow
+      # would build and attest a second digest for the same tag before the tag
+      # job refused to move it, so it stops here instead. A release whose run
+      # failed after the scan is finished by re-running its failed jobs only.
+      - name: Refuse a version that is already published
+        env:
+          RELEASE: ${{ needs.check.outputs.release }}
+          VERSION: ${{ needs.check.outputs.version }}
+          CORE_IMAGE: ${{ steps.names.outputs.core }}
+          FETCHER_IMAGE: ${{ steps.names.outputs.fetcher }}
+        run: |
+          if [ "$RELEASE" != "true" ]; then
+            echo "A rehearsal publishes no version."
+            exit 0
+          fi
+          for image in "$CORE_IMAGE" "$FETCHER_IMAGE"; do
+            if docker buildx imagetools inspect "$image:$VERSION" > /dev/null 2> "$RUNNER_TEMP/inspect.err"; then
+              echo "::error::$image:$VERSION is already published. To finish a release whose run failed, re-run its failed jobs, not all of them."
+              exit 1
+            elif ! grep -q -i -E 'not found|manifest unknown|name unknown' "$RUNNER_TEMP/inspect.err"; then
+              cat "$RUNNER_TEMP/inspect.err"
+              echo "::error::Could not tell whether $image:$VERSION exists, so nothing was built"
+              exit 1
+            fi
+          done
+
+      # no-cache and pull: every layer is built in this run from the pinned
+      # sources, and none comes from a cache another run wrote.
+      # push-by-digest with no tag: the image exists in the registry only
+      # under its digest until the scan has passed (the tag job).
+      # provenance: false, because the attest job signs GitHub's provenance
+      # for the digest; the SBOM is BuildKit's, made from the built image by
+      # the pinned generator, and travels with the image.
+      - name: Build and push the core image
+        id: core
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          # A path context, so .dockerignore's allowlist decides what is sent.
+          context: .
+          file: core/Dockerfile
+          platforms: linux/amd64
+          no-cache: true
+          pull: true
+          provenance: false
+          sbom: generator=${{ steps.names.outputs.generator }}
+          build-args: |
+            VERSION=${{ needs.check.outputs.version }}
+            SOURCE_URL=${{ steps.names.outputs.source }}
+          labels: |
+            org.opencontainers.image.title=strange_ringtone
+            org.opencontainers.image.source=${{ steps.names.outputs.source }}
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+          outputs: type=image,name=${{ steps.names.outputs.core }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Build and push the fetcher image
+        id: fetcher
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: fetcher/Dockerfile
+          platforms: linux/amd64
+          no-cache: true
+          pull: true
+          provenance: false
+          sbom: generator=${{ steps.names.outputs.generator }}
+          labels: |
+            org.opencontainers.image.title=strange_ringtone-fetcher
+            org.opencontainers.image.source=${{ steps.names.outputs.source }}
+            org.opencontainers.image.version=${{ needs.check.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+          outputs: type=image,name=${{ steps.names.outputs.fetcher }},push-by-digest=true,name-canonical=true,push=true
+
+      # Every later job works from these four values and nothing else.
+      - name: Record what was pushed
+        id: pushed
+        env:
+          CORE_IMAGE: ${{ steps.names.outputs.core }}
+          CORE_DIGEST: ${{ steps.core.outputs.digest }}
+          FETCHER_IMAGE: ${{ steps.names.outputs.fetcher }}
+          FETCHER_DIGEST: ${{ steps.fetcher.outputs.digest }}
+        run: |
+          for digest in "$CORE_DIGEST" "$FETCHER_DIGEST"; do
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::A build returned no sha256 digest"
+              exit 1
+            fi
+          done
+          {
+            echo "core-image=$CORE_IMAGE"
+            echo "core-digest=$CORE_DIGEST"
+            echo "fetcher-image=$FETCHER_IMAGE"
+            echo "fetcher-digest=$FETCHER_DIGEST"
+          } >> "$GITHUB_OUTPUT"
+
+  scan:
+    name: Image scan
+    needs: build
+    # What the shared workflow's own cap asks its caller to grant. It pulls
+    # the images without logging in, so both packages must be public.
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    # The organisation's image scan (CLAUDE.md, Supply chain): any secret, or
+    # a fixable HIGH or CRITICAL vulnerability, fails the job, and nothing in
+    # this repository's .trivyignore can change that.
+    uses: strangebasisdevs/strange_security/.github/workflows/trivy-images.yml@b3a6732ecbe1796fb2e7eaeedb228c705962db44 # v1.2.1
+    with:
+      images: |
+        ${{ needs.build.outputs.core-image }}@${{ needs.build.outputs.core-digest }}
+        ${{ needs.build.outputs.fetcher-image }}@${{ needs.build.outputs.fetcher-digest }}
+
+  attest:
+    name: Attest provenance and SBOM
+    needs: [build, scan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # id-token: write gets the signing certificate, attestations: write stores
+    # the attestation, and packages: write puts a copy beside the image. This
+    # job checks out nothing and builds nothing.
+    permissions:
+      attestations: write
+      id-token: write
+      packages: write
+    steps:
+      - name: Log in to the container registry
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      # The SBOM BuildKit attached to each image, read back by digest, so it
+      # is the one made from exactly the layers that were pushed.
+      - name: Read each image's SBOM from the registry
+        env:
+          CORE: ${{ needs.build.outputs.core-image }}@${{ needs.build.outputs.core-digest }}
+          FETCHER: ${{ needs.build.outputs.fetcher-image }}@${{ needs.build.outputs.fetcher-digest }}
+        run: |
+          for pair in "core=$CORE" "fetcher=$FETCHER"; do
+            name="${pair%%=*}"
+            reference="${pair#*=}"
+            file="$RUNNER_TEMP/$name.spdx.json"
+            docker buildx imagetools inspect "$reference" --format '{{ json .SBOM.SPDX }}' > "$file"
+            python3 -I - "$file" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              document = json.load(handle)
+          if not isinstance(document, dict) or not str(document.get("spdxVersion", "")).startswith("SPDX-"):
+              sys.exit(f"{sys.argv[1]} is not an SPDX document")
+          if not document.get("packages"):
+              sys.exit(f"{sys.argv[1]} lists no packages")
+          print(f"{sys.argv[1]}: {document['spdxVersion']}, {len(document['packages'])} packages")
+          PY
+          done
+
+      # push-to-registry stores a copy of each attestation beside its image.
+      # create-storage-record is off: that record is an organisation's
+      # artifact inventory, which needs a scope of its own and which nothing
+      # here reads. The SBOM goes through actions/attest, which replaced the
+      # deprecated actions/attest-sbom.
+      - name: Attest the core image's provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ needs.build.outputs.core-image }}
+          subject-digest: ${{ needs.build.outputs.core-digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest the core image's SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ needs.build.outputs.core-image }}
+          subject-digest: ${{ needs.build.outputs.core-digest }}
+          sbom-path: ${{ runner.temp }}/core.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest the fetcher image's provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ needs.build.outputs.fetcher-image }}
+          subject-digest: ${{ needs.build.outputs.fetcher-digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest the fetcher image's SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ needs.build.outputs.fetcher-image }}
+          subject-digest: ${{ needs.build.outputs.fetcher-digest }}
+          sbom-path: ${{ runner.temp }}/fetcher.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+  tag:
+    name: Tag the images and finish the release
+    needs: [check, build, scan, attest]
+    # Never in a rehearsal. With no status function in it, this condition
+    # still requires every job above to have succeeded.
+    if: needs.check.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # packages: write adds the version tag to the scanned digest;
+    # contents: write edits the notes of the release the owner made.
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Log in to the container registry
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      # The version tag is the only tag, and it is set once: deployments pin
+      # the digest, and a tag that could move would make the notes lie.
+      - name: Tag the scanned digests with the version
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          CORE_IMAGE: ${{ needs.build.outputs.core-image }}
+          CORE_DIGEST: ${{ needs.build.outputs.core-digest }}
+          FETCHER_IMAGE: ${{ needs.build.outputs.fetcher-image }}
+          FETCHER_DIGEST: ${{ needs.build.outputs.fetcher-digest }}
+        run: |
+          tag_image() {
+            image="$1"
+            digest="$2"
+            if existing="$(docker buildx imagetools inspect "$image:$VERSION" --format '{{ .Manifest.Digest }}' 2> "$RUNNER_TEMP/inspect.err")"; then
+              if [ "$existing" != "$digest" ]; then
+                echo "::error::$image:$VERSION already names $existing: refusing to move a version tag to $digest"
+                exit 1
+              fi
+            elif grep -q -i -E 'not found|manifest unknown|name unknown' "$RUNNER_TEMP/inspect.err"; then
+              docker buildx imagetools create --tag "$image:$VERSION" "$image@$digest"
+            else
+              cat "$RUNNER_TEMP/inspect.err"
+              echo "::error::Could not tell whether $image:$VERSION exists, so it was not tagged"
+              exit 1
+            fi
+            now="$(docker buildx imagetools inspect "$image:$VERSION" --format '{{ .Manifest.Digest }}')"
+            if [ "$now" != "$digest" ]; then
+              echo "::error::$image:$VERSION names $now, not the scanned digest $digest"
+              exit 1
+            fi
+          }
+          tag_image "$CORE_IMAGE" "$CORE_DIGEST"
+          tag_image "$FETCHER_IMAGE" "$FETCHER_DIGEST"
+
+      - name: Add the digests to the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          CORE_IMAGE: ${{ needs.build.outputs.core-image }}
+          CORE_DIGEST: ${{ needs.build.outputs.core-digest }}
+          FETCHER_IMAGE: ${{ needs.build.outputs.fetcher-image }}
+          FETCHER_DIGEST: ${{ needs.build.outputs.fetcher-digest }}
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$notes"
+          if grep -q -F "$CORE_IMAGE@$CORE_DIGEST" "$notes"; then
+            echo "The release notes already list these digests."
+            exit 0
+          fi
+          {
+            printf '\n## Images\n\n'
+            printf 'Verify an image before pinning its digest (README, Deployment contract).\n\n'
+            # \140 is a backtick, written so because one inside single quotes
+            # reads as a command substitution that never runs.
+            printf -- '- Core: \140%s@%s\140\n' "$CORE_IMAGE" "$CORE_DIGEST"
+            printf -- '- Fetcher: \140%s@%s\140\n' "$FETCHER_IMAGE" "$FETCHER_DIGEST"
+          } >> "$notes"
+          gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+
+  relabel:
+    name: Mark the release PR as tagged
+    needs: [check, tag]
+    if: needs.check.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # release-please opens no new release PR while a merged one is still
+    # labelled "autorelease: pending", and with skip-github-release nothing
+    # else swaps the label. This job holds that one scope, checks out
+    # nothing and runs no action. Both labels must exist in the repository:
+    # this token may add a label to a pull request but not create one.
+    permissions:
+      pull-requests: write
+    steps:
+      # The pull request is found by this commit, not by its label, and the
+      # new label goes on before the old one comes off, so a run that stops
+      # halfway can simply run again.
+      - name: Swap the label on this commit's release pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq '.[] | [.number, .merge_commit_sha, .head.ref, (.merged_at != null), ([.labels[].name] | join("|"))] | @tsv' \
+            > "$RUNNER_TEMP/pulls.tsv"
+          number=""
+          labels=""
+          while IFS="$(printf '\t')" read -r pull sha ref merged names; do
+            if [ "$sha" = "$GITHUB_SHA" ] && [ "$merged" = "true" ] && [[ "$ref" == release-please--* ]]; then
+              number="$pull"
+              labels="|$names|"
+            fi
+          done < "$RUNNER_TEMP/pulls.tsv"
+          if [[ ! "$number" =~ ^[0-9]+$ ]]; then
+            echo "::error::No merged release-please pull request has this commit as its merge commit. The images are published; relabel the release pull request by hand from 'autorelease: pending' to 'autorelease: tagged', or release-please opens no further release PR."
+            exit 1
+          fi
+          if [[ "$labels" != *"|autorelease: pending|"* ]]; then
+            echo "Pull request $number is not labelled 'autorelease: pending': nothing to swap."
+            exit 0
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$number/labels" -f "labels[]=autorelease: tagged" > /dev/null
+          gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/$number/labels/autorelease:%20pending" > /dev/null
+          echo "Pull request $number is now labelled 'autorelease: tagged'."

@@ -1,4 +1,5 @@
-# A hardened example of running the core (docs/PLAN.md 5.7) and, optionally,
+# A hardened example of running the core (README, Deployment contract) and,
+# optionally,
 # the fetcher with its runner and its forwarder (section 6). Copy it into your
 # own infrastructure repository and adapt it there; this repository stays
 # generic, so it names no deployment's host, domain or reverse proxy.
@@ -75,7 +76,8 @@ services:
   core:
     # Deployments pin a released image by digest, for example
     #   image: ghcr.io/strangebasisdevs/strange_ringtone@sha256:<digest>
-    # There is no release before v0.1.0, so this example builds the checkout.
+    # after verifying it (README, Images and verification). This example
+    # builds the checkout instead, so that it runs as it is.
     build:
       context: .
       dockerfile: core/Dockerfile
@@ -111,7 +113,7 @@ services:
     tmpfs:
       # The only writable path: uploads and results, gone on restart. noexec
       # and nosuid keep anything written there from running. The size follows
-      # the contract's formula (docs/PLAN.md 5.7): 64 MB fits the default
+      # the contract's formula (README, Deployment contract): 64 MB fits the default
       # settings; MAX_CLIP_SECONDS=40 needs 84 MB.
       - /tmp:rw,noexec,nosuid,size=64m,mode=1777
     # ffmpeg runs as the server's UID in this container, so this cgroup limit
@@ -127,6 +129,11 @@ services:
     # that plus the 84m tmpfs is 175.9 MiB, so 176m at the least. Measure
     # again before raising RENDER_CONCURRENCY or MAX_WORKERS.
     mem_limit: 160m
+    # Memory plus swap, set to the same figure: the container gets no swap,
+    # so mem_limit is its whole bound on a host with swap too. Left unset,
+    # Docker lets a container swap as much again as its mem_limit. Change
+    # the two together.
+    memswap_limit: 160m
     # The cgroup's cap on processes and threads. The image sets no process
     # limit of its own: prlimit's --nproc would be RLIMIT_NPROC, which the
     # kernel counts per UID across every container that runs as 10001, so
@@ -220,6 +227,9 @@ services:
     # whose tmpfs pages count against this cgroup: 80 MB of results plus the
     # server.
     mem_limit: 256m
+    # No swap on top of it (the core service says why): change the two
+    # together.
+    memswap_limit: 256m
     # The cgroup's cap on processes and threads; a thread that can't start
     # fails its request closed. The worst case: the main thread, 16 request
     # workers (FetchServer.MAX_WORKERS), the job worker and the sweeper, the
@@ -372,6 +382,13 @@ services:
     # to it: the runner sends its stdout to /dev/null and keeps only the
     # last 64 KiB of its stderr, however much a run prints.
     mem_limit: 512m
+    # No swap on top of it (the core service says why): change the two
+    # together. The margin is thin on purpose. Real fetches peaked at up to
+    # 476 MiB here, file cache included, and none reached the limit (a
+    # ten-minute window on 2026-11-12 the last). If YouTube's player script
+    # ever makes Deno need more, the kernel kills a process here and that
+    # fetch fails: raise both figures then.
+    memswap_limit: 512m
     # The cgroup's cap on processes and threads. prlimit's --nproc for yt-dlp
     # is RLIMIT_NPROC, which the kernel counts per UID across every container
     # that runs as 10001, so it bounds nothing per container; this does, and
@@ -521,6 +538,9 @@ services:
     # No tmpfs: the forwarder writes nothing, so nothing in it is writable.
     # Its own limits bound each tunnel (README); this bounds the process.
     mem_limit: 128m
+    # No swap on top of it (the core service says why): change the two
+    # together.
+    memswap_limit: 128m
     # The cgroup's cap on processes and threads, in case a change ever
     # loosens the forwarder's own thread accounting; a thread that can't
     # start fails its connection closed. The worst case from its limits: the

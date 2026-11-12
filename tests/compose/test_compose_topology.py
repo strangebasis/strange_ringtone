@@ -1385,6 +1385,19 @@ class LayoutTest(unittest.TestCase):
             f"({CORE_MEASURED_PEAK_BYTES}): a full /tmp and two renders would meet the OOM killer",
         )
 
+    def test_no_service_may_swap_beyond_its_memory_limit(self) -> None:
+        """memswap_limit equals mem_limit on every service, as compose resolves them: the limit is the whole bound."""
+        services = self._services()
+        self.assertEqual(set(services), {"core", "fetcher", "fetcher-runner", "fetcher-forwarder"})
+        for name, service in services.items():
+            with self.subTest(service=name):
+                self.assertIn("mem_limit", service, f"{name} sets no mem_limit")
+                # Unset, Docker lets a container use as much swap again as
+                # its mem_limit; -1 would mean unlimited swap.
+                self.assertIn("memswap_limit", service, f"{name} sets no memswap_limit")
+                self.assertGreater(_size_bytes(service["mem_limit"]), 0)
+                self.assertEqual(_size_bytes(service["memswap_limit"]), _size_bytes(service["mem_limit"]))
+
     def test_the_core_turns_system_v_ipc_off(self) -> None:
         """The core's sysctls leave System V IPC no object to create, which `ipc: none` alone does not."""
         sysctls = self._service("core").get("sysctls") or {}

@@ -10,8 +10,10 @@ updates:
     open-pull-requests-limit: 10
     cooldown:
       default-days: 7
-    # "chore(deps): bump ..." passes the PR-title check, and release-please
-    # leaves chores out of the CHANGELOG.
+    # "chore(deps): bump ..." passes the PR-title check. release-please
+    # opens a release for feat, fix and deps commits only, so a chore never
+    # causes one: right for a bump that changes no image, as here. The
+    # bumps that do change one are "fix(deps)" below (docs/PLAN.md 9.1).
     commit-message:
       prefix: chore
       include: scope
@@ -45,8 +47,11 @@ updates:
     open-pull-requests-limit: 10
     cooldown:
       default-days: 7
+    # fix, not chore: this bump changes a published image, and only a
+    # releasable commit makes release-please propose the release that
+    # ships it (docs/PLAN.md 9.1).
     commit-message:
-      prefix: chore
+      prefix: fix
       include: scope
     ignore:
       # The core targets Python 3.12 (CLAUDE.md), so only the digest of the
@@ -69,8 +74,11 @@ updates:
     open-pull-requests-limit: 10
     cooldown:
       default-days: 7
+    # fix, not chore: this bump changes a published image, and only a
+    # releasable commit makes release-please propose the release that
+    # ships it (docs/PLAN.md 9.1).
     commit-message:
-      prefix: chore
+      prefix: fix
       include: scope
     groups:
       ytdlp:
@@ -90,8 +98,11 @@ updates:
     open-pull-requests-limit: 10
     cooldown:
       default-days: 7
+    # fix, not chore: this bump changes a published image, and only a
+    # releasable commit makes release-please propose the release that
+    # ships it (docs/PLAN.md 9.1).
     commit-message:
-      prefix: chore
+      prefix: fix
       include: scope
     ignore:
       # Python 3.12 only (CLAUDE.md), as for the core.
@@ -99,3 +110,20 @@ updates:
         update-types:
           - version-update:semver-major
           - version-update:semver-minor
+
+  # The SBOM generator publish.yml hands to BuildKit, pinned by digest in a
+  # Dockerfile that is never built, so this ecosystem can bump it. It is
+  # in no image, so its bump is a chore.
+  - package-ecosystem: docker
+    directory: /.github/sbom
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope

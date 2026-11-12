@@ -1,0 +1,44 @@
+name: Release PR
+
+# Keeps one release pull request up to date: the next version and the
+# CHANGELOG, from the Conventional Commit subjects on main (docs/PLAN.md 9.3).
+# It never tags and never creates a release: the tag ruleset is admin-only,
+# and the owner makes each vX.Y.Z release by hand from the merged release
+# commit, which is what starts publish.yml.
+on:
+  push:
+    branches:
+      - main
+
+# No token by default; the one job below names what it needs.
+permissions: {}
+
+# One run at a time, and none cancelled halfway through updating the PR.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    name: Release PR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # contents: write pushes the release branch (version and CHANGELOG);
+    # pull-requests: write opens, updates and labels the pull request. The
+    # action's README also asks for issues: write, to create its two labels;
+    # this job goes without it, and docs/PLAN.md 9.3 says what to do if a
+    # repository's labels are missing.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # The only step: this job checks out nothing and runs no script. The
+      # action reads the repository through the API.
+      - name: Open or update the release pull request
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          # Without this the action would also tag and release every merged
+          # release PR, which the tag ruleset refuses to a workflow's token.
+          skip-github-release: true

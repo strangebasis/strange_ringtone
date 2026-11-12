@@ -46,8 +46,9 @@ HEAD_END = b"\r\n\r\n"
 
 @dataclass(frozen=True)
 class Limits:
-    # Provisional values (PLAN 6.1): the product check may resize them from
-    # one measured fetch. Each is one field here and one README row; tests
+    # Fixed for v0.1.0 (PLAN 6.1) as shipped, after real fetches stayed well
+    # inside them: they are part of the README's deployment contract, so
+    # changing one is a breaking change. Each is one field here and one README row; tests
     # inject their own small values or compare README with these.
     head_max_bytes: int = 4096
     head_deadline_seconds: int = 10

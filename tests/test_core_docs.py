@@ -136,7 +136,7 @@ class PlanTest(unittest.TestCase):
         self.assertIn("setpgid()", section)
         self.assertNotIn("doesn't outlive it (unless", section)
 
-    def test_the_contract_draft_names_the_core_caps(self) -> None:
+    def test_the_plans_contract_record_names_the_core_caps(self) -> None:
         section = _section(self.plan, "5.7 ")
         rows = [line for line in section.splitlines() if line.startswith("| Runs with |")]
         self.assertEqual(len(rows), 1, rows)
@@ -151,7 +151,7 @@ class PlanTest(unittest.TestCase):
         assert match is not None
         self.assertRegex(row, rf"\b{match[1]} ?(?:MB|MiB|m)\b")
 
-    def test_the_contract_draft_names_the_core_sysctls(self) -> None:
+    def test_the_plans_contract_record_names_the_core_sysctls(self) -> None:
         # `ipc: none` leaves System V IPC open, so the contract names the
         # three sysctls that close it, each as the example sets it.
         section = _section(self.plan, "5.7 ")
@@ -164,7 +164,7 @@ class PlanTest(unittest.TestCase):
                 self.assertIsNotNone(setting, f"the core service in compose.example.yaml sets no {key}: {value}")
                 self.assertIn(f"`{key}: {value}`", rows[0])
 
-    def test_the_open_risk_says_what_holds_now(self) -> None:
+    def test_the_accepted_risk_says_what_holds_now(self) -> None:
         bullet = _flat(_bullet(self.plan, "- **An exploited ffmpeg.**"))
         # Claims the code no longer makes true.
         for stale in (
@@ -189,8 +189,11 @@ class PlanTest(unittest.TestCase):
         self.assertRegex(bullet, rf"most {mib}: any bytes")
         self.assertEqual(set(re.findall(r"([0-9.]+) MiB", bullet)), {str(size // MIB)})
         self.assertRegex(bullet, rf"within the collection's {COLLECT_SECONDS:g} s\b")
-        # Accepting a risk is the owner's decision, not the docs'.
-        self.assertNotRegex(bullet, r"(?i)\baccepted\b")
+        # Accepting a risk is the owner's decision, not the docs': the list
+        # says whose it was and when, and the bullet gives the reason.
+        self.assertRegex(_flat(self.plan), r"\*\*Accepted risks in the core\*\* \(owner, \d{4}-\d{2}-\d{2}")
+        self.assertNotIn("Open risks in the core", self.plan)
+        self.assertRegex(bullet, r"Accepted for v0\.1\.0 because ")
 
 
 if __name__ == "__main__":
