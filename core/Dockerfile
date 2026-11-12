@@ -7,7 +7,7 @@
 
 # Same Debian release as the runtime stage, so the dynamically linked glibc the
 # binary needs is the one the runtime has. Pinned by digest; Dependabot bumps it.
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS ffmpeg
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS ffmpeg
 
 # pipefail and -u: a failed download or a typo in a variable stops the build
 # instead of configuring something else.
