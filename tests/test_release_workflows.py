@@ -303,9 +303,9 @@ class ReleasePleaseTest(unittest.TestCase):
         self.text = _text(RELEASE_PLEASE)
         self.jobs = _jobs(self.text)
 
-    def test_it_runs_only_on_pushes_to_main_one_run_at_a_time(self) -> None:
+    def test_it_runs_on_pushes_to_main_or_by_hand_one_run_at_a_time(self) -> None:
         head = _top(self.text)
-        self.assertRegex(head, r"(?m)^on:\n  push:\n    branches:\n      - main\n(?!  \S)")
+        self.assertRegex(head, r"(?m)^on:\n  push:\n    branches:\n      - main\n  workflow_dispatch:\n(?!  \S)")
         self.assertEqual(_mapping(head, "concurrency", 0), {"group": "release-please", "cancel-in-progress": "false"})
 
     def test_the_workflow_has_no_token_of_its_own_and_one_job(self) -> None:
@@ -314,6 +314,11 @@ class ReleasePleaseTest(unittest.TestCase):
         block = self.jobs["release-please"]
         self.assertEqual(_mapping(block, "permissions", 4), {"contents": "write", "pull-requests": "write"})
         self.assertRegex(block, rf"(?m)^    runs-on: {re.escape(RUNNER)}$")
+
+    def test_a_run_started_by_hand_from_another_branch_does_nothing(self) -> None:
+        # workflow_dispatch takes any branch. Picking another one by mistake
+        # must not open a release PR from it: the only job runs for main alone.
+        self.assertRegex(self.jobs["release-please"], r"(?m)^    if: github\.ref == 'refs/heads/main'$")
 
     def test_it_only_keeps_the_release_pr_and_never_tags(self) -> None:
         # The tag ruleset is admin-only: the owner makes each release by hand.

@@ -5,10 +5,14 @@ name: Release PR
 # It never tags and never creates a release: the tag ruleset is admin-only,
 # and the owner makes each vX.Y.Z release by hand from the merged release
 # commit, which is what starts publish.yml.
+# By hand as well: a run that could not start (an action the organisation
+# did not allow yet, say) often cannot be re-run, and without this the
+# release PR would wait for the next merge.
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 # No token by default; the one job below names what it needs.
 permissions: {}
@@ -23,6 +27,9 @@ jobs:
     name: Release PR
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # A run started by hand can name any branch. Picking another one by
+    # mistake must not open a release PR from that branch's state.
+    if: github.ref == 'refs/heads/main'
     # contents: write pushes the release branch (version and CHANGELOG);
     # pull-requests: write opens, updates and labels the pull request. The
     # action's README also asks for issues: write, to create its two labels;
