@@ -17,6 +17,12 @@
   --selection: rgba(10, 100, 216, 0.12);
   --fade: rgba(0, 0, 0, 0.35);
   --handle: #d93025;
+  /* The loop bars of the magnified view, read by zoom.js the same way. */
+  --loop: #a21caf;
+  /* The accent at half strength: what a disabled primary button shows while
+     it says "Rendering…". The Hear final button keeps it as the unplayed
+     part while the finished tone loops. */
+  --accent-dim: color-mix(in srgb, var(--accent) 50%, transparent);
   /* The range thumb's width, used to place the baseline marker under it. */
   --thumb: 28px;
 }
@@ -34,6 +40,7 @@
     --selection: rgba(138, 180, 248, 0.16);
     --fade: rgba(0, 0, 0, 0.5);
     --handle: #f28b82;
+    --loop: #e45fe9;
   }
 }
 
@@ -42,9 +49,13 @@
   display: none !important;
 }
 
+/* overflow-x: the magnified view is 100vw wide, and where the scrollbar takes
+   room (a narrow desktop window) 100vw is wider than the page. Without this
+   the page would scroll sideways by the scrollbar's width. */
 body {
   margin: 0;
   padding: 1rem;
+  overflow-x: clip;
 }
 
 main,
@@ -110,6 +121,20 @@ button:disabled {
   cursor: default;
 }
 
+/* While the finished tone loops, the Hear final button is its playhead
+   (docs/PLAN.md 7.1): the dimmed blue it has while rendering, filled from the
+   left with the full accent as the pass goes on. app.js sets --progress (0 to
+   1) through the CSSOM, which the CSP allows, unlike a style attribute. A
+   browser without color-mix keeps the plain button. border-box, so the fill
+   does not wrap around under the border. */
+@supports (color: color-mix(in srgb, red 50%, transparent)) {
+  #render.playing {
+    border-color: transparent;
+    background: linear-gradient(to right, var(--accent) calc(var(--progress, 0) * 100%),
+      var(--accent-dim) calc(var(--progress, 0) * 100%)) border-box;
+  }
+}
+
 .field-label {
   display: block;
   font-weight: 600;
@@ -173,6 +198,63 @@ input[type="checkbox"] {
   -webkit-user-select: none;
   -webkit-touch-callout: none;
   border-radius: 0.5rem;
+}
+
+/* The magnified view (zoom.js) breaks out of the panel to the screen's edges,
+   so the selection gets every pixel a phone has. 50% is half the panel's
+   content width and the panel is centred, so the two margins reach exactly
+   the viewport's sides. Its own background covers the panel's border where it
+   crosses it. */
+.zoom-band {
+  margin: 0 calc(50% - 50vw);
+  background: Canvas;
+}
+
+/* overflow: a bar dragged to the view's edge has half its touch target
+   outside, which must not widen the page. */
+.zoom {
+  position: relative;
+  overflow: hidden;
+}
+
+/* No touch-action here, unlike #waveform: a touch that is not on a bar
+   scrolls the page as usual, because the view is wide and sits mid-page. */
+#zoom-canvas {
+  display: block;
+  width: 100%;
+  height: 196px;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* What takes the pointer for a bar drawn on the canvas: 44 px wide, Apple's
+   minimum touch target, centred on the bar. zoom.js sets --x, --top and
+   --height through the CSSOM. touch-action: none keeps iOS from scrolling or
+   zooming the page while a bar is dragged. */
+.zoom-bar {
+  position: absolute;
+  left: var(--x, 0);
+  top: var(--top, 0);
+  width: 44px;
+  height: var(--height, 0);
+  margin-left: -22px;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  cursor: ew-resize;
+}
+
+/* In front of the trim bars: where a loop bar lies on a trim bar, the loop
+   bar is the one picked up, and the trim bar is reached by the tip that
+   stands above it. */
+.loop-bar {
+  z-index: 1;
+}
+
+.loop-toggle {
+  padding: 0 1rem;
 }
 
 .readout,
@@ -322,6 +404,12 @@ footer a {
 @media (min-width: 48rem) {
   body {
     padding: 2rem;
+  }
+
+  /* On a wide screen the magnified view lines up with the panels: out
+     through the panel's padding and border, no further. */
+  .zoom-band {
+    margin: 0 calc(-1rem - 1px);
   }
 
   .nudges {

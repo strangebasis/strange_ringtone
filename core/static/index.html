@@ -37,6 +37,16 @@
 <section id="editor" class="panel" hidden aria-labelledby="editor-title">
 <h2 id="editor-title">2. Trim, fade and level</h2>
 <canvas id="waveform" aria-label="Waveform with the selection. Use the buttons below to move its edges."></canvas>
+<div class="zoom-band">
+<div class="zoom">
+<canvas id="zoom-canvas" aria-label="The selection, magnified. Its bars move the same edges more finely; the buttons below move them too."></canvas>
+<div id="zoom-start" class="zoom-bar trim-bar" hidden></div>
+<div id="zoom-end" class="zoom-bar trim-bar" hidden></div>
+<div id="loop-start" class="zoom-bar loop-bar" hidden></div>
+<div id="loop-end" class="zoom-bar loop-bar" hidden></div>
+</div>
+<label class="toggle loop-toggle"><input type="checkbox" id="loop-on"> Enable loop controls</label>
+</div>
 <p id="selection-readout" class="readout" aria-live="polite"></p>
 
 <div class="nudges">
@@ -118,6 +128,7 @@
 <h2 id="help-title">Help</h2>
 <ul>
 <li>Where this server fetches from YouTube, paste a video link under <strong>From YouTube</strong>, or share the video from the YouTube app to a <strong>Make Ringtone</strong> Shortcut that opens this page with the link. Only the video's ID reaches the server and, for a video longer than the server fetches whole (10 minutes at most), the start time you choose.</li>
+<li>The strip under the waveform is the selection, magnified: drag its bars to move an edge more finely. <strong>Enable loop controls</strong> adds two more bars there, and Play then repeats only the part between them, so you can listen to one edge while you move it. The finished tone is still the whole selection.</li>
 <li><strong>Get on this iPhone</strong> opens the share sheet. Choose <strong>Use as Ringtone</strong>, and Settings lists the tone under the name you typed.</li>
 <li>If the share sheet doesn't offer it, tap <strong>Download .m4a</strong> or <strong>Download .m4r</strong>. Open Safari's downloads list (the download icon in the address bar), tap the file, then tap Share and <strong>Use as Ringtone</strong>.</li>
 <li><strong>Duplicate Ringtone</strong> means iOS already has this tone. Delete the old one, or type a new name and tap Hear final again.</li>

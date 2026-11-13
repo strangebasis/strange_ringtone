@@ -477,6 +477,8 @@ class StaticTest(ServerTestCase):
             "style.css": "text/css; charset=utf-8",
             "app.js": "text/javascript; charset=utf-8",
             "waveform.js": "text/javascript; charset=utf-8",
+            "zoom.js": "text/javascript; charset=utf-8",
+            "loop.js": "text/javascript; charset=utf-8",
             "player.js": "text/javascript; charset=utf-8",
             "share.js": "text/javascript; charset=utf-8",
             "fetch.js": "text/javascript; charset=utf-8",

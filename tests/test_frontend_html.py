@@ -334,6 +334,20 @@ class TemplateTest(unittest.TestCase):
         self.assertEqual(by_id["file"], ("input", {
             "type": "file", "id": "file", "accept": "audio/*,.m4a,.mp3,.wav,.aac,.aif,.aiff,.caf,.flac,.m4r"}))
         self.assertEqual(by_id["waveform"][0], "canvas")
+        # The magnified view (docs/PLAN.md 7.1): its canvas, and one element
+        # per bar to take the pointer. zoom.js shows each element when its
+        # bar is drawn, so all four start hidden.
+        self.assertEqual(by_id["zoom-canvas"][0], "canvas")
+        for bar, kind in (("zoom-start", "trim-bar"), ("zoom-end", "trim-bar"),
+                          ("loop-start", "loop-bar"), ("loop-end", "loop-bar")):
+            self.assertEqual(by_id[bar], ("div", {"id": bar, "class": f"zoom-bar {kind}", "hidden": None}))
+        # Loop controls are off until asked for.
+        self.assertEqual(by_id["loop-on"], ("input", {"type": "checkbox", "id": "loop-on"}))
+        # Under the waveform, above the readout, the nudges and Play.
+        ids = template_ids(self.text)
+        order = ["waveform", "zoom-canvas", "zoom-start", "zoom-end", "loop-start", "loop-end", "loop-on",
+                 "selection-readout", "play"]
+        self.assertEqual([name for name in ids if name in order], order)
         for slider, value in (("fade-in", "0.2"), ("fade-out", "1.5")):
             self.assertEqual(by_id[slider][1]["min"], "0")
             self.assertEqual(by_id[slider][1]["max"], "5")
@@ -411,6 +425,9 @@ class TemplateTest(unittest.TestCase):
             "Duplicate Ringtone",
             "Settings &gt; Sounds &amp; Haptics &gt; Ringtone (or Text Tone), swipe left",
             "If you hear nothing, turn off Silent mode.",
+            "<strong>Enable loop controls</strong> adds two more bars there, and Play then repeats only the part"
+            " between them",
+            "The finished tone is still the whole selection.",
             "paste a video link under <strong>From YouTube</strong>",
             "<strong>Make Ringtone</strong> Shortcut",
             "Only the video's ID reaches the server and, for a video longer than the server fetches whole"
@@ -486,6 +503,83 @@ class TouchTest(unittest.TestCase):
         assert match is not None
         self.assertGreaterEqual(int(match.group(1)), 44)
         self.assertIn("const reach = HANDLE_HIT_CSS_PX / 2;", text)
+
+
+class MagnifiedViewTouchTest(unittest.TestCase):
+    """docs/PLAN.md 7.1: the magnified view's bars are dragged with a finger; the rest of it scrolls the page."""
+
+    def setUp(self) -> None:
+        with open(STATIC_DIR / "style.css", encoding="utf-8") as handle:
+            self.css = handle.read()
+
+    def test_a_bar_takes_the_touch_gestures_on_44px(self) -> None:
+        # Each bar is drawn on the canvas, and an element laid over it takes
+        # the pointer. Without touch-action: none iOS scrolls or zooms the
+        # page while a bar is dragged; without user-select a long press
+        # selects it. 44 px is Apple's minimum touch target, centred on the bar.
+        rules = css_declarations(self.css, ".zoom-bar")
+        self.assertEqual(rules.get("touch-action"), "none")
+        self.assertEqual(rules.get("user-select"), "none")
+        self.assertEqual(rules.get("-webkit-user-select"), "none")
+        self.assertEqual(rules.get("width"), "44px")
+        self.assertEqual(rules.get("margin-left"), "-22px")
+        self.assertEqual(rules.get("position"), "absolute")
+        # Placed by zoom.js through the CSSOM, never by a style attribute.
+        self.assertEqual(rules.get("left"), "var(--x, 0)")
+        self.assertEqual(rules.get("top"), "var(--top, 0)")
+        self.assertEqual(rules.get("height"), "var(--height, 0)")
+
+    def test_a_touch_that_is_not_on_a_bar_scrolls_the_page(self) -> None:
+        # The view is as wide as the screen and sits mid-page: were it to
+        # take every touch, as #waveform does, a thumb could not scroll past
+        # it. Only the bars' own elements claim the gesture.
+        for selector in ("#zoom-canvas", ".zoom", ".zoom-band", ".trim-bar", ".loop-bar", ".loop-toggle"):
+            with self.subTest(selector):
+                self.assertNotIn("touch-action", css_declarations(self.css, selector))
+
+    def test_the_loop_bars_lie_in_front_of_the_trim_bars(self) -> None:
+        # Where a loop bar lies on a trim bar, the loop bar takes the touch,
+        # and the trim bar is reached by the tip above it (pinned for zoom.js
+        # in tests/js/zoom.test.mjs). Stacking decides it, so only the loop
+        # bars may be raised.
+        self.assertEqual(css_declarations(self.css, ".loop-bar").get("z-index"), "1")
+        for selector in (".zoom-bar", ".trim-bar", "#zoom-canvas"):
+            with self.subTest(selector):
+                self.assertNotIn("z-index", css_declarations(self.css, selector))
+
+    def test_a_bar_at_the_edge_does_not_widen_the_page(self) -> None:
+        # A bar dragged to the view's edge has half its 44 px outside the
+        # view, and the view is 100vw wide where a scrollbar takes room.
+        self.assertEqual(css_declarations(self.css, ".zoom").get("overflow"), "hidden")
+        self.assertEqual(css_declarations(self.css, ".zoom").get("position"), "relative")
+        self.assertEqual(css_declarations(self.css, "body").get("overflow-x"), "clip")
+
+    def test_the_canvas_is_as_tall_as_the_script_draws(self) -> None:
+        with open(STATIC_DIR / "zoom.js", encoding="utf-8") as handle:
+            text = handle.read()
+        parts = {name: int(value) for name, value in
+                 re.findall(r"^const (LINK|TIP|WAVE|FOOT)_CSS_PX = (\d+);$", text, re.MULTILINE)}
+        self.assertEqual(sorted(parts), ["FOOT", "LINK", "TIP", "WAVE"])
+        self.assertIn("export const HEIGHT_CSS_PX = LINK_CSS_PX + TIP_CSS_PX + WAVE_CSS_PX + FOOT_CSS_PX;", text)
+        self.assertEqual(css_declarations(self.css, "#zoom-canvas").get("height"), f"{sum(parts.values())}px")
+
+    def test_the_hear_final_button_fills_from_the_script_s_progress(self) -> None:
+        # The finished tone's playhead: app.js sets --progress on the button
+        # and adds the class; the fill itself is this rule's.
+        rules = css_declarations(self.css, "#render.playing")
+        # Full accent up to the progress, the dimmed accent from there on:
+        # both stops sit at the same place, so the edge between them is the
+        # playhead.
+        self.assertEqual(
+            re.sub(r"\s+", " ", rules.get("background", "")),
+            "linear-gradient(to right, var(--accent) calc(var(--progress, 0) * 100%),"
+            " var(--accent-dim) calc(var(--progress, 0) * 100%)) border-box",
+        )
+        # The dimmed accent is the accent at the strength a disabled button
+        # shows it, which is what the button looks like while rendering.
+        root = css_declarations(self.css, ":root")
+        self.assertEqual(root.get("--accent-dim"), "color-mix(in srgb, var(--accent) 50%, transparent)")
+        self.assertEqual(css_declarations(self.css, "button:disabled").get("opacity"), "0.5")
 
 
 class JsAuditTest(unittest.TestCase):
@@ -583,7 +677,8 @@ class JsFilesTest(unittest.TestCase):
 
     def test_ui_modules_import_the_audio_modules(self) -> None:
         wanted = {"./audio/decode.js", "./audio/loudness.js", "./audio/request.js", "./audio/suggest.js",
-                  "./audio/wav.js", "./fetch.js", "./player.js", "./share.js", "./waveform.js"}
+                  "./audio/wav.js", "./fetch.js", "./loop.js", "./player.js", "./share.js", "./waveform.js",
+                  "./zoom.js"}
         self.assertEqual(wanted - set(js_imports(self.texts["app.js"])), set())
 
 

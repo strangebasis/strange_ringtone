@@ -12,14 +12,18 @@ import {
   FetchError, fetchAudio, fetchErrorMessage, fetchJob, formatStartTime, MAX_START_SECONDS, parseStartTime,
   parseYouTubeLink, pollJob,
 } from "./fetch.js";
+import { defaultLoop, followSelection, MIN_LOOP_SECONDS } from "./loop.js";
 import { Player } from "./player.js";
 import { canShareFile, fetchResult, isCancel, render, resultUrl, shareFile, ShareError } from "./share.js";
 import { moveEdge, Waveform } from "./waveform.js";
+import { ZoomView } from "./zoom.js";
 
 // The server accepts 44100 Hz PCM only, and the decoder resamples to it.
 const SAMPLE_RATE = 44100;
 // The server refuses a clip under half a second ("too_short").
 const MIN_FRAMES = SAMPLE_RATE / 2;
+// The shortest stretch the loop controls repeat (loop.js).
+const MIN_LOOP_FRAMES = Math.round(MIN_LOOP_SECONDS * SAMPLE_RATE);
 // Past this the limiter works hard; the plan's spike compared -14, -11 and -9.
 const LOUD_WARNING_LUFS = -11;
 const TARGET_MIN_LUFS = -24;
@@ -80,6 +84,12 @@ const el = {
   fileStatus: byId("file-status"),
   editor: byId("editor"),
   waveform: byId("waveform"),
+  zoomCanvas: byId("zoom-canvas"),
+  zoomStart: byId("zoom-start"),
+  zoomEnd: byId("zoom-end"),
+  loopStart: byId("loop-start"),
+  loopEnd: byId("loop-end"),
+  loopOn: byId("loop-on"),
   selectionReadout: byId("selection-readout"),
   nudges: app.querySelector(".nudges"),
   play: byId("play"),
@@ -116,6 +126,15 @@ const state = {
   audio: null,
   fileName: "",
   selection: { start: 0, end: 0 },
+  // The loop bars, in frames (docs/PLAN.md 7.1): null until loop controls are
+  // first turned on for this clip, then kept while they are off, so turning
+  // them on again finds the loop where it was left. It only narrows what Play
+  // repeats and never reaches a render.
+  loop: null,
+  // The frames the preview that is playing repeats, for its playhead. They
+  // are the ones playback started on: a bar dragged meanwhile is heard only
+  // from the restart that follows its release.
+  played: null,
   measured: null,
   // Bumped by every change that would make a rendered result differ, so a
   // render that finishes after a change is not mistaken for the current one.
@@ -160,6 +179,13 @@ let player = null;
 let meterTimer = null;
 
 const waveform = new Waveform(el.waveform);
+const zoom = new ZoomView({
+  canvas: el.zoomCanvas,
+  top: el.waveform,
+  bars: { start: el.zoomStart, end: el.zoomEnd, loopStart: el.loopStart, loopEnd: el.loopEnd },
+});
+// The frame request that keeps the playheads moving while something plays.
+let playheadFrame = null;
 
 // --- formatting -----------------------------------------------------------------
 
@@ -232,11 +258,26 @@ function selectionBuffer() {
   return buffer;
 }
 
+// What Play repeats, in frames: the loop while loop controls are on, else
+// the whole selection.
+function previewRange() {
+  return el.loopOn.checked && state.loop !== null ? state.loop : state.selection;
+}
+
 function startPreview() {
   const buffer = selectionBuffer();
-  player.play(buffer, 0, buffer.duration, previewOptions());
+  const rate = state.audio.sampleRate;
+  const { start, end } = previewRange();
+  const from = state.selection.start;
+  // The buffer holds the selection alone, so its whole length is the stretch
+  // the fades belong to, whatever part of it loops: the loop sounds as the
+  // finished tone will there.
+  player.play(buffer, (start - from) / rate, (end - from) / rate, previewOptions(),
+    { start: 0, end: buffer.duration });
   state.playing = "preview";
+  state.played = { start, end };
   updateButtons();
+  watchPlayback();
 }
 
 function playFinal() {
@@ -244,17 +285,60 @@ function playFinal() {
   player.playPlain(state.result.buffer);
   state.playing = "final";
   updateButtons();
+  watchPlayback();
 }
 
 function stopPlayback() {
   if (player !== null) player.stop();
   state.playing = null;
+  if (playheadFrame !== null) {
+    cancelAnimationFrame(playheadFrame);
+    playheadFrame = null;
+  }
   updateButtons();
+  showPlayhead();
+}
+
+// What Play repeats has changed: a preview that is running starts over on it.
+function restartPreview() {
+  if (state.playing === "preview") startPreview();
+}
+
+// Where the pass being heard has got to (docs/PLAN.md 7.1). The preview's
+// playhead is the magnified view: what has played so far takes the
+// waveform's colour. The finished tone's is the Hear final button itself,
+// which fills as the pass goes on; the magnified view stays as it is then,
+// because what plays is the rendered file, not the picture's audio.
+function showPlayhead() {
+  const progress = player === null ? null : player.progress();
+  if (state.playing === "preview" && progress !== null && state.audio !== null) {
+    const from = state.played.start;
+    zoom.setPlayed({ from, to: from + Math.round(progress.position * state.audio.sampleRate) });
+  } else {
+    zoom.setPlayed(null);
+  }
+  const share = state.playing === "final" && progress !== null ? progress.position / progress.duration : 0;
+  // CSSOM, not a style attribute: the CSP's style-src 'self' allows this.
+  el.render.style.setProperty("--progress", String(share));
+}
+
+// Redraw the playheads on every frame for as long as something plays.
+function watchPlayback() {
+  showPlayhead();
+  if (state.playing === null || playheadFrame !== null) return;
+  playheadFrame = requestAnimationFrame(() => {
+    playheadFrame = null;
+    watchPlayback();
+  });
 }
 
 function updateButtons() {
-  el.play.textContent = state.playing === "preview" ? "Stop" : "Play selection";
+  // The button says what a tap will play.
+  const play = el.loopOn.checked ? "Play loop" : "Play selection";
+  el.play.textContent = state.playing === "preview" ? "Stop" : play;
   el.play.disabled = state.audio === null;
+  // The style that makes the button the finished tone's playhead.
+  el.render.classList.toggle("playing", state.playing === "final");
   if (state.busy) {
     el.render.textContent = "Rendering…";
   } else {
@@ -481,27 +565,77 @@ function selectionChanged() {
   scheduleMeter();
 }
 
-function selectionCommitted() {
-  if (state.playing === "preview") startPreview();
+// The loop bars as the magnified view shows them: only while loop controls
+// are on.
+function showLoop() {
+  zoom.setLoop(el.loopOn.checked ? state.loop : null);
+}
+
+/**
+ * After state.selection moved away from `before`: the magnified view shows
+ * it, and the loop follows it (loop.js). The loop follows while loop controls
+ * are off too, so turning them on again finds it inside the selection.
+ * @param {{start: number, end: number}} before
+ * @param {"edge" | "move"} how an edge was moved, or the whole selection slid
+ */
+function selectionMoved(before, how) {
+  if (state.loop !== null) {
+    state.loop = followSelection(state.loop, before, state.selection, how, MIN_LOOP_FRAMES);
+  }
+  zoom.setSelection(state.selection.start, state.selection.end);
+  showLoop();
 }
 
 function nudge(edge, seconds) {
   const frame = state.selection[edge] + Math.round(seconds * state.audio.sampleRate);
   const moved = moveEdge(state.selection, edge, frame, state.audio.length, MAX_FRAMES, MIN_FRAMES);
+  const before = state.selection;
   if (!applySelection(moved)) return;
   waveform.setSelection(state.selection.start, state.selection.end);
+  selectionMoved(before, "edge");
   selectionChanged();
-  selectionCommitted();
+  restartPreview();
 }
 
 waveform.on("change", (selection) => {
+  const before = state.selection;
   applySelection(selection);
   if (selection.start !== state.selection.start || selection.end !== state.selection.end) {
     waveform.setSelection(state.selection.start, state.selection.end);
   }
+  selectionMoved(before, selection.edge === "move" ? "move" : "edge");
   selectionChanged();
 });
-waveform.on("commit", selectionCommitted);
+waveform.on("commit", restartPreview);
+
+// The magnified view's trim bars move the same two edges, so the waveform
+// follows them as the magnified view follows the waveform's handles.
+zoom.on("change", (selection) => {
+  const before = state.selection;
+  applySelection(selection);
+  waveform.setSelection(state.selection.start, state.selection.end);
+  selectionMoved(before, "edge");
+  selectionChanged();
+});
+zoom.on("commit", restartPreview);
+
+// A loop bar changes what Play repeats and nothing else: no invalidate(),
+// because a rendered tone does not depend on it.
+zoom.on("loopchange", (loop) => {
+  state.loop = { start: loop.start, end: loop.end };
+});
+zoom.on("loopcommit", restartPreview);
+
+el.loopOn.addEventListener("input", () => {
+  // The first time on a clip the loop runs from the selection's start to its
+  // middle; after that it is where it was left.
+  if (el.loopOn.checked && state.loop === null && state.audio !== null) {
+    state.loop = defaultLoop(state.selection, MIN_LOOP_FRAMES);
+  }
+  showLoop();
+  updateButtons();
+  restartPreview();
+});
 
 el.nudges.addEventListener("click", (event) => {
   const button = event.target instanceof Element ? event.target.closest("button[data-edge]") : null;
@@ -532,6 +666,9 @@ function resetForNewFile() {
   // The waveform held the old clip's samples too; the next file decodes
   // into memory of its own, so the old one must go first.
   waveform.clear();
+  zoom.clear();
+  // The loop belongs to the clip; the next one starts with the default.
+  state.loop = null;
   state.measured = null;
   state.generation += 1;
   el.editor.hidden = true;
@@ -618,6 +755,13 @@ async function loadAudio(file, token, {
   waveform.setAudio(audio.channels, audio.sampleRate, audio.length, { maxFrames: MAX_FRAMES, minFrames: MIN_FRAMES });
   waveform.setSelection(state.selection.start, state.selection.end);
   waveform.setFades(fadeSettings().fadeIn, fadeSettings().fadeOut);
+  // With loop controls already on, this clip's first loop is made here.
+  state.loop = el.loopOn.checked ? defaultLoop(state.selection, MIN_LOOP_FRAMES) : null;
+  zoom.setAudio(audio.channels, audio.sampleRate, audio.length,
+    { maxFrames: MAX_FRAMES, minFrames: MIN_FRAMES, minLoopFrames: MIN_LOOP_FRAMES });
+  zoom.setSelection(state.selection.start, state.selection.end);
+  zoom.setFades(fadeSettings().fadeIn, fadeSettings().fadeOut);
+  showLoop();
   // suggestSelection takes a clip no longer than the cap whole, from 0, before
   // any rule looks at it, so naming the t= or the heatmap there would be wrong.
   const rule = duration <= config.maxClipSeconds ? "whole" : suggestionRule(duration, options);
@@ -945,6 +1089,7 @@ function updateFades() {
   el.fadeOutValue.textContent = Number(el.fadeOut.value).toFixed(1) + " s";
   const { fadeIn, fadeOut } = fadeSettings();
   waveform.setFades(fadeIn, fadeOut);
+  zoom.setFades(fadeIn, fadeOut);
   if (player !== null) player.update({ fadeIn, fadeOut });
 }
 

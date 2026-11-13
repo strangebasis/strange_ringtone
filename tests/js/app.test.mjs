@@ -7,6 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import { stretchCurve } from "../../core/static/audio/fades.js";
 import { integratedLufs } from "../../core/static/audio/loudness.js";
 import { fetchErrorMessage } from "../../core/static/fetch.js";
 import { dbToGain } from "../../core/static/player.js";
@@ -1617,4 +1618,351 @@ test("a timestamp that changes while a short video is on its way moves the selec
   assert.deepEqual(fetchUrls(page), ["/fetch/api/jobs", `/fetch/api/jobs/${JOB_ID}`, `/fetch/api/jobs/${JOB_ID}/audio`]);
   // Rule 1 with the time the link has now.
   assert.equal(page.el("selection-readout").textContent, "0:20.0 to 0:35.0, 15.0 s (the maximum)");
+});
+
+// --- the magnified view, the loop controls and the playheads (docs/PLAN.md 7.1) -----
+
+// The colour zoom.js falls back on for --wave when the stylesheet gives none:
+// what the magnified view draws played audio in.
+const PLAYED = "#0a64d8";
+
+// The fake canvas is 343 px wide and the cap is 15 s here, so the magnified
+// view shows the 15 s selection on 343 - 2 * 24 = 295 px: 59 px is exactly 3 s.
+const THREE_SECONDS_PX = 59;
+const ZOOM_MARGIN_PX = 24;
+
+function tick(page, id, on) {
+  page.el(id).checked = on;
+  page.el(id).dispatch("input");
+}
+
+// Drag one of the magnified view's bars from where it is by `dx` pixels.
+function dragBar(page, id, dx, { lift = true } = {}) {
+  const bar = page.el(id);
+  const x = Number.parseFloat(bar.style["--x"]);
+  bar.dispatch("pointerdown", { pointerId: 1, clientX: x });
+  bar.dispatch("pointermove", { pointerId: 1, clientX: x + dx });
+  if (lift) bar.dispatch("pointerup", { pointerId: 1, clientX: x + dx });
+}
+
+// Where a bar of the magnified view is, in CSS pixels, to a thousandth.
+function barX(page, id) {
+  return Math.round(Number.parseFloat(page.el(id).style["--x"]) * 1000) / 1000;
+}
+
+// What the preview started last repeats: [offset, length] in seconds of the selection.
+function previewed(page) {
+  const [context] = page.contexts();
+  const previews = context.sources.filter((source) => !source.loop);
+  assert.ok(previews.length > 0, "no preview was started");
+  const [, offset, length] = previews[previews.length - 1].starts[0];
+  return [Math.round(offset * 1000) / 1000, Math.round(length * 1000) / 1000];
+}
+
+function playOnce(page) {
+  page.el("play").dispatch("click");
+  const played = previewed(page);
+  page.el("play").dispatch("click");
+  return played;
+}
+
+function selectionLength(page) {
+  const match = /, (\d+\.\d) s/.exec(page.el("selection-readout").textContent);
+  assert.ok(match, page.el("selection-readout").textContent);
+  return Number(match[1]);
+}
+
+test("with loop controls on, Play repeats the loop and the button says so", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  assert.equal(page.el("loop-on").checked, false, "off by default");
+  assert.equal(page.el("play").textContent, "Play selection");
+  assert.equal(page.el("loop-start").hidden, true);
+  assert.equal(page.el("loop-end").hidden, true);
+  assert.deepEqual(playOnce(page), [0, 15]);
+
+  tick(page, "loop-on", true);
+  assert.equal(page.el("play").textContent, "Play loop");
+  assert.equal(page.el("loop-start").hidden, false);
+  assert.equal(page.el("loop-end").hidden, false);
+  // The first loop on a clip: from the selection's start to its middle.
+  assert.deepEqual(playOnce(page), [0, 7.5]);
+  assert.equal(page.el("play").textContent, "Play loop", "back from Stop");
+
+  tick(page, "loop-on", false);
+  assert.equal(page.el("play").textContent, "Play selection");
+  assert.equal(page.el("loop-start").hidden, true);
+  assert.deepEqual(playOnce(page), [0, 15]);
+});
+
+test("the loop is heard with the selection's fades: the stretch plays inside the whole selection", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  tick(page, "loop-on", true);
+  dragBar(page, "loop-start", THREE_SECONDS_PX);
+  page.el("play").dispatch("click");
+  const [context] = page.contexts();
+  // The first GainNode is the fade gain (player.js). One curve per pass, as
+  // long as the loop, not as long as the selection.
+  const curves = context.gains[0].gain.calls.filter((call) => call.method === "setValueCurveAtTime");
+  assert.ok(curves.length > 0);
+  assert.equal(curves[0].duration, 4.5);
+  assert.deepEqual(previewed(page), [3, 4.5]);
+  // 3 s to 7.5 s of a 15 s selection with the default fades (0.2 s in, 1.5 s
+  // out): the tone is at full level there, so the loop is too, between the
+  // two cuts. Fades of the loop's own would still be rising 0.1 s in and
+  // already falling half a second before its end.
+  const { curve } = curves[0];
+  assert.deepEqual(curve, stretchCurve(3, 4.5, 15, 0.2, 1.5));
+  assert.equal(curve[0], 0, "the cut");
+  assert.equal(curve[20], 1, "0.1 s in");
+  assert.equal(curve[curve.length - 101], 1, "half a second before the end");
+  assert.equal(curve[curve.length - 1], 0, "the cut");
+  page.el("play").dispatch("click");
+});
+
+test("the magnified view follows the waveform's handles and the nudge buttons", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  for (let i = 0; i < 3; i += 1) await page.nudge("end", "-1");
+  assert.equal(selectionLength(page), 12);
+  // Re-fitted at once: the bars are back at the margins, and the same 59 px
+  // that were 3 s of the 15 s selection are 2.4 s of this one.
+  assert.equal(barX(page, "zoom-start"), ZOOM_MARGIN_PX);
+  assert.equal(barX(page, "zoom-end"), 343 - ZOOM_MARGIN_PX);
+  dragBar(page, "zoom-start", THREE_SECONDS_PX);
+  assert.equal(selectionLength(page), 9.6);
+  // The waveform's own handle: the magnified view shows what it did.
+  const waveform = page.el("waveform");
+  const readout = /^0:(\d+\.\d) to 0:(\d+\.\d)/.exec(page.el("selection-readout").textContent);
+  assert.ok(readout, page.el("selection-readout").textContent);
+  const endX = (Number(readout[2]) / 60) * 343;
+  waveform.dispatch("pointerdown", { pointerId: 2, clientX: endX });
+  waveform.dispatch("pointermove", { pointerId: 2, clientX: endX - 20 });
+  waveform.dispatch("pointerup", { pointerId: 2, clientX: endX - 20 });
+  const shorter = selectionLength(page);
+  assert.ok(shorter < 9.6, String(shorter));
+  assert.equal(barX(page, "zoom-end"), 343 - ZOOM_MARGIN_PX);
+  // And a drag in the magnified view is measured on that selection.
+  dragBar(page, "zoom-end", -THREE_SECONDS_PX);
+  assert.ok(Math.abs(selectionLength(page) - shorter * 0.8) <= 0.11, String(selectionLength(page)));
+});
+
+test("turning loop controls on or off, or letting a loop bar go, restarts a running preview on the new stretch", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  page.el("play").dispatch("click");
+  assert.deepEqual(previewed(page), [0, 15]);
+  tick(page, "loop-on", true);
+  assert.equal(page.el("play").textContent, "Stop", "still playing");
+  assert.deepEqual(previewed(page), [0, 7.5]);
+  // While the bar is held, the preview goes on as it was.
+  dragBar(page, "loop-start", THREE_SECONDS_PX, { lift: false });
+  assert.deepEqual(previewed(page), [0, 7.5]);
+  page.el("loop-start").dispatch("pointerup", { pointerId: 1, clientX: 0 });
+  assert.deepEqual(previewed(page), [3, 4.5]);
+  tick(page, "loop-on", false);
+  assert.deepEqual(previewed(page), [0, 15]);
+  page.el("play").dispatch("click");
+  // Stopped: ticking the box starts nothing.
+  const [context] = page.contexts();
+  const before = context.sources.length;
+  tick(page, "loop-on", true);
+  assert.equal(context.sources.length, before);
+  assert.equal(page.el("play").textContent, "Play loop");
+});
+
+test("the loop controls never change the tone: no render is discarded and the WAV is the whole selection", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server(), navigator: SHARE_SHEET });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  await renderNow(page);
+  assert.equal(page.el("deliver").hidden, false);
+  tick(page, "loop-on", true);
+  dragBar(page, "loop-start", THREE_SECONDS_PX);
+  dragBar(page, "loop-end", -20);
+  tick(page, "loop-on", false);
+  tick(page, "loop-on", true);
+  // The finished tone is still the current one.
+  assert.equal(page.el("deliver").hidden, false);
+  assert.equal(page.el("render-status").textContent, "Playing the finished tone on a loop.");
+  assert.equal(page.el("download-m4r").href, `/api/result/${RESULT_ID}.m4r`);
+  // And a render with a loop set sends pink bar to pink bar.
+  const next = await loadApp({ maxClipSeconds: "15", fetch: server(), navigator: SHARE_SHEET });
+  await pickFile(next, "My Song.mp3", [SONG]);
+  tick(next, "loop-on", true);
+  dragBar(next, "loop-start", THREE_SECONDS_PX);
+  await renderNow(next);
+  assert.equal(postedFrames(next), 15 * RATE);
+});
+
+test("a trim bar of the magnified view moves its edge finely, in both pictures and in the tone", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server(), navigator: SHARE_SHEET });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  assert.equal(page.el("zoom-start").hidden, false);
+  assert.equal(page.el("zoom-end").hidden, false);
+  assert.equal(barX(page, "zoom-start"), ZOOM_MARGIN_PX);
+  await renderNow(page);
+  page.el("render").dispatch("click");
+  // 59 px here is 3 s; on the waveform above, 59 px of this clip is over 10 s.
+  dragBar(page, "zoom-start", THREE_SECONDS_PX, { lift: false });
+  assert.equal(selectionLength(page), 12);
+  // A change to the selection, like any other: the finished tone is stale.
+  assert.equal(page.el("deliver").hidden, true);
+  assert.equal(page.el("render-status").textContent, "Changed since the last render. Tap Hear final to render it again.");
+  // Held: the bar is where the finger took it, on a picture that did not move.
+  assert.equal(barX(page, "zoom-start"), ZOOM_MARGIN_PX + THREE_SECONDS_PX);
+  page.el("zoom-start").dispatch("pointerup", { pointerId: 1, clientX: 0 });
+  // Let go: the view glides to fit the new selection.
+  page.frame(0);
+  page.frame(1000);
+  assert.equal(barX(page, "zoom-start"), ZOOM_MARGIN_PX);
+  await renderNow(page);
+  const renders = page.fetchCalls.filter((call) => call.url.startsWith("/api/render?"));
+  assert.equal(wavShape(renders[renders.length - 1].init.body).frames, 12 * RATE);
+});
+
+test("letting a trim bar of the magnified view go restarts a running preview on the new selection", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  page.el("play").dispatch("click");
+  dragBar(page, "zoom-end", -THREE_SECONDS_PX, { lift: false });
+  assert.deepEqual(previewed(page), [0, 15], "not while the bar is held");
+  page.el("zoom-end").dispatch("pointerup", { pointerId: 1, clientX: 0 });
+  assert.deepEqual(previewed(page), [0, 12]);
+  page.el("play").dispatch("click");
+});
+
+test("a loop bar on a trim bar travels with it; a loop bar elsewhere keeps its place in the audio", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  tick(page, "loop-on", true);
+  // Room to move the start earlier without the cap pulling the end along.
+  await page.nudge("end", "-1");
+  await page.nudge("start", "-1");
+  // The loop's start went with the start bar; its end stayed in the audio.
+  assert.deepEqual(playOnce(page), [0, 8.5]);
+  await page.nudge("start", "1");
+  assert.deepEqual(playOnce(page), [0, 7.5]);
+
+  // Off the trim bar, it stays where it is when the start moves.
+  const free = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(free, "My Song.mp3", [SONG]);
+  tick(free, "loop-on", true);
+  dragBar(free, "loop-start", THREE_SECONDS_PX);
+  assert.deepEqual(playOnce(free), [3, 4.5]);
+  // At the cap, moving the start a second earlier pulls the end along: both
+  // edges move by the same amount, and still the loop does not move.
+  await free.nudge("start", "-1");
+  assert.equal(selectionLength(free), 15);
+  assert.deepEqual(playOnce(free), [4, 4.5]);
+});
+
+test("a trim bar that reaches a loop bar pushes it along", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  tick(page, "loop-on", true);
+  dragBar(page, "loop-start", THREE_SECONDS_PX);
+  // The loop is 3 s to 7.5 s; the end bar comes in to 6 s.
+  for (let i = 0; i < 9; i += 1) await page.nudge("end", "-1");
+  assert.equal(selectionLength(page), 6);
+  assert.deepEqual(playOnce(page), [3, 3]);
+});
+
+test("sliding the whole selection on the waveform carries the loop along", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  tick(page, "loop-on", true);
+  dragBar(page, "loop-start", THREE_SECONDS_PX);
+  const before = page.el("selection-readout").textContent;
+  // 60 s on 343 px: the selection is about 86 px wide. A press in its middle
+  // slides it whole.
+  const start = /^0:(\d+\.\d) to/.exec(before);
+  assert.ok(start, before);
+  const middle = ((Number(start[1]) + 7.5) / 60) * 343;
+  const waveform = page.el("waveform");
+  waveform.dispatch("pointerdown", { pointerId: 2, clientX: middle });
+  waveform.dispatch("pointermove", { pointerId: 2, clientX: middle + 40 });
+  waveform.dispatch("pointerup", { pointerId: 2, clientX: middle + 40 });
+  assert.notEqual(page.el("selection-readout").textContent, before);
+  assert.equal(selectionLength(page), 15);
+  // The loop is where it was in the selection, not where it was in the audio.
+  assert.deepEqual(playOnce(page), [3, 4.5]);
+});
+
+test("the loop is kept while its box is off, and a new clip starts with the default again", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  tick(page, "loop-on", true);
+  dragBar(page, "loop-start", THREE_SECONDS_PX);
+  tick(page, "loop-on", false);
+  tick(page, "loop-on", true);
+  assert.deepEqual(playOnce(page), [3, 4.5], "where it was left");
+  // Off, a nudge of the end past the loop's end still pushes it: turning the
+  // box on again finds the loop inside the selection.
+  tick(page, "loop-on", false);
+  for (let i = 0; i < 9; i += 1) await page.nudge("end", "-1");
+  tick(page, "loop-on", true);
+  assert.deepEqual(playOnce(page), [3, 3]);
+  // Another clip, the box still ticked: its loop is the default, shown at once.
+  await pickFile(page, "Other.mp3", [SONG]);
+  assert.equal(page.el("loop-on").checked, true);
+  assert.equal(page.el("loop-start").hidden, false);
+  assert.deepEqual(playOnce(page), [0, 7.5]);
+});
+
+test("the preview's playhead is the magnified view: what has played takes the waveform's colour", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server() });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  const canvas = page.el("zoom-canvas");
+  assert.equal(canvas.fills.includes(PLAYED), false, "nothing plays yet");
+  page.el("play").dispatch("click");
+  const [context] = page.contexts();
+  // Five seconds into the 15 s pass, one frame later.
+  context.currentTime = 5.05;
+  canvas.fills.length = 0;
+  assert.equal(page.frame(), 1);
+  assert.equal(canvas.fills.includes(PLAYED), true);
+  assert.equal(page.pendingFrames(), 1, "the next frame is asked for while it plays");
+  // Stopped: drawn without the fill, and no more frames are asked for.
+  canvas.fills.length = 0;
+  page.el("play").dispatch("click");
+  assert.ok(canvas.fills.length > 0, "redrawn");
+  assert.equal(canvas.fills.includes(PLAYED), false);
+  assert.equal(page.pendingFrames(), 0);
+});
+
+test("the finished tone's playhead is the Hear final button, and the magnified view stays as it is", async () => {
+  const page = await loadApp({ maxClipSeconds: "15", fetch: server(), navigator: SHARE_SHEET });
+  await pickFile(page, "My Song.mp3", [SONG]);
+  const render = page.el("render");
+  const canvas = page.el("zoom-canvas");
+  assert.equal(render.classes.has("playing"), false);
+  await renderNow(page);
+  assert.equal(render.textContent, "Stop final");
+  assert.equal(render.classes.has("playing"), true);
+  assert.equal(render.style["--progress"], "0");
+  const [context] = page.contexts();
+  // The fake decoder's tone is one second long; half of a pass has been heard.
+  context.currentTime += 0.55;
+  canvas.fills.length = 0;
+  assert.equal(page.frame(), 1);
+  assert.ok(Math.abs(Number(render.style["--progress"]) - 0.5) < 1e-9, render.style["--progress"]);
+  assert.equal(canvas.fills.includes(PLAYED), false, "the finished tone does not fill the magnified view");
+  // The second pass: the fill starts over.
+  context.currentTime += 0.75;
+  page.frame();
+  assert.ok(Math.abs(Number(render.style["--progress"]) - 0.25) < 1e-9, render.style["--progress"]);
+  // Stopped: a plain button again.
+  render.dispatch("click");
+  assert.equal(render.textContent, "Hear final");
+  assert.equal(render.classes.has("playing"), false);
+  assert.equal(render.style["--progress"], "0");
+  assert.equal(page.pendingFrames(), 0);
+  // Play selection is the preview's: the button stays plain while it runs.
+  page.el("play").dispatch("click");
+  context.currentTime += 3;
+  page.frame();
+  assert.equal(render.classes.has("playing"), false);
+  assert.equal(render.style["--progress"], "0");
+  page.el("play").dispatch("click");
 });
