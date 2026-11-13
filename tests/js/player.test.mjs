@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { fadeGainAt } from "../../core/static/audio/fades.js";
+import { fadeGainAt, stretchCurve } from "../../core/static/audio/fades.js";
 import { dbToGain, Player } from "../../core/static/player.js";
 
 class FakeParam {
@@ -204,5 +204,124 @@ test("stop ends every source and stops pumping", () => {
     context.currentTime = 0.9;
     player.pump();
     assert.equal(context.sources.length, 1);
+  });
+});
+
+// --- a part of the selection (the loop controls) and the playheads -----------------
+
+function near(actual, expected, label) {
+  assert.ok(Math.abs(actual - expected) <= 1e-9, `${label}: ${actual} != ${expected}`);
+}
+
+test("a part of the selection loops with the selection's fades, not fades of its own", () => {
+  withPlayer(({ context, player, fadeGain }) => {
+    // The buffer's 2 s to 6 s is the selection; its first second loops.
+    player.play(BUFFER, 2, 3, { fadeIn: 0.5, fadeOut: 1, gainDb: 0 }, { start: 2, end: 6 });
+    const [first] = context.sources;
+    // Only the part is played.
+    assert.deepEqual(first.starts, [[0.05, 2, 1]]);
+    const [curve] = fadeGain.gain.named("setValueCurveAtTime");
+    assert.equal(curve.time, 0.05);
+    assert.equal(curve.duration, 1);
+    assert.deepEqual(curve.curve, stretchCurve(0, 1, 4, 0.5, 1));
+    // The selection's fade-in is heard, and after it the level is full: the
+    // selection's fade-out is three seconds away, so nothing fades towards
+    // the part's end but the few milliseconds at the cut.
+    assert.equal(curve.curve[0], 0);
+    assert.equal(curve.curve[Math.round(curve.curve.length / 2)], 1);
+    assert.equal(curve.curve[curve.curve.length - 3], 1);
+    assert.equal(curve.curve[curve.curve.length - 1], 0);
+  });
+});
+
+test("a part at the selection's end is heard with the selection's fade-out", () => {
+  withPlayer(({ context, player, fadeGain }) => {
+    player.play(BUFFER, 5, 6, { fadeIn: 0.5, fadeOut: 2, gainDb: 0 }, { start: 2, end: 6 });
+    assert.deepEqual(context.sources[0].starts, [[0.05, 5, 1]]);
+    const [curve] = fadeGain.gain.named("setValueCurveAtTime");
+    assert.deepEqual(curve.curve, stretchCurve(3, 1, 4, 0.5, 2));
+    // Halfway through the two-second fade-out where the part begins (after
+    // the cut's own few milliseconds), and silent at the end.
+    near(curve.curve[2], Math.fround(fadeGainAt(3 + 2 / (curve.curve.length - 1), 4, 0.5, 2)), "third point");
+    assert.ok(curve.curve[2] < 0.72 && curve.curve[2] > 0.69);
+    assert.equal(curve.curve[curve.curve.length - 1], 0);
+  });
+});
+
+test("every pass of a part gets the same curve, each where the last one ends", () => {
+  withPlayer(({ context, player, fadeGain }) => {
+    player.play(BUFFER, 3, 4, { fadeIn: 0.5, fadeOut: 1, gainDb: 0 }, { start: 2, end: 6 });
+    context.currentTime = 0.7;
+    player.pump();
+    assert.deepEqual(context.sources.map((source) => source.starts[0]), [[0.05, 3, 1], [1.05, 3, 1]]);
+    const curves = fadeGain.gain.named("setValueCurveAtTime");
+    assert.equal(curves.length, 2);
+    assert.deepEqual(curves[1].curve, stretchCurve(1, 1, 4, 0.5, 1));
+    assert.equal(curves[1].time, curves[0].time + curves[0].duration);
+  });
+});
+
+test("progress says how far the pass being heard has got", () => {
+  withPlayer(({ context, player }) => {
+    assert.equal(player.progress(), null, "nothing plays");
+    player.play(BUFFER, 2, 3, { fadeIn: 0, fadeOut: 0, gainDb: 0 });
+    // The first pass starts 50 ms from now.
+    assert.deepEqual(player.progress(), { position: 0, duration: 1 });
+    context.currentTime = 0.55;
+    near(player.progress().position, 0.5, "half the first pass");
+    // The third pass: every pass starts a whole number of lengths after the first.
+    context.currentTime = 2.3;
+    near(player.progress().position, 0.25, "a quarter of the third pass");
+    assert.equal(player.progress().duration, 1);
+    player.stop();
+    assert.equal(player.progress(), null, "stopped");
+  });
+});
+
+test("the output latency is taken off, so the playhead is where the sound is", () => {
+  withPlayer(({ context, player }) => {
+    player.play(BUFFER, 2, 3, { fadeIn: 0, fadeOut: 0, gainDb: 0 });
+    // What the clock has reached leaves the speakers 0.2 s later.
+    context.outputLatency = 0.2;
+    context.currentTime = 0.75;
+    near(player.progress().position, 0.5, "with latency");
+    // Nothing is heard yet: not a position before the pass's start.
+    context.currentTime = 0.1;
+    assert.equal(player.progress().position, 0);
+    // A browser that reports none, or nonsense, changes nothing.
+    for (const latency of [undefined, Number.NaN, -1, 0]) {
+      context.outputLatency = latency;
+      context.currentTime = 0.55;
+      near(player.progress().position, 0.5, String(latency));
+    }
+  });
+});
+
+test("after a gap the passes are counted from the restart", () => {
+  withPlayer(({ context, player }) => {
+    player.play(BUFFER, 2, 3, { fadeIn: 0, fadeOut: 0, gainDb: 0 });
+    // The page was throttled for five seconds and the queue ran dry: the
+    // loop starts afresh 50 ms from now.
+    // Not a whole number of passes after the first start, or counting from
+    // the first start would give the same answer.
+    context.currentTime = 5.4;
+    player.pump();
+    assert.deepEqual(context.sources[context.sources.length - 1].starts, [[5.4 + 0.05, 2, 1]]);
+    context.currentTime = 5.7;
+    near(player.progress().position, 0.25, "counted from the fresh start");
+  });
+});
+
+test("the finished tone's progress runs over the whole file", () => {
+  withPlayer(({ context, player }) => {
+    context.currentTime = 1;
+    player.playPlain({ duration: 15 });
+    assert.deepEqual(player.progress(), { position: 0, duration: 15 });
+    context.currentTime = 1.05 + 6;
+    near(player.progress().position, 6, "six seconds in");
+    // The file loops by itself (source.loop), so the second pass starts 15 s on.
+    context.currentTime = 1.05 + 15 + 3;
+    near(player.progress().position, 3, "the second pass");
+    assert.equal(player.progress().duration, 15);
   });
 });

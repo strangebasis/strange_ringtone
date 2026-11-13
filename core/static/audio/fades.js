@@ -84,3 +84,73 @@ export function fadeCurve(duration, fadeIn, fadeOut) {
 export function scheduleFades(gainParam, startTime, duration, fadeIn, fadeOut) {
   gainParam.setValueCurveAtTime(fadeCurve(duration, fadeIn, fadeOut), startTime, duration);
 }
+
+// A loop that cuts into the middle of the audio jumps from one sample value to
+// an unrelated one on every pass, which clicks. A ramp this long at such a cut
+// removes the click and is too short to hear as a fade.
+export const SEAM_SECONDS = 0.005;
+// Half a sample at 44.1 kHz: two times that differ by less are the same frame.
+const SAME_FRAME_SECONDS = 1 / 88200;
+
+/**
+ * Gain of one stretch of the faded selection, t seconds into the stretch: the
+ * loop controls play such a stretch (docs/PLAN.md 7.1). It is what the
+ * finished tone has there, so the fades stay on the selection's edges and are
+ * heard only where the stretch covers them. An end of the stretch that is not
+ * an end of the selection is a cut in mid-audio, and gets the seam ramp.
+ * @param {number} t seconds from the stretch's start
+ * @param {number} offset where the stretch starts, in seconds from the selection's start
+ * @param {number} length the stretch's length in seconds
+ * @param {number} duration selection length in seconds
+ * @param {number} fadeIn seconds (0 for none)
+ * @param {number} fadeOut seconds (0 for none)
+ * @returns {number} gain in [0, 1]
+ */
+export function stretchGainAt(t, offset, length, duration, fadeIn, fadeOut) {
+  let gain = fadeGainAt(offset + t, duration, fadeIn, fadeOut);
+  if (offset > SAME_FRAME_SECONDS) {
+    gain *= Math.min(1, Math.max(0, t / SEAM_SECONDS));
+  }
+  if (offset + length < duration - SAME_FRAME_SECONDS) {
+    gain *= Math.min(1, Math.max(0, (length - t) / SEAM_SECONDS));
+  }
+  return gain;
+}
+
+/**
+ * stretchGainAt sampled for setValueCurveAtTime, on fadeCurve's grid. For the
+ * whole selection (offset 0, length equal to duration) it is fadeCurve.
+ * @param {number} offset seconds from the selection's start
+ * @param {number} length the stretch's length in seconds (> 0)
+ * @param {number} duration selection length in seconds
+ * @param {number} fadeIn seconds
+ * @param {number} fadeOut seconds
+ * @returns {Float32Array}
+ */
+export function stretchCurve(offset, length, duration, fadeIn, fadeOut) {
+  if (!(Number.isFinite(length) && length > 0)) {
+    throw new RangeError("length must be positive");
+  }
+  const points = Math.max(2, Math.ceil(length * POINTS_PER_SECOND) + 1);
+  const curve = new Float32Array(points);
+  for (let i = 0; i < points; i += 1) {
+    curve[i] = stretchGainAt((i / (points - 1)) * length, offset, length, duration, fadeIn, fadeOut);
+  }
+  return curve;
+}
+
+/**
+ * Schedule one loop iteration of a stretch of the selection: scheduleFades
+ * for the part of the faded selection that the stretch covers. One curve per
+ * iteration, for the reason given there.
+ * @param {AudioParam} gainParam the fade GainNode's gain
+ * @param {number} startTime AudioContext time the iteration starts
+ * @param {number} offset seconds from the selection's start
+ * @param {number} length the stretch's length in seconds (> 0)
+ * @param {number} duration selection length in seconds
+ * @param {number} fadeIn seconds (0 for none)
+ * @param {number} fadeOut seconds (0 for none)
+ */
+export function scheduleStretch(gainParam, startTime, offset, length, duration, fadeIn, fadeOut) {
+  gainParam.setValueCurveAtTime(stretchCurve(offset, length, duration, fadeIn, fadeOut), startTime, length);
+}

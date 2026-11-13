@@ -30,6 +30,8 @@ ALLOWED = {
     "style.css": "text/css; charset=utf-8",
     "app.js": _JS,
     "waveform.js": _JS,
+    "zoom.js": _JS,
+    "loop.js": _JS,
     "player.js": _JS,
     "share.js": _JS,
     "fetch.js": _JS,

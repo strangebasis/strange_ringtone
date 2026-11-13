@@ -129,7 +129,9 @@ test("a drag captures the pointer, moves the edge it picked up and releases on l
   assert.deepEqual(changes, []);
 
   canvas.fire("pointermove", 7, 40);
-  assert.deepEqual(changes, [{ start: 44_100, end: 294_000 }]);
+  // The change names the edge being dragged: the loop bars follow an edge
+  // and a slide of the whole selection differently (loop.js).
+  assert.deepEqual(changes, [{ start: 44_100, end: 294_000, edge: "start" }]);
   canvas.fire("pointerup", 7, 40);
   assert.deepEqual(canvas.captureCalls, [["set", 7], ["release", 7]]);
   assert.equal(commits, 1);

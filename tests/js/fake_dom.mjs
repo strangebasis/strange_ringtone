@@ -53,6 +53,8 @@ export class FakeElement {
     this.classList = { toggle: (name, on) => (on ? this.classes.add(name) : this.classes.delete(name)) };
     this.style = { setProperty: (name, value) => { this.style[name] = value; } };
     this.children = [];
+    // Every fill colour a canvas was drawn with, in order (getContext).
+    this.fills = [];
     if ("href" in attributes) this.href = attributes.href;
     this.rawValue = attributes.value ?? (this.type === "range" ? String((Number(this.min) + Number(this.max)) / 2) : "");
   }
@@ -101,8 +103,18 @@ export class FakeElement {
     return this.children.find((child) => child.classes.has(wanted)) ?? null;
   }
 
+  // A drawing context that accepts every call and remembers only the fill
+  // colours it was given: enough to see what a canvas shows as played.
   getContext() {
-    return sink();
+    const { fills } = this;
+    return new Proxy(function noop() {}, {
+      get: (target, key) => (key === "then" ? undefined : sink()),
+      set: (target, key, value) => {
+        if (key === "fillStyle") fills.push(value);
+        return true;
+      },
+      apply: () => undefined,
+    });
   }
 
   getBoundingClientRect() {
@@ -156,7 +168,9 @@ class FakeParam {
 
   setValueAtTime(value, time) { this.calls.push({ method: "setValueAtTime", value, time }); }
   setTargetAtTime(value, time) { this.calls.push({ method: "setTargetAtTime", value, time }); }
-  setValueCurveAtTime(curve, time, duration) { this.calls.push({ method: "setValueCurveAtTime", time, duration }); }
+  setValueCurveAtTime(curve, time, duration) {
+    this.calls.push({ method: "setValueCurveAtTime", curve, time, duration });
+  }
   cancelScheduledValues(time) { this.calls.push({ method: "cancelScheduledValues", time }); }
 
   /** The last value set or aimed at. */
@@ -317,6 +331,18 @@ export async function loadApp(options = {}) {
     if (ms >= 60_000) timer.unref();
     return timer;
   };
+  // Frame callbacks wait until a test runs them (page.frame), so a playhead
+  // or a glide moves only when the test says a frame has passed.
+  const frames = new Map();
+  let frameId = 0;
+  globalThis.requestAnimationFrame = (callback) => {
+    frameId += 1;
+    frames.set(frameId, callback);
+    return frameId;
+  };
+  globalThis.cancelAnimationFrame = (id) => {
+    frames.delete(id);
+  };
   const windowListeners = new Map();
   globalThis.window = {
     devicePixelRatio: 2,
@@ -384,6 +410,18 @@ export async function loadApp(options = {}) {
     fireDocument: (type) => (documentListeners.get(type) ?? []).map((listener) => listener({ type })),
     /** Every delay the page asked setTimeout for, in order. */
     timerDelays: () => [...timerDelays],
+    /**
+     * Let one animation frame pass: run every callback waiting for it, with
+     * `now` as its timestamp. Returns how many ran.
+     */
+    frame: (now = 0) => {
+      const due = [...frames.values()];
+      frames.clear();
+      for (const callback of due) callback(now);
+      return due.length;
+    },
+    /** How many frame callbacks are waiting. */
+    pendingFrames: () => frames.size,
     /** Fire a window event, such as hashchange. */
     fireWindow: (type) => (windowListeners.get(type) ?? []).map((listener) => listener({ type })),
     /** The Files app.js created so far. */

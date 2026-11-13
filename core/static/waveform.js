@@ -65,14 +65,24 @@ export class Waveform {
     scheme.addEventListener("change", () => this.draw());
   }
 
-  /** Register a listener: "change" fires on every move, "commit" when a drag ends. */
+  /**
+   * Register a listener: "change" fires on every move, "commit" when a drag
+   * ends. A change names what is being dragged ("start", "end" or "move"),
+   * because the numbers alone cannot tell a slide of the whole selection from
+   * an edge that pulled the other one along, and the loop bars follow the two
+   * differently (loop.js).
+   */
   on(name, listener) {
     if (!this.listeners.has(name)) this.listeners.set(name, []);
     this.listeners.get(name).push(listener);
   }
 
   emit(name) {
-    const detail = { start: this.selection.start, end: this.selection.end };
+    const detail = {
+      start: this.selection.start,
+      end: this.selection.end,
+      edge: this.drag === null ? null : this.drag.edge,
+    };
     for (const listener of this.listeners.get(name) ?? []) listener(detail);
   }
 

@@ -1546,6 +1546,81 @@ yt-dlp's info JSON and the media server's bytes:
   picker. The page decodes by content and refuses what it cannot decode.
 - Buttons: **Hear final**, **Get on this iPhone**, and **Download .m4r**.
 
+**The magnified view, the loop controls and the playheads** (the owner's
+design, settled in an interview on 2026-11-12, from their mockups). All of it
+is the page's own: nothing here reaches the server, and a rendered tone is
+the selection, whatever the loop controls say.
+
+- **The magnified view** sits under the waveform, always, also for a clip no
+  longer than the cap. It shows the selection stretched to the view's width,
+  with a strip of the audio outside it on either side (6 % of the width, at
+  least 24 px), drawn fainter. Below the 48rem breakpoint it runs from one
+  edge of the screen to the other, out of the panel; above it, it is as wide
+  as the page column. A diagonal joins each of the waveform's handles to the
+  trim bar below it. The waveform's tint and fade shading are drawn here too,
+  where a fade is wide enough to see its shape.
+- **Its trim bars** move the same two edges as the waveform's handles, with
+  the same cap and minimum, only finer, because a pixel here is far less
+  audio (a 30 s selection of a 10-minute clip: about 20 times finer on a
+  phone). While one is dragged the picture holds still, so the bar stays
+  under the finger and a pixel is the same amount of audio from the press to
+  the lift. The bar does not jump to the finger: where on its 44 px the press
+  landed is kept. On the lift the view re-fits to the new selection, in a
+  150 ms glide (a jump where the device asks for reduced motion). One drag
+  therefore grows the selection only as far as the strip shows; a longer
+  move takes another drag, the waveform's handle or a nudge.
+- **Touch.** Each bar is drawn on the canvas, and an element laid over it,
+  44 px wide, takes the pointer. Only those elements claim the gesture, so a
+  touch anywhere else on the view scrolls the page: the view is as wide as
+  the screen and sits mid-page. Nothing in the view slides the selection or
+  the loop whole.
+- **Loop controls** are a checkbox, off by default. On, two loop bars appear
+  in the magnified view, and **Play selection** becomes **Play loop**: it
+  repeats only the stretch between them. They are an aid for placing the
+  edges, like the loop region of an audio editor, and they change nothing in
+  the tone: no render is discarded when they move.
+  - The first time on a clip the loop runs from the selection's start to its
+    middle. After that it is kept, also while the box is off, until another
+    clip is picked. The box itself is not stored anywhere.
+  - A loop bar stays inside the trim bars and may rest on one: a loop over
+    the whole selection is a valid one. The shortest loop is 0.25 s, half
+    the shortest clip, so the default always fits. A loop bar stops at the
+    other loop bar and never pushes it, and one let go within 4 px of its
+    trim bar rests exactly on it.
+  - When a trim bar moves, a loop bar resting on it travels with it, in both
+    directions, so with the loop on the start, an earlier start is heard on
+    the next pass. Any other loop bar keeps its place in the audio and moves
+    only when a trim bar reaches it and pushes it. Sliding the whole
+    selection on the waveform carries the loop along.
+  - The trim bars stand taller and are a little thicker, and the loop bars
+    are drawn, and picked up, in front. Where a loop bar lies on a trim bar,
+    a touch on their shared height takes the loop bar, and the trim bar is
+    reached by the tip that stands above it (43 px with its grip). Between
+    the two loop bars a touch takes the nearer one: a short loop's bars are
+    closer than their touch targets are wide, and stacking would always give
+    the same one.
+  - The loop bars are moved by dragging only. There are no nudge buttons and
+    no keys for them (the owner's choice: the preview alone depends on them).
+- **The loop's sound** is the finished tone's at that place: the fades stay
+  on the selection's edges and are heard only where the loop covers them,
+  and the level is the preview gain measured on the whole selection. Where a
+  loop bar cuts into the audio, a 5 ms ramp keeps the jump back from
+  clicking; an end of the loop that is an end of the selection gets none,
+  because the tone has none there.
+- **The playheads** are fills, not one more bar. While the preview plays, the
+  audio heard so far on this pass is drawn in the waveform's blue in the
+  magnified view, from the selection's start, or the loop's, and the rest
+  stays grey. While the finished tone plays, the **Hear final** button itself
+  is the playhead: it keeps the dimmed blue it has while rendering and fills
+  from the left with the full accent as each pass goes on; the magnified
+  view shows nothing then, because what plays is the rendered file. The
+  button's label changes colour where the fill does, the button's text
+  colour over the fill and the page's over the rest, because no one colour
+  reaches 4.5:1 on both; where a browser cannot do that, or forces its own
+  colours, the button stays plain. Both
+  read the audio clock, less the output latency where the browser reports
+  one.
+
 ### 7.2 Auto-suggesting the hook
 
 The first rule that applies places the selection:
@@ -2105,7 +2180,7 @@ core/
   Dockerfile  ffmpeg/{VERSION,SHA256SUMS,ffmpeg-devel.asc,configure.txt,components.txt}
   __main__.py               # checkout entry point: python -I core
   strange_ringtone/{__main__.py,config.py,server.py,http_guard.py,static.py,wav.py,render.py,names.py,results.py}
-  static/{index.html,style.css,app.js,waveform.js,player.js,share.js,fetch.js}   # fetch.js: link parser, /fetch/ client
+  static/{index.html,style.css,app.js,waveform.js,zoom.js,loop.js,player.js,share.js,fetch.js}   # zoom.js, loop.js: the magnified view and the loop bars' rules (7.1); fetch.js: link parser, /fetch/ client
   static/audio/{decode,wav,loudness,suggest,fades,request}.js   # pure audio code, unit-tested under Node
   static/package.json       # {"type": "module"} for the Node tests only: not served, not in the image
 fetcher/

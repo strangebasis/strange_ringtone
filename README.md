@@ -16,10 +16,15 @@ iOS 26's **Share → Use as Ringtone**. No GarageBand, no computer and no cable.
    share a YouTube link instead ([below](#from-a-youtube-link)).
 2. The app pre-selects the loudest stretch, up to `MAX_CLIP_SECONDS` (30 s by
    default), and moves its start to a quiet moment. Drag the handles or nudge
-   them by 0.1 s or 1 s. **Play selection** loops it the way a ringtone
+   them by 0.1 s or 1 s. Under the waveform the selection is shown again,
+   magnified, with bars that move the same edges more finely. **Play
+   selection** loops it the way a ringtone
    rings, with the fade-in and fade-out (toggles and 0 to 5 s sliders) and the
    loudness (a Softer to Louder slider from -24 to -9 LUFS, measured on the
-   phone) applied as you change them.
+   phone) applied as you change them. **Enable loop controls** adds two bars
+   to the magnified view, and Play then repeats only the part between them,
+   for listening to one edge while you place it; the tone is still the whole
+   selection.
 3. Type a name and tap **Hear final**. Only the selection travels to the
    server, as plain 16-bit WAV; the server measures, fades, levels and
    encodes it, and the app plays the finished file back on a loop.
