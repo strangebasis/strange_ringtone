@@ -1595,7 +1595,10 @@ the selection, whatever the loop controls say.
   - The trim bars stand taller and are a little thicker, and the loop bars
     are drawn, and picked up, in front. Where a loop bar lies on a trim bar,
     a touch on their shared height takes the loop bar, and the trim bar is
-    reached by the tip that stands above it (43 px with its grip).
+    reached by the tip that stands above it (43 px with its grip). Between
+    the two loop bars a touch takes the nearer one: a short loop's bars are
+    closer than their touch targets are wide, and stacking would always give
+    the same one.
   - The loop bars are moved by dragging only. There are no nudge buttons and
     no keys for them (the owner's choice: the preview alone depends on them).
 - **The loop's sound** is the finished tone's at that place: the fades stay
@@ -1610,7 +1613,11 @@ the selection, whatever the loop controls say.
   stays grey. While the finished tone plays, the **Hear final** button itself
   is the playhead: it keeps the dimmed blue it has while rendering and fills
   from the left with the full accent as each pass goes on; the magnified
-  view shows nothing then, because what plays is the rendered file. Both
+  view shows nothing then, because what plays is the rendered file. The
+  button's label changes colour where the fill does, the button's text
+  colour over the fill and the page's over the rest, because no one colour
+  reaches 4.5:1 on both; where a browser cannot do that, or forces its own
+  colours, the button stays plain. Both
   read the audio clock, less the output latency where the browser reports
   one.
 

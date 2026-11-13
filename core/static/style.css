@@ -124,14 +124,36 @@ button:disabled {
 /* While the finished tone loops, the Hear final button is its playhead
    (docs/PLAN.md 7.1): the dimmed blue it has while rendering, filled from the
    left with the full accent as the pass goes on. app.js sets --progress (0 to
-   1) through the CSSOM, which the CSP allows, unlike a style attribute. A
-   browser without color-mix keeps the plain button. border-box, so the fill
-   does not wrap around under the border. */
-@supports (color: color-mix(in srgb, red 50%, transparent)) {
-  #render.playing {
-    border-color: transparent;
-    background: linear-gradient(to right, var(--accent) calc(var(--progress, 0) * 100%),
-      var(--accent-dim) calc(var(--progress, 0) * 100%)) border-box;
+   1) through the CSSOM, which the CSP allows, unlike a style attribute.
+   border-box, so the fill does not wrap around under the border.
+
+   The label changes colour where the fill does. No one colour can be read on
+   both parts: the button's own is about 2.3:1 on the dimmed blue in the light
+   scheme and 3:1 in the dark one, under the 4.5:1 that text of this size
+   needs. So a second layer, cut to the letters and split at the same place,
+   paints them: the button's text colour over the fill, the page's over the
+   rest, which is at least 5:1 in both schemes. The letters' own fill is
+   transparent so that layer shows; color stays, for whatever reads
+   currentColor.
+
+   A browser without color-mix or the text clip keeps the plain button, and so
+   does forced-colours mode, which replaces the background and would leave
+   transparent letters on it. */
+@media (forced-colors: none) {
+  @supports (color: color-mix(in srgb, red 50%, transparent)) and
+      ((background-clip: text) or (-webkit-background-clip: text)) and
+      (-webkit-text-fill-color: transparent) {
+    #render.playing {
+      border-color: transparent;
+      background:
+        linear-gradient(to right, var(--accent-text) calc(var(--progress, 0) * 100%),
+          CanvasText calc(var(--progress, 0) * 100%)) border-box,
+        linear-gradient(to right, var(--accent) calc(var(--progress, 0) * 100%),
+          var(--accent-dim) calc(var(--progress, 0) * 100%)) border-box;
+      -webkit-background-clip: text, border-box;
+      background-clip: text, border-box;
+      -webkit-text-fill-color: transparent;
+    }
   }
 }
 

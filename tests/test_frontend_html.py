@@ -567,12 +567,15 @@ class MagnifiedViewTouchTest(unittest.TestCase):
         # The finished tone's playhead: app.js sets --progress on the button
         # and adds the class; the fill itself is this rule's.
         rules = css_declarations(self.css, "#render.playing")
-        # Full accent up to the progress, the dimmed accent from there on:
-        # both stops sit at the same place, so the edge between them is the
-        # playhead.
+        # The second layer is the fill: full accent up to the progress, the
+        # dimmed accent from there on. Both stops sit at the same place, so
+        # the edge between them is the playhead. The first layer is the
+        # label's colours, split at that same place.
         self.assertEqual(
             re.sub(r"\s+", " ", rules.get("background", "")),
-            "linear-gradient(to right, var(--accent) calc(var(--progress, 0) * 100%),"
+            "linear-gradient(to right, var(--accent-text) calc(var(--progress, 0) * 100%),"
+            " canvastext calc(var(--progress, 0) * 100%)) border-box,"
+            " linear-gradient(to right, var(--accent) calc(var(--progress, 0) * 100%),"
             " var(--accent-dim) calc(var(--progress, 0) * 100%)) border-box",
         )
         # The dimmed accent is the accent at the strength a disabled button
@@ -580,6 +583,79 @@ class MagnifiedViewTouchTest(unittest.TestCase):
         root = css_declarations(self.css, ":root")
         self.assertEqual(root.get("--accent-dim"), "color-mix(in srgb, var(--accent) 50%, transparent)")
         self.assertEqual(css_declarations(self.css, "button:disabled").get("opacity"), "0.5")
+
+    def test_the_playing_button_s_label_is_cut_from_its_own_layer(self) -> None:
+        # The label's colours are a background layer cut to the letters, over
+        # the fill, which keeps the whole button. The letters' own fill is
+        # transparent so that layer shows through them.
+        rules = css_declarations(self.css, "#render.playing")
+        self.assertEqual(rules.get("background-clip"), "text, border-box")
+        self.assertEqual(rules.get("-webkit-background-clip"), "text, border-box")
+        self.assertEqual(rules.get("-webkit-text-fill-color"), "transparent")
+        # color is left alone: the focus ring and the like read currentColor.
+        self.assertNotIn("color", rules)
+        # Transparent letters need the layer behind them. Where a browser
+        # cannot cut a background to text, or replaces backgrounds (forced
+        # colours), the rule must not apply at all: the label would be gone.
+        css = re.sub(r"/\*.*?\*/", "", self.css, flags=re.DOTALL)
+        self.assertEqual(css.count("#render.playing"), 1)
+        guards = re.sub(r"\s+", " ", css[:css.index("#render.playing")].rsplit("}", 1)[1]).strip()
+        self.assertEqual(
+            guards,
+            "@media (forced-colors: none) {"
+            " @supports (color: color-mix(in srgb, red 50%, transparent)) and"
+            " ((background-clip: text) or (-webkit-background-clip: text)) and"
+            " (-webkit-text-fill-color: transparent) {",
+        )
+
+    def test_the_playing_button_s_label_can_be_read_on_both_parts(self) -> None:
+        # WCAG's 4.5:1 for text of this size, worked out from the stylesheet's
+        # own colours. The button's text colour alone gives about 2.3:1 on the
+        # dimmed part in the light scheme and 3:1 in the dark one, which is
+        # why the label changes colour where the fill does.
+        css = re.sub(r"/\*.*?\*/", "", self.css, flags=re.DOTALL)
+        light_css, dark_css = css.split("@media (prefers-color-scheme: dark)", 1)
+        light = css_declarations(light_css[:light_css.index("}") + 1], ":root")
+        dark = css_declarations(dark_css[:dark_css.index("}") + 1], ":root")
+        self.assertEqual(light.get("--panel"), "rgba(127, 127, 127, 0.08)")
+        self.assertNotIn("--panel", dark)
+
+        def rgb(colour: str) -> tuple[float, ...]:
+            self.assertRegex(colour, r"^#[0-9a-f]{6}$")
+            return tuple(float(int(colour[i:i + 2], 16)) for i in (1, 3, 5))
+
+        def over(top: tuple[float, ...], alpha: float, under: tuple[float, ...]) -> tuple[float, ...]:
+            return tuple(a * alpha + b * (1 - alpha) for a, b in zip(top, under, strict=True))
+
+        def luminance(colour: tuple[float, ...]) -> float:
+            parts = [c / 255 for c in colour]
+            linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in parts]
+            return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+        def contrast(a: tuple[float, ...], b: tuple[float, ...]) -> float:
+            high, low = sorted((luminance(a), luminance(b)), reverse=True)
+            return (high + 0.05) / (low + 0.05)
+
+        # Canvas and CanvasText are the browser's: white and black in the
+        # light scheme, and in the dark one what each engine uses.
+        schemes = (
+            ("light", light, "#ffffff", "#000000"),
+            ("dark, Chromium", dark, "#121212", "#ffffff"),
+            ("dark, WebKit", dark, "#1e1e1e", "#ffffff"),
+            ("dark, Gecko", dark, "#1c1b22", "#fbfbfe"),
+        )
+        for name, palette, canvas, canvas_text in schemes:
+            with self.subTest(name):
+                accent = rgb(palette["--accent"])
+                label = rgb(palette["--accent-text"])
+                panel = over((127.0, 127.0, 127.0), 0.08, rgb(canvas))
+                dimmed = over(accent, 0.5, panel)
+                # Over the fill, the button's own text colour.
+                self.assertGreaterEqual(contrast(label, accent), 4.5)
+                # Over the rest, the page's.
+                self.assertGreaterEqual(contrast(rgb(canvas_text), dimmed), 4.5)
+                # Which the button's own would not be: the reason for the split.
+                self.assertLess(contrast(label, dimmed), 4.5)
 
 
 class JsAuditTest(unittest.TestCase):

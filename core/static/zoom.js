@@ -8,8 +8,9 @@
 //
 // The bars are drawn on the canvas, and each has an element laid over it that
 // takes the pointer. So a touch anywhere else on the view scrolls the page as
-// usual, and which bar a touch picks is decided by plain stacking: the loop
-// bars lie in front, and a trim bar under one is reached by its tip.
+// usual, and between a loop bar and a trim bar plain stacking decides which
+// one a touch picks: the loop bars lie in front, and a trim bar under one is
+// reached by its tip. Between the two loop bars it is the nearer one.
 import { fadeGainAt } from "./audio/fades.js";
 import { moveLoopEdge } from "./loop.js";
 import { moveEdge } from "./waveform.js";
@@ -469,10 +470,25 @@ export class ZoomView {
     return event.clientX - this.canvas.getBoundingClientRect().left;
   }
 
-  onPointerDown(name, event) {
+  // The bar a press on `pressed`'s element picks up. The loop bars' elements
+  // are 44 px wide and a short loop's bars are a few pixels apart, so the
+  // element in front lies over the other bar's line too, and stacking alone
+  // would hand every press there to the same bar. Between the two loop bars
+  // the nearer one is taken. A trim bar is never chosen this way: under a loop
+  // bar it is reached by its tip, as before.
+  barAt(pressed, x) {
+    if (!(pressed in LOOP_BARS)) return pressed;
+    const other = pressed === "loopStart" ? "loopEnd" : "loopStart";
+    const away = (name) => Math.abs(x - this.frameToX(this.barFrame(name)));
+    return away(other) < away(pressed) ? other : pressed;
+  }
+
+  onPointerDown(pressed, event) {
     if (this.channels === null || this.view === null || this.drag !== null) return;
+    if (this.barFrame(pressed) === null) return;
+    const at = this.localX(event);
+    const name = this.barAt(pressed, at);
     const frame = this.barFrame(name);
-    if (frame === null) return;
     event.preventDefault();
     const element = this.bars[name];
     // Capture keeps the drag alive when the finger leaves the bar's element.
@@ -485,7 +501,7 @@ export class ZoomView {
       element,
       // Where on the bar's 44 px the press landed. Without it the bar would
       // jump to the finger on the first move, by up to two seconds of audio.
-      grab: this.localX(event) - this.frameToX(frame),
+      grab: at - this.frameToX(frame),
     };
   }
 

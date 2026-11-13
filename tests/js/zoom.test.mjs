@@ -391,6 +391,68 @@ test("a loop bar let go within 4 px of its trim bar rests exactly on it", () => 
   bars.loopStart.fire("pointerup", 8, 10 + 29);
 });
 
+test("between two loop bars a press picks up the nearer one, whichever element it landed on", () => {
+  const { view, bars, events } = makeView();
+  // 10 px apart, at 124 px and 134 px. Each element is 44 px wide, and the
+  // end bar's is the one in front (it comes later in the page), so it lies
+  // over the start bar's line too.
+  const loop = { start: START + 100 * PER_PX, end: START + 110 * PER_PX };
+  view.setLoop(loop);
+
+  // Right on the start bar: the start bar, though the end bar's element got it.
+  const down = bars.loopEnd.fire("pointerdown", 7, 10 + 124);
+  assert.equal(down.defaultPrevented, true);
+  // The picked bar's element holds the pointer for the drag.
+  assert.deepEqual(bars.loopStart.captureCalls, [["set", 7]]);
+  assert.deepEqual(bars.loopEnd.captureCalls, []);
+  bars.loopStart.fire("pointermove", 7, 10 + 104);
+  assert.deepEqual(events, [["loopchange", { start: START + 80 * PER_PX, end: loop.end }]]);
+  bars.loopStart.fire("pointerup", 7, 10 + 104);
+  assert.deepEqual(bars.loopStart.captureCalls, [["set", 7], ["release", 7]]);
+  view.setLoop(loop);
+
+  // 3 px from the end bar and 7 px from the start bar: the end bar, and it
+  // keeps those 3 px under the finger.
+  bars.loopEnd.fire("pointerdown", 8, 10 + 131);
+  bars.loopEnd.fire("pointermove", 8, 10 + 151);
+  assert.deepEqual(view.loop, { start: loop.start, end: START + 130 * PER_PX });
+  bars.loopEnd.fire("pointerup", 8, 10 + 151);
+  view.setLoop(loop);
+
+  // Nearer the end bar, on the start bar's element (were it the one in front).
+  bars.loopStart.fire("pointerdown", 9, 10 + 140);
+  assert.deepEqual(bars.loopEnd.captureCalls.at(-1), ["set", 9]);
+  bars.loopEnd.fire("pointerup", 9, 10 + 140);
+
+  // Halfway between the two: the bar whose element was pressed.
+  bars.loopEnd.fire("pointerdown", 10, 10 + 129);
+  bars.loopEnd.fire("pointermove", 10, 10 + 139);
+  assert.deepEqual(view.loop, { start: loop.start, end: START + 120 * PER_PX });
+  bars.loopEnd.fire("pointerup", 10, 10 + 139);
+});
+
+test("nearness is between the loop bars only: a trim bar is picked by its own element alone", () => {
+  const { view, bars, events } = makeView();
+  // The loop's start bar 6 px right of the trim bar at 24 px.
+  const loop = { start: START + 6 * PER_PX, end: START + 150 * PER_PX };
+  view.setLoop(loop);
+  // On the loop bar's element, right on the trim bar's line: still the loop bar.
+  bars.loopStart.fire("pointerdown", 7, 10 + 24);
+  bars.loopStart.fire("pointermove", 7, 10 + 44);
+  assert.deepEqual(events, [["loopchange", { start: START + 26 * PER_PX, end: loop.end }]]);
+  assert.deepEqual(view.selection, { start: START, end: END });
+  bars.loopStart.fire("pointerup", 7, 10 + 44);
+  view.setLoop(loop);
+  events.length = 0;
+  // On the trim bar's element (its tip), nearer the loop bar: still the trim bar.
+  bars.start.fire("pointerdown", 8, 10 + 32);
+  assert.deepEqual(bars.start.captureCalls, [["set", 8]]);
+  assert.deepEqual(bars.loopStart.captureCalls.filter(([, id]) => id === 8), []);
+  bars.start.fire("pointermove", 8, 10 + 22);
+  assert.deepEqual(events, [["change", { start: START - 10 * PER_PX, end: END, edge: "start" }]]);
+  bars.start.fire("pointerup", 8, 10 + 22);
+});
+
 test("without a loop the loop bars' elements take no drag", () => {
   const { bars, events } = makeView();
   const down = bars.loopStart.fire("pointerdown", 7, 34);
