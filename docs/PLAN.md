@@ -1017,6 +1017,24 @@ interpreter: the base interpreter compiles the venv's bytecode with
 Keeping one image leaves CI, Trivy, publishing, provenance and Dependabot as
 they are.
 
+Of yt-dlp's extractors the image keeps only YouTube's and the modules they
+import, eight entries listed in `fetcher/ytdlp-extractors.txt`; the build
+deletes the other nine hundred or so (`fetcher/prune_extractors.py`, run by
+the base interpreter with `-I -S` before the compile, and removed from the
+image in the same step). The runner starts yt-dlp with `--use-extractors
+youtube` only, and yt-dlp imports an extractor's module when that extractor
+is used, so the rest was code the image never ran. Some of it carries other
+sites' keys and tokens in its source: the first rehearsal of the release scan
+(2026-11-12) reported 43 of them as secrets, in ten extractors, and that scan
+fails on any secret, with exceptions bound to an image that a release has not
+built yet. Pruning removes what it found and leaves a compromised run less
+to use; the owner chose it over loosening the scan. The cost: the installed
+tree no longer matches the wheel's record of its files, `yt-dlp
+--list-extractors` no longer works in the image, and a yt-dlp bump that makes
+the YouTube extractor import another module fails the in-image tests until
+the module is added to the list. A real ten-minute window through the pruned
+image, on the same day, returned the same bytes as through the full one.
+
 **Contract changes**, none of which needs a breaking marker before v0.1.0:
 
 - shipped in PR A:

@@ -98,6 +98,9 @@ FORWARDER_CMD = ["python", "-I", "/app/fetcher/forwarder.py"]
 FORWARDER_PORT = 3128
 FORWARDER_PACKAGE = Path("/app/fetcher/strange_ringtone_forwarder")
 LOCK = Path("/app/fetcher/requirements.txt")
+# The entries of yt_dlp/extractor the build keeps (fetcher/ytdlp-extractors.txt):
+# it deletes every other one, and the list stays in the image for these tests.
+KEEP_LIST = Path("/app/fetcher/ytdlp-extractors.txt")
 # yt-dlp and yt-dlp-ejs live in a venv of their own (docs/PLAN.md 6.1): a wheel
 # installed for the server's interpreter would be code in the server, since -I
 # still runs .pth lines and pip writes scripts and data into the prefix.
@@ -190,6 +193,29 @@ for dist in importlib.metadata.distributions():
 print(json.dumps(sorted(found)))
 """
 _VERSION_PROBE = "import importlib.metadata, sys; print(importlib.metadata.version(sys.argv[1]))"
+# Which of yt-dlp's extractor modules a YouTube-only run imports, and how far
+# it gets with no network: the lookup of the extractor, then the first request.
+_EXTRACTOR_PROBE = """\
+import json, sys
+import yt_dlp
+ydl = yt_dlp.YoutubeDL({"allowed_extractors": ["youtube"], "quiet": True, "no_warnings": True,
+                        "socket_timeout": 2, "logger": type("Quiet", (), {
+                            "debug": lambda *a: None, "warning": lambda *a: None, "error": lambda *a: None})()})
+try:
+    ydl.extract_info("https://www.youtube.com/watch?v=" + sys.argv[1], download=False)
+    outcome = ["extracted", ""]
+except Exception as error:
+    outcome = [type(error).__name__, str(error)]
+prefix = "yt_dlp.extractor."
+modules = sorted({name[len(prefix):].split('.')[0] for name in sys.modules if name.startswith(prefix)})
+print(json.dumps({"outcome": outcome, "modules": modules}))
+"""
+# What an image scan reports as a secret in other sites' extractors: a JSON
+# web token, and an AWS access key id. Patterns only; nothing here is a key.
+_TOKEN_PATTERNS = {
+    "a JSON web token": re.compile(rb"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
+    "an AWS access key id": re.compile(rb"(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA)[0-9A-Z]{16}"),
+}
 # Run under the venv's interpreter: for every module of the two packages, the
 # .pyc that interpreter would load (its own cache tag, no optimisation level)
 # must exist and match the source, by timestamp and size or by hash (PEP 552).
@@ -507,8 +533,9 @@ class FilesystemTest(unittest.TestCase):
                     check(os.path.join(directory, name))
         for path in (DENO, "/opt"):
             check(path)
-        # The walk saw the venv's packages and the forwarder, not an empty tree.
-        self.assertGreater(checked, 500)
+        # The walk saw the venv's packages and the forwarder, not an empty tree
+        # (yt-dlp keeps only YouTube's extractors, so a few hundred entries).
+        self.assertGreater(checked, 250)
         self.assertEqual(problems, [])
 
     def test_tmp_is_the_writable_tmpfs(self) -> None:
@@ -692,7 +719,8 @@ class DependenciesTest(unittest.TestCase):
         # The interpreter that compiled them shares the venv's cache tag and
         # magic number: the same binary.
         self.assertEqual((data["tag"], data["magic"]), (base["tag"], base["magic"]))
-        self.assertGreater(data["counts"]["yt_dlp"], 500, data["counts"])
+        # More than a hundred modules even with only YouTube's extractors kept.
+        self.assertGreater(data["counts"]["yt_dlp"], 100, data["counts"])
         self.assertGreater(data["counts"]["yt_dlp_ejs"], 0, data["counts"])
         self.assertEqual(data["bad"], [])
 
@@ -726,6 +754,79 @@ class DependenciesTest(unittest.TestCase):
             f"yt-dlp's range of {chunk} bytes plus {RANGE_HEADROOM_BYTES} bytes of headroom exceeds the forwarder's "
             f"download_bytes_per_tunnel of {cap}: raise Limits.download_bytes_per_tunnel and the README row together",
         )
+
+
+class PrunedExtractorsTest(unittest.TestCase):
+    """Only YouTube's extractors, and the modules they import, are in the image (docs/PLAN.md 6.1).
+
+    The runner starts yt-dlp with --use-extractors youtube and nothing else.
+    The build deletes every other extractor: code this image never runs, some
+    of it carrying other sites' keys and tokens in its source, which an image
+    scan reports as secrets and which a compromised run could have used.
+    """
+
+    EXTRACTORS = VENV_SITE / "yt_dlp" / "extractor"
+
+    def keep(self) -> set[str]:
+        with KEEP_LIST.open(encoding="ascii") as handle:
+            lines = [line.strip() for line in handle]
+        names = {line.rstrip("/") for line in lines if line and not line.startswith("#")}
+        self.assertIn("youtube", names)
+        return names
+
+    def test_the_extractor_directory_holds_exactly_the_keep_list(self) -> None:
+        keep = self.keep()
+        found = {entry.name for entry in self.EXTRACTORS.iterdir()}
+        self.assertEqual(found - {"__pycache__"}, keep)
+        # Bytecode only for the modules that stayed: the build prunes before it compiles.
+        compiled = {entry.name.split(".")[0] + ".py" for entry in (self.EXTRACTORS / "__pycache__").iterdir()}
+        self.assertEqual(compiled, {name for name in keep if name.endswith(".py")})
+        # The list names YouTube and a handful of modules, not other sites.
+        self.assertLessEqual(len(keep), 12, keep)
+
+    def test_a_youtube_only_run_imports_only_what_was_kept(self) -> None:
+        # Never let this run where it could reach YouTube.
+        self.assertEqual(_interfaces(), {"lo"}, "refusing to run yt-dlp with a network")
+        data, why = _python_json(VENV_PYTHON, _EXTRACTOR_PROBE, OFFLINE_VIDEO_ID)
+        self.assertIsNotNone(data, why)
+        assert data is not None
+        kind, message = data["outcome"]
+        # It found the YouTube extractor and got as far as the first request:
+        # a module the keep list lacks would be an ImportError before that.
+        self.assertEqual(kind, "DownloadError", message)
+        self.assertRegex(message, r"(?i)resolution|resolve|getaddrinfo|name or service")
+        self.assertIn("[youtube]", message)
+        kept = {name.removesuffix(".py") for name in self.keep()}
+        self.assertLessEqual(set(data["modules"]), kept)
+        self.assertIn("youtube", data["modules"])
+
+    def test_another_sites_link_finds_no_extractor(self) -> None:
+        self.assertEqual(_interfaces(), {"lo"}, "refusing to run yt-dlp with a network")
+        proc = _run([VENV_PYTHON, "-I", "-m", "yt_dlp", "--ignore-config", "--use-extractors", "youtube",
+                     "--skip-download", "--socket-timeout", "2", "--", "https://vimeo.com/1"])
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("No suitable extractor", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def test_nothing_in_the_venv_looks_like_a_key_or_a_token(self) -> None:
+        hits: list[str] = []
+        checked = 0
+        for directory, _names, files in os.walk(VENV):
+            for name in files:
+                path = os.path.join(directory, name)
+                if os.path.islink(path):
+                    continue
+                with open(path, "rb") as handle:
+                    data = handle.read()
+                checked += 1
+                hits.extend(f"{path}: {label}" for label, pattern in _TOKEN_PATTERNS.items() if pattern.search(data))
+        self.assertGreater(checked, 200)
+        self.assertEqual(hits, [])
+
+    def test_the_build_script_did_not_stay_in_the_image(self) -> None:
+        self.assertFalse(os.path.lexists("/build"))
+        for directory, _names, files in os.walk("/app"):
+            self.assertNotIn("prune_extractors.py", files, directory)
 
 
 class IntExpressionTest(unittest.TestCase):

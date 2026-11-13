@@ -43,6 +43,15 @@ _SETTING_INSTRUCTIONS = {"ENV", "ARG", "SHELL"}
 # The venv's bin directory written relative to a parent (a WORKDIR of /opt,
 # say): a later step can name the venv's interpreter without its full path.
 _RELATIVE_BIN = "yt-dlp/bin"
+# The one other step that may name the venv after the install: the base
+# interpreter, isolated and without site, running the build's own script
+# from outside the venv on yt-dlp's extractor directory. Exactly this
+# argument list; the script itself is tested in tests/test_prune_extractors.py.
+PRUNE_STEP = [
+    "python", "-I", "-S", "/build/prune_extractors.py", "/app/fetcher/ytdlp-extractors.txt",
+    "/opt/yt-dlp/lib/python3.12/site-packages/yt_dlp/extractor",
+]
+COMPILE_STEP = ["python", "-I", "-S", "-m", "compileall", "-q", "/opt/yt-dlp/lib"]
 
 
 def _names_venv(text: str) -> bool:
@@ -233,7 +242,7 @@ def _check(steps: list[list[str]], compiles: list[list[str]]) -> list[str]:
         if not any(_names_venv(token) for token in argv):
             continue
         compiling = any("compileall" in token or "py_compile" in token for token in argv)
-        if _is_site_free_compile(argv):
+        if _is_site_free_compile(argv) or argv == PRUNE_STEP:
             compiles.append(argv)
         elif compiling:
             problems.append(f"{line}: compiles the venv other than as the base interpreter's -I -S -m compileall")
@@ -284,7 +293,21 @@ class VenvBuildStepTest(unittest.TestCase):
         self.assertEqual(problems, [])
         # Acceptance: the bytecode is still compiled, by the base interpreter
         # without site, which shares the venv interpreter's cache tag.
-        self.assertEqual(compiles, [["python", "-I", "-S", "-m", "compileall", "-q", "/opt/yt-dlp/lib"]])
+        # Before it, the same interpreter prunes the extractors, so that no
+        # bytecode is compiled for a module the image doesn't keep.
+        self.assertEqual(compiles, [PRUNE_STEP, COMPILE_STEP])
+
+    def test_the_prune_script_comes_from_outside_the_venv_and_leaves_the_image(self) -> None:
+        found = instructions(self.text)
+        self.assertIn(("COPY", "fetcher/prune_extractors.py /build/prune_extractors.py"), found)
+        self.assertIn(("COPY", "fetcher/ytdlp-extractors.txt /app/fetcher/ytdlp-extractors.txt"), found)
+        runs = [commands(arguments) for keyword, arguments in found if keyword == "RUN"]
+        step = [steps for steps in runs if PRUNE_STEP in steps]
+        self.assertEqual(len(step), 1)
+        # The step that ran it removes it, and nothing else is ever put in /build.
+        self.assertEqual(step[0][-1], ["rm", "-r", "/build"])
+        copied = [arguments for keyword, arguments in found if "/build" in arguments and keyword != "RUN"]
+        self.assertEqual(copied, ["fetcher/prune_extractors.py /build/prune_extractors.py"])
 
     def test_the_install_is_the_base_interpreters_prefix_install(self) -> None:
         # I2: exactly one step installs into the venv, and it is the base
@@ -360,6 +383,14 @@ class VenvBuildStepTest(unittest.TestCase):
             "the venv on PATH": "PATH=/opt/yt-dlp/bin:/usr/bin python -c pass",
             "the venv on PYTHONPATH": "PYTHONPATH=/opt/yt-dlp/lib/python3.12/site-packages python -c pass",
             "a venv file run by base": "python /opt/yt-dlp/lib/python3.12/site-packages/yt_dlp/__main__.py",
+            # The prune step in any other form than the one allowed.
+            "the prune with site": " ".join(["python", "-I", *PRUNE_STEP[3:]]),
+            "the prune without -I": " ".join(["python", "-S", *PRUNE_STEP[3:]]),
+            "the prune by the venv's interpreter": " ".join(["/opt/yt-dlp/bin/python", *PRUNE_STEP[1:]]),
+            "the prune on the whole venv": " ".join([*PRUNE_STEP[:5], "/opt/yt-dlp"]),
+            "another script on the venv": " ".join([*PRUNE_STEP[:3], "/build/other.py", *PRUNE_STEP[4:]]),
+            "a script of the venv as the pruner": " ".join(
+                [*PRUNE_STEP[:3], "/opt/yt-dlp/lib/python3.12/site-packages/x.py", *PRUNE_STEP[4:]]),
             "the venv's site dir": "python -m site /opt/yt-dlp",
             "activate": ". /opt/yt-dlp/bin/activate",
             "cd into the venv, then bin/python": "cd /opt/yt-dlp && bin/python -c pass",

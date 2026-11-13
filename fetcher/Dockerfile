@@ -56,15 +56,27 @@ COPY --from=deno /deno /usr/local/bin/deno
 # same cache tag. The lock stays in the image, so the in-image tests can
 # compare what is installed with it (tests/image_fetcher).
 COPY fetcher/requirements.txt /app/fetcher/requirements.txt
+# Of yt-dlp's extractors only YouTube's are kept, and the modules they
+# import: the runner never starts yt-dlp for another site, so the other
+# nine hundred modules are code this image never runs, some of it carrying
+# those sites' keys and tokens in its source. The list of what stays is kept
+# in the image, like the lock, for the in-image tests. The script that
+# deletes the rest is a build step only: it goes to /build, which the step
+# removes again, and like the compile it runs on the base interpreter with
+# -I -S, before the compile, so no bytecode is made for what it deleted.
+COPY fetcher/ytdlp-extractors.txt /app/fetcher/ytdlp-extractors.txt
+COPY fetcher/prune_extractors.py /build/prune_extractors.py
 RUN python -m venv --without-pip /opt/yt-dlp \
     && python -m pip install --no-cache-dir --disable-pip-version-check \
         --prefix /opt/yt-dlp \
         --require-hashes --no-deps --only-binary :all: -r /app/fetcher/requirements.txt \
+    && python -I -S /build/prune_extractors.py /app/fetcher/ytdlp-extractors.txt /opt/yt-dlp/lib/python3.12/site-packages/yt_dlp/extractor \
     && python -I -S -m compileall -q /opt/yt-dlp/lib \
     # The base interpreter runs the fetcher, the runner and the forwarder, so
     # it keeps no installer either: after this nothing third-party is
     # importable by it, and tests/image_fetcher proves it (I1).
-    && python -m pip uninstall --yes --disable-pip-version-check pip
+    && python -m pip uninstall --yes --disable-pip-version-check pip \
+    && rm -r /build
 
 # Exactly the core modules the fetcher and the runner import
 # (fetcher/__main__.py, fetcher/runner.py), at the path both put first on
