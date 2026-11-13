@@ -1985,7 +1985,8 @@ No workflow uses `pull_request_target` or `workflow_run`.
 As built in milestone 6, from the owner's decisions of 2026-10-25 and
 2026-11-12:
 
-- **`release-please.yml`** runs on pushes to `main` with top-level
+- **`release-please.yml`** runs on pushes to `main`, or by hand for `main`
+  only (a run that could not start often cannot be re-run), with top-level
   `permissions: {}`. Its one job gets `contents: write` and
   `pull-requests: write` and runs one step, release-please-action with
   `skip-github-release: true`: it keeps the release PR (the next version
