@@ -1,0 +1,27 @@
+# The entries of yt_dlp/extractor that the fetcher image keeps (docs/PLAN.md
+# 6.1). The build deletes every other one (fetcher/prune_extractors.py): the
+# runner only ever starts yt-dlp with --use-extractors youtube, and yt-dlp
+# loads an extractor's module when that extractor is used, so the code for the
+# other sites was never run here. It was still in the image, with the keys and
+# tokens those sites' extractors carry in their source.
+#
+# One name per line: a module as name.py, a package as name/. The list stays
+# in the image, so the in-image tests can compare the directory with it and
+# check that a YouTube-only run loads nothing else. After a yt-dlp bump that
+# makes the YouTube extractor import another module, those tests fail: add the
+# module here.
+
+# What every run needs: the package itself, the lookup table of extractor
+# classes, and the base class.
+__init__.py
+extractors.py
+lazy_extractors.py
+common.py
+
+# YouTube.
+youtube/
+
+# What the base class and the YouTube extractor import.
+adobepass.py
+afreecatv.py
+openload.py

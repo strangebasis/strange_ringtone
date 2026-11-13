@@ -126,7 +126,10 @@ is authoritative.
   come from a hashed
   pip-tools lock (`--require-hashes --no-deps --only-binary :all:`) into the
   image's venv, never into the base interpreter's site-packages, and nobody
-  hand-edits `requirements.txt`.
+  hand-edits `requirements.txt`. Of yt-dlp's extractors the image keeps only
+  the ones in `fetcher/ytdlp-extractors.txt` (YouTube's and what they
+  import); the build deletes the rest. When a yt-dlp bump fails the in-image
+  tests for a missing module, add that module to the list, and nothing else.
 - Tests use stdlib `unittest`, not pytest. **Every security check has a test
   that fails when the check is removed.** Malformed-input tests also assert that
   no files are left behind.
